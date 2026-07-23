@@ -1,11 +1,6 @@
 """Semantic-only acoustic codec distillation components."""
 
 from semantic_acoustic_codec.config import DecoderConfig, Route
-from semantic_acoustic_codec.export import (
-    export_legacy_oracle_checkpoint,
-    export_legacy_s2s_oracle,
-    legacy_s2s_oracle_state_dict,
-)
 from semantic_acoustic_codec.model import (
     AcousticDiT,
     AcousticRVQDecoder,
@@ -41,9 +36,6 @@ __all__ = [
     "SemanticConditioner",
     "build_codec",
     "build_route",
-    "export_legacy_oracle_checkpoint",
-    "export_legacy_s2s_oracle",
-    "legacy_s2s_oracle_state_dict",
     "load_artifact",
     "save_artifact",
     "teacher_features",

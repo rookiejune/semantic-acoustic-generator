@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from semantic_acoustic_codec.config import AdapterType, DecoderConfig, Route
-from semantic_acoustic_codec.export import export_legacy_s2s_oracle, legacy_s2s_oracle_state_dict
 from semantic_acoustic_codec.loss import FlowLoss, RepaLoss, RVQLoss
 from semantic_acoustic_codec.model import (
     AcousticRVQDecoder,
@@ -208,61 +207,6 @@ def test_semantic_codec_decodes_and_roundtrips_artifact(tmp_path) -> None:
     assert torch.allclose(features, loaded_features)
 
 
-def test_exports_legacy_s2s_flow_oracle_checkpoint(tmp_path) -> None:
-    from semantic_acoustic_codec.teacher import LongCatTeacher
-
-    teacher = LongCatTeacher(FakeCodec())
-    config = SemanticCodecConfig(
-        route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
-        feature_mean=(0.5, 0.0, -0.5, 1.0),
-        feature_std=(2.0, 1.5, 1.0, 0.5),
-    )
-    codec = build_codec(teacher, config).eval()
-    legacy = _legacy_flow_state(codec.state_dict())
-    checkpoint = tmp_path / "legacy.ckpt"
-    artifact = tmp_path / "artifact"
-    torch.save({"state_dict": legacy}, checkpoint)
-
-    mapped = legacy_s2s_oracle_state_dict({"state_dict": legacy}, route=Route.FM)
-    exported = export_legacy_s2s_oracle(checkpoint, artifact, config, teacher=teacher)
-    loaded = load_artifact(artifact, teacher=teacher)
-
-    assert "conditioner.embedding.weight" in mapped
-    assert "decoder.decoder.output.weight" in mapped
-    assert torch.allclose(exported.feature_mean, codec.feature_mean)
-    assert torch.allclose(loaded.feature_std, codec.feature_std)
-
-
-def test_exports_legacy_s2s_rvq_oracle_checkpoint(tmp_path) -> None:
-    if importlib.util.find_spec("transformers") is None:
-        pytest.skip("RVQ route requires transformers.")
-
-    from semantic_acoustic_codec.teacher import LongCatTeacher
-
-    teacher = LongCatTeacher(FakeCodec())
-    config = SemanticCodecConfig(
-        route=Route.RVQ,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
-    )
-    codec = build_codec(teacher, config).eval()
-    legacy = _legacy_rvq_state(codec.state_dict())
-    checkpoint = tmp_path / "legacy-rvq.ckpt"
-    artifact = tmp_path / "artifact-rvq"
-    torch.save({"state_dict": legacy}, checkpoint)
-
-    mapped = legacy_s2s_oracle_state_dict({"state_dict": legacy}, route=Route.RVQ)
-    exported = export_legacy_s2s_oracle(checkpoint, artifact, config, teacher=teacher)
-    loaded = load_artifact(artifact, teacher=teacher)
-
-    assert "conditioner.embedding.weight" in mapped
-    assert "decoder.heads.0.weight" in mapped
-    assert torch.allclose(exported.decoder.heads[0].weight, codec.decoder.heads[0].weight)
-    assert torch.allclose(loaded.decoder.heads[1].bias, codec.decoder.heads[1].bias)
-
-
 def test_fm_route_trains_one_step() -> None:
     from semantic_acoustic_codec.teacher import LongCatTeacher
 
@@ -348,30 +292,3 @@ def test_rvq_decoder_import_is_lazy() -> None:
     with pytest.raises(ImportError, match="transformers"):
         AcousticRVQDecoder(4, 2, (5, 7), hidden_dim=4, layers=1, heads=1, ffn_ratio=2)
 
-
-def _legacy_flow_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    legacy: dict[str, torch.Tensor] = {}
-    for key, value in state.items():
-        if key.startswith("conditioner.embedding."):
-            legacy[f"model.semantic_audio_embedding.{key.removeprefix('conditioner.embedding.')}"] = value
-        elif key.startswith("conditioner.adapter."):
-            legacy[f"model.semantic_audio_adapter.{key.removeprefix('conditioner.adapter.')}"] = value
-        elif key.startswith("decoder.decoder."):
-            legacy[f"model.acoustic_flow.decoder.{key.removeprefix('decoder.decoder.')}"] = value
-        elif key == "feature_mean":
-            legacy["target_mean"] = value
-        elif key == "feature_std":
-            legacy["target_std"] = value
-    return legacy
-
-
-def _legacy_rvq_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    legacy: dict[str, torch.Tensor] = {}
-    for key, value in state.items():
-        if key.startswith("conditioner.embedding."):
-            legacy[f"model.semantic_audio_embedding.{key.removeprefix('conditioner.embedding.')}"] = value
-        elif key.startswith("conditioner.adapter."):
-            legacy[f"model.semantic_audio_adapter.{key.removeprefix('conditioner.adapter.')}"] = value
-        elif key.startswith("decoder."):
-            legacy[f"model.acoustic_decoder.{key.removeprefix('decoder.')}"] = value
-    return legacy
