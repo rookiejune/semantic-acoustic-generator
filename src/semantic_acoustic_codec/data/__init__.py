@@ -1,8 +1,8 @@
 from semantic_acoustic_codec.data.longcat import (
     LONGCAT_VIEW,
     SemanticCodecBatch,
-    collate,
     codes,
+    collate,
     split_codes,
 )
 

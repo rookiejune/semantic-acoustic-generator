@@ -6,9 +6,8 @@ from collections.abc import Mapping, Sequence, Sized
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, Optional, cast
+from typing import Any, Literal, cast
 
-import torch
 from lightning import pytorch as pl
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
@@ -49,12 +48,12 @@ class LBAConfig:
 
 @dataclass(frozen=True)
 class DataConfig:
-    root: Optional[str] = None
+    root: str | None = None
     split: str = "train"
     sample_index: int = 0
-    max_seconds: Optional[float] = None
+    max_seconds: float | None = None
     overlong: str = "error"
-    sample_limit: Optional[int] = None
+    sample_limit: int | None = None
     batch_size: int = 8
     num_workers: int = 8
     pin_memory: bool = True
@@ -268,7 +267,7 @@ def _positive_number(value: object, *, name: str) -> None:
         raise ValueError(f"{name} must be finite and positive.")
 
 
-def _path(value: Optional[str]) -> Path | None:
+def _path(value: str | None) -> Path | None:
     return None if value is None else Path(value).expanduser()
 
 
