@@ -118,17 +118,18 @@ class DataModule(pl.LightningDataModule):
         del stage
         if self.dataset is not None:
             return
+        data = self.data
         dataset: Dataset[Any] = cast(
             Dataset[Any],
-            wmt19_tts_codec(codec="longcat", root=_path(self.data.root), split=self.data.split),
+            wmt19_tts_codec(codec="longcat", root=_path(data.root), split=data.split),
         )
-        sample_limit = self.data.sample_limit
+        sample_limit = data.sample_limit
         if sample_limit is not None:
             dataset = Subset(dataset, range(min(sample_limit, len(cast(Sized, dataset)))))
-        if self.data.overlong == "filter":
-            dataset, self.filtered_samples = _filter(dataset, data=self.data, frame_rate=self.frame_rate)
+        if data.overlong == "filter":
+            dataset, self.filtered_samples = _filter(dataset, data=data, frame_rate=self.frame_rate)
             if self.filtered_samples:
-                max_seconds = _max_seconds(self.data)
+                max_seconds = _max_seconds(data)
                 if max_seconds is None:
                     raise RuntimeError("duration filtering requires a hard limit.")
                 warnings.warn(
@@ -141,15 +142,17 @@ class DataModule(pl.LightningDataModule):
     def train_dataloader(self):
         if self.dataset is None:
             raise RuntimeError("semantic codec DataModule.setup() must run first.")
-        collate_fn = partial(collate_samples, data=self.data, frame_rate=self.frame_rate)
-        persistent_workers = self.data.persistent_workers and self.data.num_workers > 0
-        if not self.data.lba.enabled:
+        data = self.data
+        lba = data.lba
+        collate_fn = partial(collate_samples, data=data, frame_rate=self.frame_rate)
+        persistent_workers = data.persistent_workers and data.num_workers > 0
+        if not lba.enabled:
             return DataLoader(
                 self.dataset,
-                batch_size=self.data.batch_size,
+                batch_size=data.batch_size,
                 shuffle=True,
-                num_workers=self.data.num_workers,
-                pin_memory=self.data.pin_memory,
+                num_workers=data.num_workers,
+                pin_memory=data.pin_memory,
                 persistent_workers=persistent_workers,
                 collate_fn=collate_fn,
             )
@@ -158,18 +161,18 @@ class DataModule(pl.LightningDataModule):
 
         return LBA(
             self.dataset,
-            batch_size=self.data.batch_size,
+            batch_size=data.batch_size,
             shuffle=True,
-            num_workers=self.data.num_workers,
-            pin_memory=self.data.pin_memory,
+            num_workers=data.num_workers,
+            pin_memory=data.pin_memory,
             persistent_workers=persistent_workers,
             collate_fn=collate_fn,
-            len_fn=partial(length, data=self.data, frame_rate=self.frame_rate),
-            max_padded_length=_frames(self.data.lba.max_batch_seconds, self.frame_rate),
-            max_padding_ratio=self.data.lba.max_padding_ratio,
-            prefetch_batches=self.data.lba.prefetch_batches,
-            planner_mode=cast(Literal["quality", "throughput"], self.data.lba.planner_mode),
-            drop_last_flush=self.data.lba.drop_last_flush,
+            len_fn=partial(length, data=data, frame_rate=self.frame_rate),
+            max_padded_length=_frames(lba.max_batch_seconds, self.frame_rate),
+            max_padding_ratio=lba.max_padding_ratio,
+            prefetch_batches=lba.prefetch_batches,
+            planner_mode=cast(Literal["quality", "throughput"], lba.planner_mode),
+            drop_last_flush=lba.drop_last_flush,
             log_dir=self.output_dir / "lba",
         )
 
