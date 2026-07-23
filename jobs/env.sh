@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SEMANTIC_ACOUSTIC_CODEC_ROOT="${SEMANTIC_ACOUSTIC_CODEC_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+REPOS_ROOT="${REPOS_ROOT:-$(cd "${SEMANTIC_ACOUSTIC_CODEC_ROOT}/.." && pwd)}"
+
+source "${REPOS_ROOT}/workspace/jobs/env.sh"
+
+export SEMANTIC_ACOUSTIC_CODEC_ROOT
+export PYTHONPATH="${SEMANTIC_ACOUSTIC_CODEC_ROOT}/src:${REPOS_ROOT}/third_party/length-based-batching-adapter/src:${PYTHONPATH:-}"
+export SEMANTIC_ACOUSTIC_CODEC_PYTHON="${SEMANTIC_ACOUSTIC_CODEC_PYTHON:-${WORKSPACE_PYTHON:-python}}"
+if [[ -z "${SEMANTIC_ACOUSTIC_CODEC_TRAIN_ROOT:-}" ]]; then
+    : "${DYNAMIC_HOME:?Set DYNAMIC_HOME or SEMANTIC_ACOUSTIC_CODEC_TRAIN_ROOT before sourcing jobs/env.sh}"
+    SEMANTIC_ACOUSTIC_CODEC_TRAIN_ROOT="${DYNAMIC_HOME}/train/semantic-acoustic-codec"
+fi
+export SEMANTIC_ACOUSTIC_CODEC_TRAIN_ROOT

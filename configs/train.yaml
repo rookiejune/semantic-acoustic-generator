@@ -1,0 +1,70 @@
+defaults:
+  - _self_
+  - optional experiment: null
+
+route: fm
+condition_dim: 1024
+adapter: linear
+initialization: codec
+normalize_features: true
+device: null
+output_dir: null
+output_subdir: longcat/${route}-${decoder.layers}l/${initialization}
+
+decoder:
+  hidden_dim: null
+  layers: 8
+  heads: 8
+  ffn_ratio: 4
+  repa_feature_dim: null
+  repa_student_layer: null
+  repa_loss_weight: 0.0
+
+sampling:
+  flow_steps: 16
+  temperature: 1.0
+  top_p: 1.0
+
+optimizer:
+  learning_rate: 3e-4
+  weight_decay: 0.01
+
+data:
+  root: null
+  split: train
+  sample_index: 0
+  max_seconds: null
+  overlong: error
+  sample_limit: null
+  batch_size: 8
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  lba:
+    enabled: true
+    max_batch_seconds: 8.0
+    max_padding_ratio: 0.05
+    prefetch_batches: 4
+    planner_mode: quality
+    drop_last_flush: true
+
+train:
+  seed: 0
+  max_steps: 1000000
+
+trainer:
+  accelerator: auto
+  devices: auto
+  strategy: auto
+  use_distributed_sampler: true
+  precision: bf16-mixed
+  max_epochs: -1
+  log_every_n_steps: 10
+  enable_checkpointing: true
+  gradient_clip_val: 1.0
+
+checkpoint:
+  filename: step-{step:08d}
+  save_last: true
+  save_top_k: -1
+  every_n_train_steps: 10000
