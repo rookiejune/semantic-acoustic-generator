@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn
+from torch import nn
 
 from semantic_acoustic_codec.loss.types import LossItem
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 
 class TrainingSample(Protocol):

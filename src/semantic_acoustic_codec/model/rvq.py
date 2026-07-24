@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from anytrain.module.qwen import QwenMTPCodebookPredictor, top_p_filter
-from torch import Tensor, nn
+from torch import nn
 
 from semantic_acoustic_codec._tensor import is_signed_integer_dtype
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from torch import Tensor
 
 
 class AcousticRVQDecoder(nn.Module):
@@ -189,12 +193,12 @@ class AcousticRVQMTPDecoder(QwenMTPCodebookPredictor):
     def forward(
         self,
         condition: Tensor,
-        target_acoustic_codes: Tensor | None = None,
+        target_codes: Tensor | None = None,
         *,
         mask: Tensor | None = None,
     ) -> tuple[Tensor, ...]:
         """Return one teacher-forced [B, F, K_q] tensor per codebook."""
-        return super().forward(condition, target_acoustic_codes, mask=mask)
+        return super().forward(condition, target_codes, mask=mask)
 
 
 def _qwen3_model(

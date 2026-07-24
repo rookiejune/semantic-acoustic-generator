@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
-from torch import Tensor, nn
+from torch import nn
 
 from semantic_acoustic_codec.config import AdapterType, Initialization
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 
 class MLPAdapter(nn.Module):

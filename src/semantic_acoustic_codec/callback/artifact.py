@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from lightning import LightningModule, Trainer
 from lightning.pytorch.callbacks import Callback
 
-from semantic_acoustic_codec.pl_module import SemanticCodecModule
+from semantic_acoustic_codec.pl_module.semantic import SemanticCodecModule
+
+if TYPE_CHECKING:
+    from lightning import LightningModule, Trainer
 
 
 class ArtifactExport(Callback):
@@ -27,4 +30,3 @@ def _module(module: LightningModule) -> SemanticCodecModule:
 
 
 __all__ = ["ArtifactExport"]
-

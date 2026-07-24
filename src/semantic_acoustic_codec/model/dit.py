@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
-from anytrain.module.dit import DiT, DiTConditionState, DiTConditionType
-from torch import Tensor, nn
+from anytrain.module.dit import DiT, DiTConditionType
+from torch import nn
+
+if TYPE_CHECKING:
+    from anytrain.module.dit import DiTConditionState
+    from torch import Tensor
 
 
 class AcousticDiT(DiT):
@@ -39,10 +45,18 @@ class AcousticDiT(DiT):
         t: Tensor,
         *,
         condition: Tensor | None = None,
+        condition_mask: Tensor | None = None,
         condition_state: DiTConditionState | None = None,
         mask: Tensor | None = None,
     ) -> Tensor:
-        return super().forward(x_t, t, condition=condition, condition_state=condition_state, mask=mask)
+        return super().forward(
+            x_t,
+            t,
+            condition=condition,
+            condition_mask=condition_mask,
+            condition_state=condition_state,
+            mask=mask,
+        )
 
     def forward_with_features(
         self,
@@ -50,6 +64,7 @@ class AcousticDiT(DiT):
         t: Tensor,
         *,
         condition: Tensor | None = None,
+        condition_mask: Tensor | None = None,
         condition_state: DiTConditionState | None = None,
         mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
@@ -57,6 +72,7 @@ class AcousticDiT(DiT):
             x_t,
             t,
             condition=condition,
+            condition_mask=condition_mask,
             condition_state=condition_state,
             mask=mask,
         )

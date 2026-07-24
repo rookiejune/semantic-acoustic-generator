@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn
+from torch import nn
 
 from semantic_acoustic_codec._tensor import is_signed_integer_dtype
 from semantic_acoustic_codec.loss.types import LossItem
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 
 class RVQLoss(nn.Module):

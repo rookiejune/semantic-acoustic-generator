@@ -18,7 +18,4 @@
 
 ## speech-to-speech 接入前
 
-- 固定 artifact schema version。
-- 在本仓库提供 runtime loader，不依赖 `workspace` 或 `speech-to-speech`。
-- 在 `speech-to-speech` 增加 runtime preset 前，确认依赖方向只有 `speech-to-speech -> semantic-acoustic-codec`。
 - 用 `model/acoustic=none` 跑一条 TTS generation decode smoke。

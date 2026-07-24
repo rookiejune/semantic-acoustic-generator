@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 from lightning import LightningModule
-from torch import Tensor
 
 from semantic_acoustic_codec.config import Route
-from semantic_acoustic_codec.data import SemanticCodecBatch
-from semantic_acoustic_codec.loss import Teacher
-from semantic_acoustic_codec.model import backend_features
-from semantic_acoustic_codec.runtime import (
+from semantic_acoustic_codec.data.longcat import SemanticCodecBatch
+from semantic_acoustic_codec.runtime.semantic import (
     SemanticCodecSupport,
     SemanticSupportConfig,
     build_support,
     save_artifact,
 )
-from semantic_acoustic_codec.runtime.protocol import CodecBackend
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from typing import Any
+
+    from torch import Tensor
+
+    from semantic_acoustic_codec.loss.repa import Teacher
+    from semantic_acoustic_codec.runtime.protocol import CodecBackend
 
 
 class SemanticCodecModule(LightningModule):
@@ -29,6 +33,7 @@ class SemanticCodecModule(LightningModule):
         support: SemanticCodecSupport,
         config: SemanticSupportConfig,
         *,
+        backend: CodecBackend,
         learning_rate: float = 3e-4,
         weight_decay: float = 0.01,
         repa_teacher: Teacher | None = None,
@@ -52,6 +57,7 @@ class SemanticCodecModule(LightningModule):
         ):
             raise ValueError("REPA teacher feature_dim must match repa_feature_dim.")
         self.support = support
+        self.backend = backend
         self.config = config
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -61,16 +67,17 @@ class SemanticCodecModule(LightningModule):
         del batch_idx
         batch = _move(batch, self.device)
         mask = batch.mask
+        target_features = self._target_features(batch)
         condition = self.support.condition(
             batch.semantic_codes,
             mask=mask,
-            reference_acoustic_codes=batch.safe_acoustic_codes,
+            reference_features=target_features,
             reference_mask=mask,
         )
         output = self.support.generator.loss(
-            self.support.backend,
             batch,
             condition,
+            target_features,
             feature_mean=self.support.feature_mean,
             feature_std=self.support.feature_std,
             repa_teacher=self.repa_teacher,
@@ -103,10 +110,15 @@ class SemanticCodecModule(LightningModule):
         save_artifact(path, self.support, self.config)
 
     def _normalized_features(self, batch: SemanticCodecBatch) -> Tensor:
-        features = backend_features(self.support.backend, batch.safe_acoustic_codes, batch.mask)
+        features = self._target_features(batch)
         reference = self.support.feature_mean
         features = features.to(device=reference.device, dtype=reference.dtype)
         return (features - self.support.feature_mean) / self.support.feature_std
+
+    @torch.no_grad()
+    def _target_features(self, batch: SemanticCodecBatch) -> Tensor:
+        features = self.backend.acoustic_codes_to_features(batch.safe_acoustic_codes)
+        return features.masked_fill(~batch.mask[..., None], 0)
 
 
 @torch.no_grad()
@@ -125,10 +137,16 @@ def build_module(
             raise ValueError("feature normalization requires a representative sample batch.")
         mean, std = feature_stats(backend, sample)
         config = replace(config, feature_mean=mean, feature_std=std)
-    support = build_support(backend, config)
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    )
     return SemanticCodecModule(
         support,
         config,
+        backend=backend,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         repa_teacher=repa_teacher,
@@ -137,7 +155,8 @@ def build_module(
 
 @torch.no_grad()
 def feature_stats(backend: CodecBackend, batch: SemanticCodecBatch) -> tuple[tuple[float, ...], tuple[float, ...]]:
-    target = backend_features(backend, batch.safe_acoustic_codes, batch.mask).float()
+    target = backend.acoustic_codes_to_features(batch.safe_acoustic_codes).float()
+    target = target.masked_fill(~batch.mask[..., None], 0)
     valid = target[batch.mask]
     if valid.numel() == 0:
         raise ValueError("feature stats require at least one valid frame.")

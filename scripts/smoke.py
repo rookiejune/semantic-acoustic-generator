@@ -4,23 +4,30 @@ import argparse
 import importlib.util
 import os
 import tempfile
-from collections.abc import Iterable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
-from torch import Tensor
 
 from semantic_acoustic_codec.backend import LongCatBackend
 from semantic_acoustic_codec.config import DecoderConfig, Route
-from semantic_acoustic_codec.data import SemanticCodecBatch, collate
+from semantic_acoustic_codec.data import collate
 from semantic_acoustic_codec.loss import FlowLoss, RVQLoss
 from semantic_acoustic_codec.model import RectifiedFlowRuntime, backend_features, build_route
 from semantic_acoustic_codec.runtime import (
+    SemanticCodecRuntime,
     SemanticSupportConfig,
     build_support,
     load_artifact,
     save_artifact,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from torch import Tensor
+
+    from semantic_acoustic_codec.data.longcat import SemanticCodecBatch
 
 
 class FakeEncoder:
@@ -137,7 +144,14 @@ def _route_smoke(
         if route is Route.RVQ and importlib.util.find_spec("transformers") is None:
             print("rvq smoke skipped: transformers is not installed")
             continue
-        modules = build_route(route, backend, condition_dim=12, decoder=decoder)
+        modules = build_route(
+            route,
+            backend.semantic_codebook,
+            backend.acoustic_feature_dim,
+            backend.acoustic_codebook_sizes,
+            condition_dim=12,
+            decoder=decoder,
+        )
         optimizer = torch.optim.AdamW(
             list(modules.conditioner.parameters())
             + list(modules.reference_conditioner.parameters())
@@ -164,16 +178,22 @@ def _route_smoke(
 def _artifact_smoke(backend: LongCatBackend, decoder: DecoderConfig) -> None:
     semantic, _, mask = _batch()
     config = SemanticSupportConfig(route=Route.FM, condition_dim=12, decoder=decoder)
-    support = build_support(backend, config).eval()
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    ).eval()
+    runtime = SemanticCodecRuntime(support, backend)
     features = support.sample_features(semantic, mask=mask, generator=torch.Generator().manual_seed(0))
-    waveform = support.decode(semantic, mask=mask, generator=torch.Generator().manual_seed(1))
+    waveform = runtime.decode(semantic, mask=mask, generator=torch.Generator().manual_seed(1))
     if features.shape != (*semantic.shape[:2], backend.acoustic_feature_dim):
         raise RuntimeError("artifact smoke produced an unexpected feature shape.")
     if waveform.dim() != 3 or not bool(torch.isfinite(waveform).all()):
         raise RuntimeError("artifact smoke produced an invalid waveform.")
     with tempfile.TemporaryDirectory(prefix="semantic-acoustic-codec-") as tmp:
         save_artifact(tmp, support, config)
-        loaded = load_artifact(tmp, backend=backend)
+        loaded = load_artifact(tmp)
         loaded_features = loaded.sample_features(semantic, mask=mask, generator=torch.Generator().manual_seed(0))
     if not torch.allclose(features, loaded_features):
         raise RuntimeError("artifact smoke changed seeded FM features.")

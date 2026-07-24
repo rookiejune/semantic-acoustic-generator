@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 from anydataset.types import AudioItem, AudioView, Modality, Role
@@ -10,6 +9,10 @@ from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 
 from semantic_acoustic_codec._tensor import is_signed_integer_dtype
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+    from typing import Any
 
 LONGCAT_VIEW = AudioView.LONGCAT
 PAD_ID = -1

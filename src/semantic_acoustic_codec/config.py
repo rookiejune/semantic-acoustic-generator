@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING
 
 from semantic_acoustic_codec._compat import StrEnum, auto
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class Route(StrEnum):
@@ -58,19 +60,44 @@ def decoder_options(
         return DecoderConfig()
     if isinstance(config, DecoderConfig):
         return config
-    predictor = cast(str, config.get("rvq_predictor", "codebook_ar"))
+    predictor = config.get("rvq_predictor", RVQPredictor.CODEBOOK_AR.value)
+    if not isinstance(predictor, str):
+        raise TypeError("rvq_predictor must be a string.")
     return DecoderConfig(
-        hidden_dim=cast(int | None, config["hidden_dim"]),
-        layers=cast(int, config["layers"]),
-        heads=cast(int, config["heads"]),
-        ffn_ratio=cast(int, config["ffn_ratio"]),
+        hidden_dim=_optional_int(config.get("hidden_dim"), name="hidden_dim"),
+        layers=_int(config["layers"], name="layers"),
+        heads=_int(config["heads"], name="heads"),
+        ffn_ratio=_int(config["ffn_ratio"], name="ffn_ratio"),
         rvq_predictor=RVQPredictor(predictor),
-        mtp_layers=int(cast(int, config.get("mtp_layers", 2))),
-        mtp_heads=int(cast(int, config.get("mtp_heads", 4))),
-        repa_feature_dim=cast(int | None, config.get("repa_feature_dim")),
-        repa_student_layer=cast(int | None, config.get("repa_student_layer")),
-        repa_loss_weight=float(cast(float, config.get("repa_loss_weight", 0.0))),
+        mtp_layers=_int(config.get("mtp_layers", 2), name="mtp_layers"),
+        mtp_heads=_int(config.get("mtp_heads", 4), name="mtp_heads"),
+        repa_feature_dim=_optional_int(config.get("repa_feature_dim"), name="repa_feature_dim"),
+        repa_student_layer=_optional_int(
+            config.get("repa_student_layer"),
+            name="repa_student_layer",
+        ),
+        repa_loss_weight=_float(config.get("repa_loss_weight", 0.0), name="repa_loss_weight"),
     )
+
+
+def _optional_int(value: object, *, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer or None.")
+    return value
+
+
+def _int(value: object, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer.")
+    return value
+
+
+def _float(value: object, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number.")
+    return float(value)
 
 
 __all__ = [

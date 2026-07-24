@@ -53,14 +53,18 @@ class CodecBackend(Protocol):
 
 
 class SemanticCodecSupport(nn.Module):
-    backend: CodecBackend
     generator: CodecUnitGenerator
 
-    def encode(self, audio: Tensor, sample_rate: int) -> Tensor:
-        """Return semantic codes with shape [batch, frame, 1]."""
+    def sample_features(self, semantic_codes: Tensor) -> Tensor: ...
+    def sample_acoustic_codes(self, semantic_codes: Tensor) -> Tensor: ...
 
-    def decode(self, semantic_codes: Tensor) -> Tensor:
-        """Generate missing codec units internally and return waveform."""
+
+class SemanticCodecRuntime:
+    support: SemanticCodecSupport
+    backend: CodecBackend
+
+    def encode(self, audio: Tensor, sample_rate: int) -> Tensor: ...
+    def decode(self, semantic_codes: Tensor) -> Tensor: ...
 ```
 
 训练侧另外定义 codec unit generator，不要求调用方知道 FM/RVQ 或 codec-specific side-unit 路线：
@@ -86,7 +90,7 @@ class CodecUnitGenerator(Protocol):
 ```text
 src/semantic_acoustic_codec/
   backend/        # LongCatBackend / BiCodecBackend adapters around real codec instances
-  runtime/        # SemanticCodecSupport, artifact loader and public Protocols
+  runtime/        # codec-free support, codec runtime composition, artifact loader and Protocols
   datamodule/     # wmt19_tts_codec(longcat) batch extraction, collate and Lightning data modules
   model/
     condition.py  # semantic embedding, BPE span repeat, adapter
@@ -181,8 +185,9 @@ features / RVQ codes、BiCodec 的 semantic 外 global / acoustic / residual uni
 
 训练时可以使用 target side units 构造 backend feature、loss target 或 condition dropout；这些只属于
 `datamodule/`、`pl_module/` 和 `model/` 的训练内部契约。推理 artifact 必须保存生成缺失 units 所需的
-模型权重、normalization 和 backend metadata，加载后由 `SemanticCodecSupport.decode(semantic_codes)` 完成
-端到端 waveform reconstruction。
+模型权重、normalization 和 backend compatibility metadata。`SemanticCodecSupport` 本身不持有 codec；
+加载后由 `SemanticCodecRuntime(support, backend).decode(semantic_codes)` 完成端到端 waveform
+reconstruction。
 
 ## 训练与验收
 
@@ -202,8 +207,8 @@ P0 文档落地后，代码实现按以下闭环推进：
 
 迁移目标是：
 
-- `semantic-acoustic-codec` 拥有 LongCat/BiCodec backend adapter、SemanticCodecSupport、FM/RVQ unit generator、sampling 和
-  `decode(semantic_codes)` 实现。
+- `semantic-acoustic-codec` 拥有 LongCat/BiCodec backend adapter、codec-free `SemanticCodecSupport`、
+  FM/RVQ unit generator、sampling 和 `SemanticCodecRuntime.decode(semantic_codes)` 实现。
 - `speech-to-speech` 拥有 text/audio token model、task datamodule、generation service 和
   evaluation。
 - `speech-to-speech` 只通过公开 `SemanticCodecSupport`、`CodecBackend`、`CodecUnitGenerator` 和
@@ -214,8 +219,8 @@ P0 文档落地后，代码实现按以下闭环推进：
 - 本仓库不 import `speech_to_speech`。
 - 可复用的 oracle model、Flow/RVQ decoder 和 condition 初始化逻辑从 `speech-to-speech` 迁移或复制到
   本仓库后，`speech-to-speech` 再删除本地重复实现。
-- generation 中 semantic-only decode 使用 `support.decode(semantic_codes)`；有 acoustic features 的训练/日志路径使用
-  `support.decode_features(semantic_codes, features)`。
+- generation 中 semantic-only decode 使用 `SemanticCodecRuntime(support, backend).decode(...)`；训练只用
+  backend 将 prepared acoustic codes 转成 target/reference features，support 不持有 backend。
 - checkpoints 使用稳定前缀区分 semantic condition、unit generator 和 support wrapper，不依赖调用方包名。
 
 ## 关键风险

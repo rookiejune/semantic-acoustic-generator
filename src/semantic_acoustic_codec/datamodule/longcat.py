@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import math
 import warnings
-from collections.abc import Mapping, Sequence, Sized
+from collections.abc import Sized
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, cast
 
 from lightning import pytorch as pl
-from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, Subset
 from zhuyin.datasets.wmt19_tts import wmt19_tts_codec
 
 from semantic_acoustic_codec.data.longcat import PAD_ID, SemanticCodecBatch, codes, split_codes
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+    from typing import Any, Literal
+
+    from torch import Tensor
 
 
 @dataclass(frozen=True)
@@ -23,7 +28,7 @@ class LBAConfig:
     max_batch_seconds: float = 8.0
     max_padding_ratio: float = 0.05
     prefetch_batches: int = 4
-    planner_mode: str = "quality"
+    planner_mode: Literal["quality", "throughput"] = "quality"
     drop_last_flush: bool = True
 
     def __post_init__(self) -> None:
@@ -119,13 +124,14 @@ class DataModule(pl.LightningDataModule):
         if self.dataset is not None:
             return
         data = self.data
-        dataset: Dataset[Any] = cast(
-            Dataset[Any],
-            wmt19_tts_codec(codec="longcat", root=_path(data.root), split=data.split),
+        dataset: Dataset[Any] = wmt19_tts_codec(
+            codec="longcat",
+            root=_path(data.root),
+            split=data.split,
         )
         sample_limit = data.sample_limit
         if sample_limit is not None:
-            dataset = Subset(dataset, range(min(sample_limit, len(cast(Sized, dataset)))))
+            dataset = Subset(dataset, range(min(sample_limit, len(dataset))))
         if data.overlong == "filter":
             dataset, self.filtered_samples = _filter(dataset, data=data, frame_rate=self.frame_rate)
             if self.filtered_samples:
@@ -171,7 +177,7 @@ class DataModule(pl.LightningDataModule):
             max_padded_length=_frames(lba.max_batch_seconds, self.frame_rate),
             max_padding_ratio=lba.max_padding_ratio,
             prefetch_batches=lba.prefetch_batches,
-            planner_mode=cast(Literal["quality", "throughput"], lba.planner_mode),
+            planner_mode=lba.planner_mode,
             drop_last_flush=lba.drop_last_flush,
             log_dir=self.output_dir / "lba",
         )
@@ -226,7 +232,8 @@ def collate_codes(values: Sequence[Tensor]) -> SemanticCodecBatch:
 
 def single_batch_loader(value: Tensor) -> DataLoader[SemanticCodecBatch]:
     dataset = cast(Dataset[Tensor], cast(object, [value]))
-    return DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=collate_codes)
+    loader = DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=collate_codes)
+    return cast(DataLoader[SemanticCodecBatch], cast(object, loader))
 
 
 def _filter(
@@ -239,7 +246,7 @@ def _filter(
     if max_seconds is None:
         return dataset, 0
     max_frames = _frames(max_seconds, frame_rate)
-    size = len(cast(Sized, dataset))
+    size = len(cast(Sized, cast(object, dataset)))
     indices = [index for index in range(size) if codes(dataset[index]).size(0) <= max_frames]
     dropped = size - len(indices)
     if not indices:

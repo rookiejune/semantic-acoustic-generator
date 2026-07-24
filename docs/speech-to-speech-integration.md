@@ -28,13 +28,12 @@ semantic-acoustic-codec -> speech-to-speech
 
 ## 2. speech-to-speech 需要消费什么
 
-`speech-to-speech` 需要的是一个满足 semantic-only support contract 的对象：
+`speech-to-speech` 保留负责数据和 token layout 的完整 backend codec，并额外消费一个满足
+semantic-only decode contract 的对象：
 
 ```python
 codec.sample_rate
 codec.frame_rate
-codec.semantic_codebook
-codec.encode(audio, sample_rate)       # -> semantic codes
 codec.decode(semantic_codes)           # -> waveform
 ```
 
@@ -112,12 +111,9 @@ checkpoint_dir/
 
 ```yaml
 runtime:
-  codec: semantic_acoustic
-  codec_artifact: /path/to/semantic-acoustic-codec/checkpoint_dir
-  audio_tokenizer: native
-model:
-  acoustic:
-    name: none
+  codec: longcat
+  semantic_codec_artifact: /path/to/semantic-acoustic-codec/checkpoint_dir
+model/acoustic: none
 ```
 
 具体字段名后续以 `speech-to-speech` runtime schema 为准，但原则是：S2S 不重建本仓库模型配置，

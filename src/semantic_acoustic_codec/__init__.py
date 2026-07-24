@@ -19,6 +19,7 @@ from semantic_acoustic_codec.model import (
 from semantic_acoustic_codec.runtime import (
     CodecBackend,
     SamplingConfig,
+    SemanticCodecRuntime,
     SemanticCodecSupport,
     SemanticSupportConfig,
     build_support,
@@ -41,6 +42,7 @@ __all__ = [
     "Route",
     "RouteModules",
     "SamplingConfig",
+    "SemanticCodecRuntime",
     "SemanticCodecSupport",
     "SemanticSupportConfig",
     "SemanticConditioner",

@@ -83,7 +83,7 @@ def test_training_module_trains_and_exports_artifact(tmp_path) -> None:
     loss = output["loss"]
     loss.backward()
     module.export_artifact(tmp_path)
-    loaded = load_artifact(tmp_path, backend=backend)
+    loaded = load_artifact(tmp_path)
 
     assert torch.isfinite(loss)
     assert module.config.feature_mean is not None

@@ -2,24 +2,27 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 
 from semantic_acoustic_codec.config import DecoderConfig, Route, RVQPredictor
-from semantic_acoustic_codec.data import SemanticCodecBatch
-from semantic_acoustic_codec.loss import (
-    FlowLoss,
-    LossItem,
-    RectifiedFlowRuntime,
-    RepaLoss,
-    RVQLoss,
-    Teacher,
-)
+from semantic_acoustic_codec.loss.flow import FlowLoss, RectifiedFlowRuntime
+from semantic_acoustic_codec.loss.repa import RepaLoss
+from semantic_acoustic_codec.loss.rvq import RVQLoss
 from semantic_acoustic_codec.model.dit import DiTDecoder
 from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder, AcousticRVQMTPDecoder
-from semantic_acoustic_codec.runtime.protocol import CodecBackend
+
+if TYPE_CHECKING:
+    from typing import Any
+
+    from torch import Tensor
+
+    from semantic_acoustic_codec.data.longcat import SemanticCodecBatch
+    from semantic_acoustic_codec.loss.repa import Teacher
+    from semantic_acoustic_codec.loss.types import LossItem
+    from semantic_acoustic_codec.runtime.protocol import CodecBackend
 
 
 @dataclass(frozen=True)
@@ -37,7 +40,6 @@ class CodecUnitGenerator(ABC, nn.Module):
     @abstractmethod
     def sample_features(
         self,
-        backend: CodecBackend,
         condition: Tensor,
         mask: Tensor,
         *,
@@ -63,9 +65,9 @@ class CodecUnitGenerator(ABC, nn.Module):
     @abstractmethod
     def loss(
         self,
-        backend: CodecBackend,
         batch: SemanticCodecBatch,
         condition: Tensor,
+        target_features: Tensor | None = None,
         *,
         feature_mean: Tensor,
         feature_std: Tensor,
@@ -101,7 +103,6 @@ class FMFeatureGenerator(CodecUnitGenerator):
     @torch.no_grad()
     def sample_features(
         self,
-        backend: CodecBackend,
         condition: Tensor,
         mask: Tensor,
         *,
@@ -112,7 +113,7 @@ class FMFeatureGenerator(CodecUnitGenerator):
         top_p: float,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        del backend, temperature, top_p
+        del temperature, top_p
         features = self.core.sample(
             condition,
             mask=mask,
@@ -123,15 +124,17 @@ class FMFeatureGenerator(CodecUnitGenerator):
 
     def loss(
         self,
-        backend: CodecBackend,
         batch: SemanticCodecBatch,
         condition: Tensor,
+        target_features: Tensor | None = None,
         *,
         feature_mean: Tensor,
         feature_std: Tensor,
         repa_teacher: Teacher | None = None,
     ) -> DecoderLoss:
-        target = _normalized_features(backend, batch, feature_mean=feature_mean, feature_std=feature_std)
+        if target_features is None:
+            raise ValueError("FM loss requires acoustic target features.")
+        target = _normalized_features(target_features, batch.mask, feature_mean, feature_std)
         if self.repa_loss_weight <= 0:
             item = self.flow_loss(self.core, condition, target, batch.mask, self.flow_runtime)
             return DecoderLoss(
@@ -208,7 +211,6 @@ class RVQCodeGenerator(CodecUnitGenerator):
     @torch.no_grad()
     def sample_features(
         self,
-        backend: CodecBackend,
         condition: Tensor,
         mask: Tensor,
         *,
@@ -219,15 +221,8 @@ class RVQCodeGenerator(CodecUnitGenerator):
         top_p: float,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        del feature_mean, feature_std, flow_steps
-        codes = self.sample_acoustic_codes(
-            condition,
-            mask,
-            temperature=temperature,
-            top_p=top_p,
-            generator=generator,
-        )
-        return backend.acoustic_codes_to_features(codes).to(device=condition.device, dtype=condition.dtype)
+        del feature_mean, feature_std, flow_steps, temperature, top_p, generator
+        raise RuntimeError("RVQ feature conversion requires a codec runtime.")
 
     @torch.no_grad()
     def sample_acoustic_codes(
@@ -249,15 +244,15 @@ class RVQCodeGenerator(CodecUnitGenerator):
 
     def loss(
         self,
-        backend: CodecBackend,
         batch: SemanticCodecBatch,
         condition: Tensor,
+        target_features: Tensor | None = None,
         *,
         feature_mean: Tensor,
         feature_std: Tensor,
         repa_teacher: Teacher | None = None,
     ) -> DecoderLoss:
-        del backend, feature_mean, feature_std, repa_teacher
+        del target_features, feature_mean, feature_std, repa_teacher
         labels = batch.safe_acoustic_codes
         item = self.rvq_loss(self.core(condition, labels, mask=batch.mask), labels, batch.mask)
         return DecoderLoss(
@@ -268,20 +263,27 @@ class RVQCodeGenerator(CodecUnitGenerator):
 
 
 @torch.no_grad()
-def backend_features(backend: CodecBackend, acoustic_codes: Tensor, mask: Tensor) -> Tensor:
+def backend_features(
+    backend: CodecBackend,
+    acoustic_codes: Tensor,
+    mask: Tensor,
+) -> Tensor:
     if acoustic_codes.dim() != 3 or mask.shape != acoustic_codes.shape[:2]:
-        raise ValueError("acoustic_codes and mask must have shapes [B, F, K] and [B, F].")
-    features = backend.acoustic_codes_to_features(acoustic_codes.masked_fill(~mask[..., None], 0))
+        raise ValueError(
+            "acoustic_codes and mask must have shapes [B, F, K] and [B, F]."
+        )
+    safe_codes = acoustic_codes.masked_fill(~mask[..., None], 0)
+    features = backend.acoustic_codes_to_features(safe_codes)
     return features.masked_fill(~mask[..., None], 0)
 
 
 def _normalized_features(
-    backend: CodecBackend,
-    batch: SemanticCodecBatch,
-    *,
+    features: Tensor,
+    mask: Tensor,
     feature_mean: Tensor,
     feature_std: Tensor,
 ) -> Tensor:
-    features = backend_features(backend, batch.safe_acoustic_codes, batch.mask)
+    if features.dim() != 3 or mask.shape != features.shape[:2]:
+        raise ValueError("acoustic target features and mask must align on [B, F].")
     features = features.to(device=feature_mean.device, dtype=feature_mean.dtype)
     return (features - feature_mean) / feature_std

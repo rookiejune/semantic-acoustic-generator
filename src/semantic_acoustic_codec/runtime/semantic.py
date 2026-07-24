@@ -4,13 +4,12 @@ import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 from torch import Tensor, nn
 
 from semantic_acoustic_codec._tensor import is_signed_integer_dtype
-from semantic_acoustic_codec.backend import LongCatBackend
 from semantic_acoustic_codec.config import (
     AdapterType,
     DecoderConfig,
@@ -19,9 +18,11 @@ from semantic_acoustic_codec.config import (
     RVQPredictor,
 )
 from semantic_acoustic_codec.model.routes import RouteModules, build_route
-from semantic_acoustic_codec.runtime.protocol import CodecBackend
 
-SCHEMA_VERSION = 2
+if TYPE_CHECKING:
+    from semantic_acoustic_codec.runtime.protocol import CodecBackend
+
+SCHEMA_VERSION = 3
 CONFIG_NAME = "codec.json"
 CHECKPOINT_NAME = "model.ckpt"
 
@@ -69,63 +70,29 @@ class SemanticSupportConfig:
 
 
 class SemanticCodecSupport(nn.Module):
-    """Semantic-only support wrapper around a real codec backend and unit generator."""
+    """Trainable semantic-to-acoustic unit generator with no codec ownership."""
 
     def __init__(
         self,
-        backend: CodecBackend,
         modules: RouteModules,
+        acoustic_feature_dim: int,
         *,
         sampling: SamplingConfig | None = None,
         feature_mean: Tensor | None = None,
         feature_std: Tensor | None = None,
     ) -> None:
         super().__init__()
-        self.backend = backend
+        if acoustic_feature_dim <= 0:
+            raise ValueError("acoustic_feature_dim must be positive.")
         self.conditioner = modules.conditioner
         self.reference_conditioner = modules.reference_conditioner
         self.generator = modules.generator
         self.route = modules.route
+        self.acoustic_feature_dim = acoustic_feature_dim
+        self.acoustic_codebook_sizes = modules.acoustic_codebook_sizes
         self.sampling = SamplingConfig() if sampling is None else sampling
-        self.feature_mean = nn.Buffer(_feature_stat(backend, feature_mean, fill=0.0))
-        self.feature_std = nn.Buffer(_feature_stat(backend, feature_std, fill=1.0))
-
-    @property
-    def sample_rate(self) -> int:
-        return self.backend.sample_rate
-
-    @property
-    def frame_rate(self) -> float:
-        return self.backend.frame_rate
-
-    @property
-    def semantic_codebook(self) -> Tensor:
-        return self.backend.semantic_codebook
-
-    @torch.no_grad()
-    def encode(self, audio: Tensor, sample_rate: int) -> Tensor:
-        codes = self.backend.encode(audio, sample_rate)
-        if codes.dim() != 3 or codes.size(-1) < 1:
-            raise ValueError("backend encode must return codes with shape [B, F, K].")
-        if not is_signed_integer_dtype(codes.dtype):
-            raise TypeError("backend encode must return signed integer codes.")
-        return codes[..., :1].to(dtype=torch.long).contiguous()
-
-    @torch.no_grad()
-    def decode(
-        self,
-        semantic_codes: Tensor,
-        *,
-        mask: Tensor | None = None,
-        generator: torch.Generator | None = None,
-    ) -> Tensor:
-        prepared, frame_mask = self._semantic_input(semantic_codes, mask)
-        features = self.sample_features(
-            prepared,
-            mask=frame_mask,
-            generator=generator,
-        )
-        return self.backend.decode_features(prepared, features)
+        self.feature_mean = nn.Buffer(_feature_stat(acoustic_feature_dim, feature_mean, fill=0.0))
+        self.feature_std = nn.Buffer(_feature_stat(acoustic_feature_dim, feature_std, fill=1.0))
 
     @torch.no_grad()
     def sample_features(
@@ -137,8 +104,9 @@ class SemanticCodecSupport(nn.Module):
     ) -> Tensor:
         prepared, frame_mask = self._semantic_input(semantic_codes, mask)
         condition = self.condition(prepared, mask=frame_mask)
+        if self.route is Route.RVQ:
+            raise RuntimeError("RVQ feature conversion requires a codec runtime.")
         features = self.generator.sample_features(
-            self.backend,
             condition,
             frame_mask,
             feature_mean=self.feature_mean,
@@ -173,7 +141,6 @@ class SemanticCodecSupport(nn.Module):
         semantic_codes: Tensor,
         *,
         mask: Tensor | None = None,
-        reference_acoustic_codes: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
     ) -> Tensor:
@@ -181,51 +148,20 @@ class SemanticCodecSupport(nn.Module):
         semantic = self.conditioner(prepared)
         reference = self._reference_condition(
             batch_size=prepared.size(0),
-            reference_acoustic_codes=reference_acoustic_codes,
             reference_features=reference_features,
             reference_mask=reference_mask,
         )
         return (semantic + reference).masked_fill(~frame_mask[..., None], 0)
 
-    @torch.no_grad()
-    def decode_features(self, semantic_codes: Tensor, features: Tensor) -> Tensor:
-        prepared, _ = self._semantic_input(semantic_codes, None)
-        if features.shape[:2] != prepared.shape[:2] or features.dim() != 3:
-            raise ValueError("features must have shape [B, F, D] and align with semantic codes.")
-        if features.size(-1) != self.backend.acoustic_feature_dim:
-            raise ValueError("features must match backend acoustic_feature_dim.")
-        return self.backend.decode_features(prepared, features)
-
     def _reference_condition(
         self,
         *,
         batch_size: int,
-        reference_acoustic_codes: Tensor | None,
         reference_features: Tensor | None,
         reference_mask: Tensor | None,
     ) -> Tensor:
-        if reference_acoustic_codes is not None and reference_features is not None:
-            raise ValueError("provide reference_acoustic_codes or reference_features, not both.")
         features = reference_features
-        if reference_acoustic_codes is not None:
-            if reference_acoustic_codes.dim() != 3 or reference_acoustic_codes.size(-1) < 1:
-                raise ValueError("reference_acoustic_codes must have shape [B, F, K].")
-            if not is_signed_integer_dtype(reference_acoustic_codes.dtype):
-                raise TypeError("reference_acoustic_codes must use a signed integer dtype.")
-            if reference_mask is None:
-                reference_mask = torch.ones(
-                    reference_acoustic_codes.shape[:2],
-                    device=reference_acoustic_codes.device,
-                    dtype=torch.bool,
-                )
-            elif reference_mask.shape != reference_acoustic_codes.shape[:2]:
-                raise ValueError("reference_mask must align with reference_acoustic_codes.")
-            elif reference_mask.dtype != torch.bool:
-                raise TypeError("reference_mask must be boolean.")
-            safe_codes = reference_acoustic_codes.masked_fill(~reference_mask[..., None], 0)
-            with torch.no_grad():
-                features = self.backend.acoustic_codes_to_features(safe_codes)
-        elif features is not None and reference_mask is not None:
+        if features is not None and reference_mask is not None:
             if reference_mask.shape != features.shape[:2]:
                 raise ValueError("reference_mask must align with reference_features.")
             if reference_mask.dtype != torch.bool:
@@ -279,10 +215,78 @@ class SemanticCodecSupport(nn.Module):
         return prepared.masked_fill(~frame_mask[..., None], 0), frame_mask
 
 
-def build_support(backend: CodecBackend, config: SemanticSupportConfig) -> SemanticCodecSupport:
+class SemanticCodecRuntime:
+    """Compose a semantic unit generator with a codec for waveform I/O."""
+
+    def __init__(self, support: SemanticCodecSupport, backend: CodecBackend) -> None:
+        self.support = support
+        self.backend = backend
+        _validate_backend_metadata(_support_metadata(support), backend)
+
+    @property
+    def sample_rate(self) -> int:
+        return self.backend.sample_rate
+
+    @property
+    def frame_rate(self) -> float:
+        return self.backend.frame_rate
+
+    @torch.no_grad()
+    def encode(self, audio: Tensor, sample_rate: int) -> Tensor:
+        codes = self.backend.encode(audio, sample_rate)
+        if codes.dim() != 3 or codes.size(-1) < 1:
+            raise ValueError("backend encode must return codes with shape [B, F, K].")
+        if not is_signed_integer_dtype(codes.dtype):
+            raise TypeError("backend encode must return signed integer codes.")
+        return codes[..., :1].to(dtype=torch.long).contiguous()
+
+    @torch.no_grad()
+    def sample_features(
+        self,
+        semantic_codes: Tensor,
+        *,
+        mask: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        if self.support.route is Route.FM:
+            return self.support.sample_features(semantic_codes, mask=mask, generator=generator)
+        codes = self.support.sample_acoustic_codes(semantic_codes, mask=mask, generator=generator)
+        return self.backend.acoustic_codes_to_features(codes)
+
+    @torch.no_grad()
+    def decode(
+        self,
+        semantic_codes: Tensor,
+        *,
+        mask: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        prepared, frame_mask = self.support._semantic_input(semantic_codes, mask)
+        features = self.sample_features(prepared, mask=frame_mask, generator=generator)
+        return self.backend.decode_features(prepared, features)
+
+    @torch.no_grad()
+    def decode_features(self, semantic_codes: Tensor, features: Tensor) -> Tensor:
+        prepared, _ = self.support._semantic_input(semantic_codes, None)
+        if features.shape[:2] != prepared.shape[:2] or features.dim() != 3:
+            raise ValueError("features must have shape [B, F, D] and align with semantic codes.")
+        if features.size(-1) != self.support.acoustic_feature_dim:
+            raise ValueError("features must match support acoustic_feature_dim.")
+        return self.backend.decode_features(prepared, features)
+
+
+def build_support(
+    config: SemanticSupportConfig,
+    *,
+    semantic_codebook: Tensor,
+    acoustic_feature_dim: int,
+    acoustic_codebook_sizes: tuple[int, ...],
+) -> SemanticCodecSupport:
     modules = build_route(
         config.route,
-        backend,
+        semantic_codebook,
+        acoustic_feature_dim,
+        acoustic_codebook_sizes,
         condition_dim=config.condition_dim,
         decoder=config.decoder,
         adapter=config.adapter,
@@ -292,8 +296,8 @@ def build_support(backend: CodecBackend, config: SemanticSupportConfig) -> Seman
     mean = None if config.feature_mean is None else torch.tensor(config.feature_mean, dtype=torch.float32)
     std = None if config.feature_std is None else torch.tensor(config.feature_std, dtype=torch.float32)
     return SemanticCodecSupport(
-        backend,
         modules,
+        acoustic_feature_dim,
         sampling=config.sampling,
         feature_mean=mean,
         feature_std=std,
@@ -310,12 +314,7 @@ def save_artifact(path: str | Path, support: SemanticCodecSupport, config: Seman
         "schema_version": SCHEMA_VERSION,
         "config": _config_dict(config),
         "backend": {
-            "name": support.backend.name,
-            "sample_rate": support.sample_rate,
-            "frame_rate": support.frame_rate,
-            "semantic_vocab_size": int(support.semantic_codebook.size(0)),
-            "acoustic_feature_dim": int(support.backend.acoustic_feature_dim),
-            "acoustic_codebook_sizes": list(support.backend.acoustic_codebook_sizes),
+            **_support_metadata(support),
         },
         "checkpoint": CHECKPOINT_NAME,
     }
@@ -325,7 +324,6 @@ def save_artifact(path: str | Path, support: SemanticCodecSupport, config: Seman
 def load_artifact(
     path: str | Path,
     *,
-    backend: CodecBackend | None = None,
     device: str | torch.device | None = None,
 ) -> SemanticCodecSupport:
     root = Path(path)
@@ -333,10 +331,16 @@ def load_artifact(
     if data.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"unsupported semantic codec schema: {data.get('schema_version')!r}")
     backend_data = cast(Mapping[str, object], data["backend"])
-    backend = _load_backend(backend_data, device=device) if backend is None else backend
     config = _config(data["config"])
-    _validate_backend_metadata(backend_data, backend)
-    support = build_support(backend, config)
+    support = build_support(
+        config,
+        semantic_codebook=torch.empty(
+            _metadata_int(backend_data, "semantic_vocab_size"),
+            _metadata_int(backend_data, "semantic_embedding_dim"),
+        ),
+        acoustic_feature_dim=_metadata_int(backend_data, "acoustic_feature_dim"),
+        acoustic_codebook_sizes=_metadata_sizes(backend_data),
+    )
     state = _load_state(root / str(data.get("checkpoint", CHECKPOINT_NAME)), device=device)
     support.load_state_dict(state)
     if device is not None:
@@ -354,12 +358,6 @@ def _load_state(path: Path, *, device: str | torch.device | None) -> Mapping[str
         raise TypeError("semantic codec checkpoint must contain a state dict mapping.")
     return cast(Mapping[str, Tensor], state)
 
-
-def _load_backend(data: Mapping[str, object], *, device: str | torch.device | None) -> CodecBackend:
-    name = data.get("name")
-    if name == LongCatBackend.name:
-        return LongCatBackend.from_pretrained(device=None if device is None else str(device))
-    raise ValueError(f"unsupported codec backend: {name!r}")
 
 
 def _config_dict(config: SemanticSupportConfig) -> dict[str, object]:
@@ -380,15 +378,17 @@ def _config(data: Mapping[str, Any]) -> SemanticSupportConfig:
         route=Route(cast(str, data["route"])),
         condition_dim=int(data["condition_dim"]),
         decoder=DecoderConfig(
-            hidden_dim=cast(int | None, decoder["hidden_dim"]),
+            hidden_dim=cast(Optional[int], decoder["hidden_dim"]),
             layers=int(decoder["layers"]),
             heads=int(decoder["heads"]),
             ffn_ratio=int(decoder["ffn_ratio"]),
-            rvq_predictor=RVQPredictor(cast(str, decoder.get("rvq_predictor", RVQPredictor.CODEBOOK_AR.value))),
+            rvq_predictor=RVQPredictor(
+                cast(str, decoder.get("rvq_predictor", RVQPredictor.CODEBOOK_AR.value))
+            ),
             mtp_layers=int(decoder.get("mtp_layers", 2)),
             mtp_heads=int(decoder.get("mtp_heads", 4)),
-            repa_feature_dim=cast(int | None, decoder.get("repa_feature_dim")),
-            repa_student_layer=cast(int | None, decoder.get("repa_student_layer")),
+            repa_feature_dim=cast(Optional[int], decoder.get("repa_feature_dim")),
+            repa_student_layer=cast(Optional[int], decoder.get("repa_student_layer")),
             repa_loss_weight=float(decoder.get("repa_loss_weight", 0.0)),
         ),
         adapter=None if adapter is None else AdapterType(cast(str, adapter)),
@@ -404,26 +404,12 @@ def _config(data: Mapping[str, Any]) -> SemanticSupportConfig:
     )
 
 
-def _validate_backend_metadata(data: Mapping[str, object], backend: CodecBackend) -> None:
-    expected = {
-        "name": backend.name,
-        "sample_rate": backend.sample_rate,
-        "frame_rate": backend.frame_rate,
-        "semantic_vocab_size": int(backend.semantic_codebook.size(0)),
-        "acoustic_feature_dim": backend.acoustic_feature_dim,
-        "acoustic_codebook_sizes": list(backend.acoustic_codebook_sizes),
-    }
-    for key, value in expected.items():
-        if data.get(key) != value:
-            raise ValueError(f"backend metadata mismatch for {key}: {data.get(key)!r} != {value!r}")
-
-
-def _feature_stat(backend: CodecBackend, value: Tensor | None, *, fill: float) -> Tensor:
+def _feature_stat(acoustic_feature_dim: int, value: Tensor | None, *, fill: float) -> Tensor:
     if value is None:
-        return torch.full((1, 1, backend.acoustic_feature_dim), fill)
+        return torch.full((1, 1, acoustic_feature_dim), fill)
     if value.dim() == 1:
         value = value.view(1, 1, -1)
-    if value.shape != (1, 1, backend.acoustic_feature_dim):
+    if value.shape != (1, 1, acoustic_feature_dim):
         raise ValueError("feature normalization must match backend acoustic_feature_dim.")
     if not torch.is_floating_point(value):
         raise TypeError("feature normalization tensors must be floating point.")
@@ -438,3 +424,44 @@ def _float_tuple(value: object) -> tuple[float, ...] | None:
     if not isinstance(value, list):
         raise TypeError("feature normalization metadata must be a list.")
     return tuple(float(item) for item in value)
+
+
+def _codebook_sizes(support: SemanticCodecSupport) -> tuple[int, ...]:
+    return support.acoustic_codebook_sizes
+
+
+def _support_metadata(support: SemanticCodecSupport) -> dict[str, object]:
+    return {
+        "semantic_vocab_size": support.conditioner.embedding.num_embeddings,
+        "semantic_embedding_dim": support.conditioner.embedding.embedding_dim,
+        "acoustic_feature_dim": support.acoustic_feature_dim,
+        "acoustic_codebook_sizes": list(_codebook_sizes(support)),
+    }
+
+
+def _validate_backend_metadata(data: Mapping[str, object], backend: CodecBackend) -> None:
+    expected = {
+        "semantic_vocab_size": int(backend.semantic_codebook.size(0)),
+        "semantic_embedding_dim": int(backend.semantic_codebook.size(1)),
+        "acoustic_feature_dim": backend.acoustic_feature_dim,
+        "acoustic_codebook_sizes": list(backend.acoustic_codebook_sizes),
+    }
+    for key, value in expected.items():
+        if data.get(key) != value:
+            raise ValueError(f"backend metadata mismatch for {key}: {data.get(key)!r} != {value!r}")
+
+
+def _metadata_int(data: Mapping[str, object], key: str) -> int:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"artifact backend metadata {key!r} must be an integer.")
+    return value
+
+
+def _metadata_sizes(data: Mapping[str, object]) -> tuple[int, ...]:
+    value = data.get("acoustic_codebook_sizes")
+    if not isinstance(value, list) or any(
+        isinstance(item, bool) or not isinstance(item, int) for item in value
+    ):
+        raise TypeError("artifact acoustic_codebook_sizes must be a list of integers.")
+    return tuple(value)

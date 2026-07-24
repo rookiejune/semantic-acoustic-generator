@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import TYPE_CHECKING
 
-from torch import Tensor
+if TYPE_CHECKING:
+    from typing import Any
+
+    from torch import Tensor
 
 
 class LongCatBackend:
@@ -39,21 +42,20 @@ class LongCatBackend:
 
     @property
     def semantic_codebook(self) -> Tensor:
-        return cast(Tensor, self.codec.semantic_codebook)
+        return self.codec.semantic_codebook
 
     @property
     def acoustic_codebook_sizes(self) -> tuple[int, ...]:
         return tuple(int(size) for size in self.codec.codebook_sizes[1:])
 
     def encode(self, audio: Tensor, sample_rate: int) -> Tensor:
-        return cast(Tensor, self.codec.encode(audio, sample_rate))
+        return self.codec.encode(audio, sample_rate)
 
     def decode(self, codes: Tensor) -> Tensor:
-        return cast(Tensor, self.codec.decode(codes))
+        return self.codec.decode(codes)
 
     def acoustic_codes_to_features(self, acoustic_codes: Tensor) -> Tensor:
-        return cast(Tensor, self.codec.acoustic_codes_to_features(acoustic_codes))
+        return self.codec.acoustic_codes_to_features(acoustic_codes)
 
     def decode_features(self, semantic_codes: Tensor, acoustic_features: Tensor) -> Tensor:
-        return cast(Tensor, self.codec.decode_features(semantic_codes, acoustic_features))
-
+        return self.codec.decode_features(semantic_codes, acoustic_features)

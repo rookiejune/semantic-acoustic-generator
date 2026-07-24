@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from torch import Tensor
+if TYPE_CHECKING:
+    from torch import Tensor
 
 
 class CodecBackend(Protocol):

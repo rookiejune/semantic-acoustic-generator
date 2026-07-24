@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from semantic_acoustic_codec.config import (
     AdapterType,
@@ -14,7 +15,10 @@ from semantic_acoustic_codec.model.decoder import (
     FMFeatureGenerator,
     RVQCodeGenerator,
 )
-from semantic_acoustic_codec.runtime.protocol import CodecBackend
+
+if TYPE_CHECKING:
+    from torch import Tensor
+
 
 
 @dataclass(frozen=True)
@@ -23,11 +27,14 @@ class RouteModules:
     reference_conditioner: ReferenceConditioner
     generator: CodecUnitGenerator
     route: Route
+    acoustic_codebook_sizes: tuple[int, ...]
 
 
 def build_route(
     route: Route,
-    backend: CodecBackend,
+    semantic_codebook: Tensor,
+    acoustic_feature_dim: int,
+    acoustic_codebook_sizes: tuple[int, ...],
     *,
     condition_dim: int,
     decoder: DecoderConfig | None = None,
@@ -37,24 +44,24 @@ def build_route(
 ) -> RouteModules:
     options = DecoderConfig() if decoder is None else decoder
     conditioner = SemanticConditioner(
-        backend.semantic_codebook,
+        semantic_codebook,
         condition_dim=condition_dim,
         adapter=adapter,
         initialization=initialization,
         seed=seed,
     )
     reference_conditioner = ReferenceConditioner(
-        backend.acoustic_feature_dim,
+        acoustic_feature_dim,
         condition_dim,
     )
     if route is Route.FM:
         module = FMFeatureGenerator(
             condition_dim,
-            backend.acoustic_feature_dim,
+            acoustic_feature_dim,
             options,
         )
     elif route is Route.RVQ:
-        module = RVQCodeGenerator(condition_dim, backend.acoustic_codebook_sizes, options)
+        module = RVQCodeGenerator(condition_dim, acoustic_codebook_sizes, options)
     else:
         raise AssertionError(f"unsupported route: {route}")
     return RouteModules(
@@ -62,4 +69,5 @@ def build_route(
         reference_conditioner=reference_conditioner,
         generator=module,
         route=route,
+        acoustic_codebook_sizes=acoustic_codebook_sizes,
     )

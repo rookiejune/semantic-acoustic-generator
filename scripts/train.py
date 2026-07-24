@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, cast
 
 import hydra
 import torch
 from lightning import pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
-from omegaconf import DictConfig
 
 from semantic_acoustic_codec.backend import LongCatBackend
 from semantic_acoustic_codec.callback import ArtifactExport
@@ -23,6 +22,11 @@ from semantic_acoustic_codec.datamodule import (
 )
 from semantic_acoustic_codec.pl_module import build_module
 from semantic_acoustic_codec.runtime import SamplingConfig, SemanticSupportConfig
+
+if TYPE_CHECKING:
+    from typing import Any
+
+    from omegaconf import DictConfig
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
