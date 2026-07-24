@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from anytrain.module.dit import DiT, DiTConditionType
+from anytrain.module.dit import DiT, DiTConditionState, DiTConditionType
 from torch import Tensor, nn
 
 
@@ -38,20 +38,28 @@ class AcousticDiT(DiT):
         x_t: Tensor,
         t: Tensor,
         *,
-        condition: Tensor,
+        condition: Tensor | None = None,
+        condition_state: DiTConditionState | None = None,
         mask: Tensor | None = None,
     ) -> Tensor:
-        return super().forward(x_t, t, condition=condition, mask=mask)
+        return super().forward(x_t, t, condition=condition, condition_state=condition_state, mask=mask)
 
     def forward_with_features(
         self,
         x_t: Tensor,
         t: Tensor,
         *,
-        condition: Tensor,
+        condition: Tensor | None = None,
+        condition_state: DiTConditionState | None = None,
         mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        return super().forward_with_features(x_t, t, condition=condition, mask=mask)
+        return super().forward_with_features(
+            x_t,
+            t,
+            condition=condition,
+            condition_state=condition_state,
+            mask=mask,
+        )
 
 
 class DiTDecoder(nn.Module):
@@ -122,10 +130,11 @@ class DiTDecoder(nn.Module):
             dtype=condition.dtype,
             generator=generator,
         )
+        condition_state = self.decoder.prepare_condition(condition)
         dt = 1.0 / steps
         for index in range(steps):
             t = condition.new_full((condition.size(0),), (index + 0.5) * dt)
-            velocity = self.decoder(latent, t, condition=condition, mask=mask)
+            velocity = self.decoder(latent, t, condition_state=condition_state, mask=mask)
             latent = latent + dt * velocity
             if mask is not None:
                 latent = latent.masked_fill(~mask[..., None], 0)
