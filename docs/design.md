@@ -110,6 +110,16 @@ docs/
 `datamodule/`、`pl_module/`、`callback/`、`scripts/` 是本仓库训练实现，不应被
 `speech-to-speech` 直接 import。
 
+## 复用约定
+
+模型内部优先复用已有通用模块，不先为本仓库重写 Transformer、attention、cache、MTP 或 codebook AR
+基础结构。当前 RVQ 路线明确复用 anytrain 的 Qwen/Qwen3 model builder，把 Qwen decoder-only model
+作为 codebook 轴上的 causal decoder 使用；本仓库只负责 codec 语义、condition、head、loss 和 runtime
+组合。
+
+后续如果需要优化 RVQ 的专用结构，应先用当前 Qwen 路线跑通质量/效率闭环，再单独设计和验证替代模块；
+不要在 P0/P1 阶段为了“看起来更小”引入自定义基础网络。
+
 ## 数据路线
 
 当前只使用 `wmt19_tts_codec(longcat)`：
@@ -137,6 +147,8 @@ RVQ 路线预测 LongCat acoustic codebook IDs：
 
 RVQ 的优势是目标离散、与 LongCat acoustic representation 对齐；风险是多 codebook 采样误差会逐层累积。
 generator 需要显式持有每个 codebook size，不能假设所有 acoustic codebook 共用相同 vocab size。
+当前默认实现复用 Qwen decoder-only model 处理 codebook 轴自回归，保留 cache、causal mask 和 MTP
+能力的一致接口；这属于仓库复用约定，不是临时 fallback。
 
 ### FM
 

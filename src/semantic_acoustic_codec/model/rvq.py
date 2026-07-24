@@ -13,8 +13,10 @@ from semantic_acoustic_codec._tensor import is_signed_integer_dtype
 class AcousticRVQDecoder(nn.Module):
     """Frame-parallel, codebook-autoregressive acoustic code predictor.
 
-    Reuses the shared anytrain Qwen3 builder while keeping transformers optional
-    until the RVQ route is instantiated.
+    Reuses the shared anytrain Qwen3 builder by design. The repository convention
+    is to avoid custom Transformer/cache implementations before the Qwen-based
+    RVQ route has been validated and a dedicated optimization pass is planned.
+    Transformers stay optional until the RVQ route is instantiated.
     """
 
     def __init__(
