@@ -6,13 +6,16 @@ import pytest
 import torch
 
 from semantic_acoustic_codec.config import AdapterType, DecoderConfig, Route, RVQPredictor
+from semantic_acoustic_codec.data import SemanticCodecBatch
 from semantic_acoustic_codec.loss import FlowLoss, RepaLoss, RVQLoss
 from semantic_acoustic_codec.model import (
     AcousticRVQDecoder,
     AcousticRVQMTPDecoder,
     DiTDecoder,
+    FlowAcousticDecoder,
     RectifiedFlowRuntime,
     ReferenceConditioner,
+    RVQAcousticDecoder,
     SemanticConditioner,
     build_route,
     teacher_features,
@@ -156,6 +159,7 @@ def test_build_route_and_teacher_features() -> None:
     features = teacher_features(teacher, acoustic, mask)
 
     assert modules.route is Route.FM
+    assert isinstance(modules.decoder, FlowAcousticDecoder)
     assert teacher.sample_rate == 16_000
     assert teacher.frame_rate == 50.0
     assert teacher.acoustic_feature_dim == 4
@@ -231,8 +235,14 @@ def test_fm_route_trains_one_step() -> None:
     )
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
-    item = FlowLoss()(modules.decoder, condition, target, mask, RectifiedFlowRuntime())
-    loss = item.loss.mean()
+    output = modules.decoder.loss(
+        teacher,
+        SemanticCodecBatch(semantic_codes=semantic, acoustic_codes=acoustic, mask=mask),
+        condition,
+        feature_mean=torch.zeros(1, 1, teacher.acoustic_feature_dim),
+        feature_std=torch.ones(1, 1, teacher.acoustic_feature_dim),
+    )
+    loss = output.loss
     loss.backward()
     optimizer.step()
 
@@ -264,8 +274,14 @@ def test_rvq_route_trains_one_step_when_transformers_is_available() -> None:
     target = teacher_features(teacher, acoustic, mask)
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
-    logits = modules.decoder(condition, acoustic, mask=mask)
-    loss = RVQLoss()(logits, acoustic, mask).loss.mean()
+    output = modules.decoder.loss(
+        teacher,
+        SemanticCodecBatch(semantic_codes=semantic, acoustic_codes=acoustic, mask=mask),
+        condition,
+        feature_mean=torch.zeros(1, 1, teacher.acoustic_feature_dim),
+        feature_std=torch.ones(1, 1, teacher.acoustic_feature_dim),
+    )
+    loss = output.loss
     loss.backward()
     optimizer.step()
 
@@ -299,16 +315,19 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
     decoder = modules.decoder
-    logits = decoder(condition, acoustic, mask=mask)
+    assert isinstance(decoder, RVQAcousticDecoder)
+    logits = decoder.core(condition, acoustic, mask=mask)
     loss = RVQLoss()(logits, acoustic, mask).loss.mean()
     loss.backward()
-    generated = decoder.generate(
+    generated = decoder.sample_acoustic_codes(
         condition,
-        mask=mask,
+        mask,
+        temperature=1.0,
+        top_p=1.0,
         generator=torch.Generator().manual_seed(0),
     )
 
-    assert isinstance(decoder, AcousticRVQMTPDecoder)
+    assert isinstance(decoder.core, AcousticRVQMTPDecoder)
     assert torch.isfinite(loss)
     assert [value.shape for value in logits] == [(1, 3, 5), (1, 3, 7)]
     assert generated.shape == (1, 3, 2)

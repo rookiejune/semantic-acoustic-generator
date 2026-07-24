@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import torch
 from lightning import LightningModule, Trainer
@@ -11,9 +11,8 @@ from torch import Tensor
 
 from semantic_acoustic_codec.config import Route
 from semantic_acoustic_codec.data import SemanticCodecBatch
-from semantic_acoustic_codec.loss import FlowLoss, RepaLoss, RVQLoss, Teacher
-from semantic_acoustic_codec.model import DiTDecoder, RectifiedFlowRuntime, teacher_features
-from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder
+from semantic_acoustic_codec.loss import Teacher
+from semantic_acoustic_codec.model import teacher_features
 from semantic_acoustic_codec.runtime import (
     SemanticAcousticCodec,
     SemanticCodecConfig,
@@ -57,11 +56,7 @@ class SemanticCodecModule(LightningModule):
         self.config = config
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
-        self.flow_loss = FlowLoss()
-        self.repa_loss = RepaLoss()
         self.repa_teacher = repa_teacher
-        self.rvq_loss = RVQLoss()
-        self.flow_runtime = RectifiedFlowRuntime()
 
     def training_step(self, batch: SemanticCodecBatch, batch_idx: int) -> dict[str, Any]:
         del batch_idx
@@ -73,62 +68,29 @@ class SemanticCodecModule(LightningModule):
             reference_acoustic_codes=batch.safe_acoustic_codes,
             reference_mask=mask,
         )
-        if self.codec.route is Route.FM:
-            decoder = cast(DiTDecoder, self.codec.decoder)
-            target = self._normalized_features(batch)
-            if self.config.decoder.repa_loss_weight > 0:
-                if self.repa_teacher is None:
-                    raise RuntimeError("REPA requires a teacher.")
-                item, representation = self.flow_loss.forward_with_features(
-                    decoder,
-                    condition,
-                    target,
-                    mask,
-                    self.flow_runtime,
-                )
-                teacher = self.repa_teacher(
-                    batch.semantic_codes,
-                    batch.safe_acoustic_codes,
-                    mask,
-                )
-                repa = self.repa_loss(representation, teacher, mask)
-                repa_loss = repa.loss.mean()
-                item_loss = item.loss.mean()
-                loss = item_loss + self.config.decoder.repa_loss_weight * repa_loss
-                self.log("train/flow_loss", item_loss, on_step=True, prog_bar=True, sync_dist=True)
-                self.log("train/repa_loss", repa_loss, on_step=True, prog_bar=True, sync_dist=True)
-                self.log(
-                    "train/repa_weight",
-                    self.config.decoder.repa_loss_weight,
-                    on_step=True,
-                    sync_dist=True,
-                )
-                log_name = "train/flow_loss"
-            else:
-                item = self.flow_loss(decoder, condition, target, mask, self.flow_runtime)
-                loss = item.loss.mean()
-                log_name = "train/flow_loss"
-        elif self.codec.route is Route.RVQ:
-            decoder = cast(AcousticRVQDecoder, self.codec.decoder)
-            labels = batch.safe_acoustic_codes
-            item = self.rvq_loss(decoder(condition, labels, mask=mask), labels, mask)
-            loss = item.loss.mean()
-            log_name = "train/rvq_loss"
-        else:
-            raise AssertionError(f"unsupported route: {self.codec.route}")
+        output = self.codec.decoder.loss(
+            self.codec.teacher,
+            batch,
+            condition,
+            feature_mean=self.codec.feature_mean,
+            feature_std=self.codec.feature_std,
+            repa_teacher=self.repa_teacher,
+        )
 
-        if self.codec.route is not Route.FM or self.config.decoder.repa_loss_weight <= 0:
-            self.log(log_name, loss, on_step=True, prog_bar=True, sync_dist=True)
+        if output.logs:
+            for name, value in output.logs.items():
+                self.log(name, value, on_step=True, prog_bar=name == output.log_name, sync_dist=True)
+        else:
+            self.log(output.log_name, output.loss, on_step=True, prog_bar=True, sync_dist=True)
         self.log("train/batch_size", float(mask.size(0)), on_step=True, sync_dist=True)
         self.log("train/valid_frames", mask.sum().float(), on_step=True, sync_dist=True)
-        if item.details is not None:
-            for name, value in item.details.items():
+        if output.item.details is not None:
+            for name, value in output.item.details.items():
                 if name == "frames":
                     continue
-                self.log(f"{log_name}/{name}", value.mean(), on_step=True, sync_dist=True)
-        result: dict[str, Any] = {"loss": loss, "item": item}
-        if self.codec.route is Route.FM and self.config.decoder.repa_loss_weight > 0:
-            result["repa"] = repa
+                self.log(f"{output.log_name}/{name}", value.mean(), on_step=True, sync_dist=True)
+        result: dict[str, Any] = {"loss": output.loss, "item": output.item}
+        result.update(output.extras)
         return result
 
     def configure_optimizers(self):

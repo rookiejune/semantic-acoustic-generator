@@ -2,19 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import torch
-from torch import Tensor, nn
-
 from semantic_acoustic_codec.config import (
     AdapterType,
     DecoderConfig,
     Initialization,
     Route,
-    RVQPredictor,
 )
 from semantic_acoustic_codec.model.condition import ReferenceConditioner, SemanticConditioner
-from semantic_acoustic_codec.model.dit import DiTDecoder
-from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder, AcousticRVQMTPDecoder
+from semantic_acoustic_codec.model.decoder import (
+    AcousticDecoder,
+    FlowAcousticDecoder,
+    RVQAcousticDecoder,
+)
 from semantic_acoustic_codec.runtime.protocol import TeacherCodec
 
 
@@ -22,7 +21,7 @@ from semantic_acoustic_codec.runtime.protocol import TeacherCodec
 class RouteModules:
     conditioner: SemanticConditioner
     reference_conditioner: ReferenceConditioner
-    decoder: nn.Module
+    decoder: AcousticDecoder
     route: Route
 
 
@@ -49,44 +48,13 @@ def build_route(
         condition_dim,
     )
     if route is Route.FM:
-        module: nn.Module = DiTDecoder(
+        module = FlowAcousticDecoder(
             condition_dim,
             teacher.acoustic_feature_dim,
-            hidden_dim=options.hidden_dim,
-            layers=options.layers,
-            heads=options.heads,
-            ffn_ratio=options.ffn_ratio,
-            repa_feature_dim=options.repa_feature_dim,
-            repa_student_layer=options.repa_student_layer,
+            options,
         )
     elif route is Route.RVQ:
-        sizes = teacher.acoustic_codebook_sizes
-        if not sizes:
-            raise ValueError("RVQ route requires acoustic codebooks.")
-        if options.rvq_predictor is RVQPredictor.CODEBOOK_AR:
-            module = AcousticRVQDecoder(
-                condition_dim,
-                len(sizes),
-                sizes,
-                hidden_dim=options.hidden_dim,
-                layers=options.layers,
-                heads=options.heads,
-                ffn_ratio=options.ffn_ratio,
-            )
-        elif options.rvq_predictor is RVQPredictor.MTP:
-            module = AcousticRVQMTPDecoder(
-                condition_dim,
-                len(sizes),
-                sizes,
-                hidden_dim=options.hidden_dim,
-                layers=options.layers,
-                heads=options.heads,
-                ffn_ratio=options.ffn_ratio,
-                mtp_layers=options.mtp_layers,
-                mtp_heads=options.mtp_heads,
-            )
-        else:
-            raise AssertionError(f"unsupported RVQ predictor: {options.rvq_predictor}")
+        module = RVQAcousticDecoder(condition_dim, teacher.acoustic_codebook_sizes, options)
     else:
         raise AssertionError(f"unsupported route: {route}")
     return RouteModules(
@@ -95,11 +63,3 @@ def build_route(
         decoder=module,
         route=route,
     )
-
-
-@torch.no_grad()
-def teacher_features(teacher: TeacherCodec, acoustic_codes: Tensor, mask: Tensor) -> Tensor:
-    if acoustic_codes.dim() != 3 or mask.shape != acoustic_codes.shape[:2]:
-        raise ValueError("acoustic_codes and mask must have shapes [B, F, K] and [B, F].")
-    features = teacher.acoustic_codes_to_features(acoustic_codes.masked_fill(~mask[..., None], 0))
-    return features.masked_fill(~mask[..., None], 0)

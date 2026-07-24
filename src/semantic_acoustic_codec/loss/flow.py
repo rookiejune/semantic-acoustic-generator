@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 import torch
@@ -17,6 +18,28 @@ class TrainingSample(Protocol):
 
 class FlowRuntime(Protocol):
     def training_sample(self, x_1: Tensor, *, x_0: Tensor | None = None) -> TrainingSample: ...
+
+
+@dataclass(eq=False)
+class FlowSample:
+    x_t: Tensor
+    t: Tensor
+    velocity: Tensor
+
+
+class RectifiedFlowRuntime:
+    """Small local flow runtime for the package's per-sample loss contract."""
+
+    def training_sample(self, x_1: Tensor, *, x_0: Tensor | None = None) -> FlowSample:
+        if x_1.dim() != 3:
+            raise ValueError("flow target must have shape [B, F, D].")
+        noise = torch.randn_like(x_1) if x_0 is None else x_0
+        if noise.shape != x_1.shape:
+            raise ValueError("flow noise and target must have the same shape.")
+        t = torch.rand(x_1.size(0), device=x_1.device, dtype=x_1.dtype)
+        view_t = t[:, None, None]
+        x_t = (1 - view_t) * noise + view_t * x_1
+        return FlowSample(x_t=x_t, t=t, velocity=x_1 - noise)
 
 
 class FeatureDecoder(Protocol):

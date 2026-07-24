@@ -17,9 +17,7 @@ from semantic_acoustic_codec.config import (
     Route,
     RVQPredictor,
 )
-from semantic_acoustic_codec.model.dit import DiTDecoder
 from semantic_acoustic_codec.model.routes import RouteModules, build_route
-from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder
 from semantic_acoustic_codec.runtime.protocol import TeacherCodec
 from semantic_acoustic_codec.teacher import LongCatTeacher
 
@@ -154,29 +152,17 @@ class SemanticAcousticCodec(nn.Module):
             reference_features=reference_features,
             reference_mask=reference_mask,
         )
-        if self.route is Route.FM:
-            decoder = cast(DiTDecoder, self.decoder)
-            features = decoder.sample(
-                condition,
-                mask=frame_mask,
-                steps=self.sampling.flow_steps,
-                generator=generator,
-            )
-        elif self.route is Route.RVQ:
-            decoder = cast(AcousticRVQDecoder, self.decoder)
-            acoustic_codes = decoder.generate(
-                condition,
-                mask=frame_mask,
-                temperature=self.sampling.temperature,
-                top_p=self.sampling.top_p,
-                generator=generator,
-            )
-            features = self.teacher.acoustic_codes_to_features(acoustic_codes)
-            features = features.to(device=condition.device, dtype=condition.dtype)
-        else:
-            raise AssertionError(f"unsupported route: {self.route}")
-        if self.route is Route.FM:
-            features = features * self.feature_std + self.feature_mean
+        features = self.decoder.sample_features(
+            self.teacher,
+            condition,
+            frame_mask,
+            feature_mean=self.feature_mean,
+            feature_std=self.feature_std,
+            flow_steps=self.sampling.flow_steps,
+            temperature=self.sampling.temperature,
+            top_p=self.sampling.top_p,
+            generator=generator,
+        )
         return features.masked_fill(~frame_mask[..., None], 0)
 
     @torch.no_grad()
@@ -190,8 +176,6 @@ class SemanticAcousticCodec(nn.Module):
         reference_mask: Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        if self.route is not Route.RVQ:
-            raise RuntimeError("sample_acoustic_codes is only available for the RVQ route.")
         prepared, frame_mask = self._semantic_input(semantic_codes, mask)
         condition = self.condition(
             prepared,
@@ -200,10 +184,9 @@ class SemanticAcousticCodec(nn.Module):
             reference_features=reference_features,
             reference_mask=reference_mask,
         )
-        decoder = cast(AcousticRVQDecoder, self.decoder)
-        return decoder.generate(
+        return self.decoder.sample_acoustic_codes(
             condition,
-            mask=frame_mask,
+            frame_mask,
             temperature=self.sampling.temperature,
             top_p=self.sampling.top_p,
             generator=generator,

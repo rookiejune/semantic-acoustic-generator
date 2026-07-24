@@ -2,11 +2,15 @@
 
 from semantic_acoustic_codec.config import DecoderConfig, Route
 from semantic_acoustic_codec.model import (
+    AcousticDecoder,
     AcousticDiT,
     AcousticRVQDecoder,
+    DecoderLoss,
     DiTDecoder,
+    FlowAcousticDecoder,
     ReferenceConditioner,
     RouteModules,
+    RVQAcousticDecoder,
     SemanticConditioner,
     build_route,
     teacher_features,
@@ -22,11 +26,15 @@ from semantic_acoustic_codec.runtime import (
 from semantic_acoustic_codec.teacher import LongCatTeacher
 
 __all__ = [
+    "AcousticDecoder",
     "AcousticDiT",
     "AcousticRVQDecoder",
+    "DecoderLoss",
     "DecoderConfig",
     "DiTDecoder",
+    "FlowAcousticDecoder",
     "LongCatTeacher",
+    "RVQAcousticDecoder",
     "ReferenceConditioner",
     "Route",
     "RouteModules",
