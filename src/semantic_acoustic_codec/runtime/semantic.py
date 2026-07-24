@@ -10,7 +10,13 @@ import torch
 from torch import Tensor, nn
 
 from semantic_acoustic_codec._tensor import is_signed_integer_dtype
-from semantic_acoustic_codec.config import AdapterType, DecoderConfig, Initialization, Route
+from semantic_acoustic_codec.config import (
+    AdapterType,
+    DecoderConfig,
+    Initialization,
+    Route,
+    RVQPredictor,
+)
 from semantic_acoustic_codec.model.dit import DiTDecoder
 from semantic_acoustic_codec.model.routes import RouteModules, build_route
 from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder
@@ -394,6 +400,8 @@ def _config_dict(config: SemanticCodecConfig) -> dict[str, object]:
     data["route"] = config.route.value
     data["adapter"] = None if config.adapter is None else config.adapter.value
     data["initialization"] = config.initialization.value
+    decoder = cast(dict[str, object], data["decoder"])
+    decoder["rvq_predictor"] = config.decoder.rvq_predictor.value
     return cast(dict[str, object], data)
 
 
@@ -409,6 +417,9 @@ def _config(data: Mapping[str, Any]) -> SemanticCodecConfig:
             layers=int(decoder["layers"]),
             heads=int(decoder["heads"]),
             ffn_ratio=int(decoder["ffn_ratio"]),
+            rvq_predictor=RVQPredictor(cast(str, decoder.get("rvq_predictor", RVQPredictor.CODEBOOK_AR.value))),
+            mtp_layers=int(decoder.get("mtp_layers", 2)),
+            mtp_heads=int(decoder.get("mtp_heads", 4)),
             repa_feature_dim=cast(int | None, decoder.get("repa_feature_dim")),
             repa_student_layer=cast(int | None, decoder.get("repa_student_layer")),
             repa_loss_weight=float(decoder.get("repa_loss_weight", 0.0)),

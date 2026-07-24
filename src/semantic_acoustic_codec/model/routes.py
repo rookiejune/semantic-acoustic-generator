@@ -5,10 +5,16 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from semantic_acoustic_codec.config import AdapterType, DecoderConfig, Initialization, Route
+from semantic_acoustic_codec.config import (
+    AdapterType,
+    DecoderConfig,
+    Initialization,
+    Route,
+    RVQPredictor,
+)
 from semantic_acoustic_codec.model.condition import ReferenceConditioner, SemanticConditioner
 from semantic_acoustic_codec.model.dit import DiTDecoder
-from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder
+from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder, AcousticRVQMTPDecoder
 from semantic_acoustic_codec.runtime.protocol import TeacherCodec
 
 
@@ -57,15 +63,30 @@ def build_route(
         sizes = teacher.acoustic_codebook_sizes
         if not sizes:
             raise ValueError("RVQ route requires acoustic codebooks.")
-        module = AcousticRVQDecoder(
-            condition_dim,
-            len(sizes),
-            sizes,
-            hidden_dim=options.hidden_dim,
-            layers=options.layers,
-            heads=options.heads,
-            ffn_ratio=options.ffn_ratio,
-        )
+        if options.rvq_predictor is RVQPredictor.CODEBOOK_AR:
+            module = AcousticRVQDecoder(
+                condition_dim,
+                len(sizes),
+                sizes,
+                hidden_dim=options.hidden_dim,
+                layers=options.layers,
+                heads=options.heads,
+                ffn_ratio=options.ffn_ratio,
+            )
+        elif options.rvq_predictor is RVQPredictor.MTP:
+            module = AcousticRVQMTPDecoder(
+                condition_dim,
+                len(sizes),
+                sizes,
+                hidden_dim=options.hidden_dim,
+                layers=options.layers,
+                heads=options.heads,
+                ffn_ratio=options.ffn_ratio,
+                mtp_layers=options.mtp_layers,
+                mtp_heads=options.mtp_heads,
+            )
+        else:
+            raise AssertionError(f"unsupported RVQ predictor: {options.rvq_predictor}")
     else:
         raise AssertionError(f"unsupported route: {route}")
     return RouteModules(

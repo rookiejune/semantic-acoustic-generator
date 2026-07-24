@@ -7,11 +7,12 @@ from semantic_acoustic_codec.model.condition import (
 )
 from semantic_acoustic_codec.model.dit import AcousticDiT, DiTDecoder, RectifiedFlowRuntime
 from semantic_acoustic_codec.model.routes import RouteModules, build_route, teacher_features
-from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder
+from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder, AcousticRVQMTPDecoder
 
 __all__ = [
     "AcousticDiT",
     "AcousticRVQDecoder",
+    "AcousticRVQMTPDecoder",
     "DiTDecoder",
     "MLPAdapter",
     "ReferenceConditioner",

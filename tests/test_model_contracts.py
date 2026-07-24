@@ -5,10 +5,11 @@ import importlib.util
 import pytest
 import torch
 
-from semantic_acoustic_codec.config import AdapterType, DecoderConfig, Route
+from semantic_acoustic_codec.config import AdapterType, DecoderConfig, Route, RVQPredictor
 from semantic_acoustic_codec.loss import FlowLoss, RepaLoss, RVQLoss
 from semantic_acoustic_codec.model import (
     AcousticRVQDecoder,
+    AcousticRVQMTPDecoder,
     DiTDecoder,
     RectifiedFlowRuntime,
     ReferenceConditioner,
@@ -271,6 +272,51 @@ def test_rvq_route_trains_one_step_when_transformers_is_available() -> None:
     assert torch.isfinite(loss)
 
 
+def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> None:
+    if importlib.util.find_spec("transformers") is None:
+        pytest.skip("RVQ MTP route requires transformers.")
+
+    from semantic_acoustic_codec.teacher import LongCatTeacher
+
+    teacher = LongCatTeacher(FakeCodec())
+    semantic = torch.tensor([[[1], [2], [0]]], dtype=torch.long)
+    acoustic = torch.tensor([[[1, 2], [3, 4], [0, 0]]], dtype=torch.long)
+    mask = torch.tensor([[True, True, False]])
+    modules = build_route(
+        Route.RVQ,
+        teacher,
+        condition_dim=10,
+        decoder=DecoderConfig(
+            layers=1,
+            heads=2,
+            ffn_ratio=2,
+            rvq_predictor=RVQPredictor.MTP,
+            mtp_layers=1,
+            mtp_heads=2,
+        ),
+    )
+    target = teacher_features(teacher, acoustic, mask)
+    reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
+    condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
+    decoder = modules.decoder
+    logits = decoder(condition, acoustic, mask=mask)
+    loss = RVQLoss()(logits, acoustic, mask).loss.mean()
+    loss.backward()
+    generated = decoder.generate(
+        condition,
+        mask=mask,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    assert isinstance(decoder, AcousticRVQMTPDecoder)
+    assert torch.isfinite(loss)
+    assert [value.shape for value in logits] == [(1, 3, 5), (1, 3, 7)]
+    assert generated.shape == (1, 3, 2)
+    assert torch.equal(generated[:, 2], torch.zeros_like(generated[:, 2]))
+    assert bool((generated[..., 0][mask] < 5).all())
+    assert bool((generated[..., 1][mask] < 7).all())
+
+
 def test_rvq_loss_validates_per_codebook_logits() -> None:
     logits = (torch.randn(1, 2, 5), torch.randn(1, 2, 7))
     labels = torch.tensor([[[1, 2], [3, 4]]], dtype=torch.long)
@@ -292,3 +338,32 @@ def test_rvq_decoder_import_is_lazy() -> None:
     with pytest.raises(ImportError, match="transformers"):
         AcousticRVQDecoder(4, 2, (5, 7), hidden_dim=4, layers=1, heads=1, ffn_ratio=2)
 
+
+def test_rvq_mtp_decoder_import_is_lazy() -> None:
+    if importlib.util.find_spec("transformers") is not None:
+        decoder = AcousticRVQMTPDecoder(
+            4,
+            2,
+            (5, 7),
+            hidden_dim=4,
+            layers=1,
+            heads=1,
+            ffn_ratio=2,
+            mtp_layers=1,
+            mtp_heads=1,
+        )
+        assert decoder.codebook_sizes == (5, 7)
+        return
+
+    with pytest.raises(ImportError, match="transformers"):
+        AcousticRVQMTPDecoder(
+            4,
+            2,
+            (5, 7),
+            hidden_dim=4,
+            layers=1,
+            heads=1,
+            ffn_ratio=2,
+            mtp_layers=1,
+            mtp_heads=1,
+        )
