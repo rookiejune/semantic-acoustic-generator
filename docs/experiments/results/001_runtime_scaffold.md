@@ -9,11 +9,11 @@ codec oracle 细节。
 - 迁移/改写 `speech-to-speech` codec oracle 中的 shared semantic conditioner、DiT/FM backbone、RVQ decoder 和三类 masked loss。
 - 添加 LongCat prepared code parser：按 `[frame, codebook]` 拆分 `codes[..., :1]` semantic 和
   `codes[..., 1:]` acoustic RVQ codebooks。
-- 添加 `LongCatTeacher` 能力适配：sample/frame rate、semantic codebook、acoustic codebook sizes、
+- 添加 `LongCatBackend` 能力适配：sample/frame rate、semantic codebook、acoustic codebook sizes、
   acoustic codes 到 features、features 到 waveform。
-- 添加 `SemanticAcousticCodec` runtime：`encode(audio)` 只导出 semantic codes，
+- 添加 `SemanticCodecSupport` runtime：`encode(audio)` 只导出 semantic codes，
   `decode(semantic_codes)` 在本仓库内预测 acoustic side channel 后重建 waveform。
-- 添加最小 artifact contract：`codec.json` + `model.ckpt`，并验证同 teacher 下保存/加载后输出一致。
+- 添加最小 artifact contract：`codec.json` + `model.ckpt`，并验证同 backend 下保存/加载后输出一致。
 
 已知阻断：
 

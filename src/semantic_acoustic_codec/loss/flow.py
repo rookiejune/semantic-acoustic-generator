@@ -63,7 +63,7 @@ class FeatureDecoder(Protocol):
 
 
 class FlowLoss(nn.Module):
-    """Frame-masked velocity objective copied from speech-to-speech."""
+    """Frame-masked velocity objective for acoustic feature decoders."""
 
     def forward(
         self,

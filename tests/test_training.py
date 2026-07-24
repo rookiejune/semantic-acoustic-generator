@@ -7,10 +7,11 @@ from torch import Tensor
 pytest.importorskip("lightning")
 
 try:
+    from semantic_acoustic_codec.backend import LongCatBackend
     from semantic_acoustic_codec.config import DecoderConfig, Route
-    from semantic_acoustic_codec.runtime import SemanticCodecConfig, load_artifact
-    from semantic_acoustic_codec.teacher import LongCatTeacher
-    from semantic_acoustic_codec.training import build_module, collate_codes, feature_stats
+    from semantic_acoustic_codec.datamodule import collate_codes
+    from semantic_acoustic_codec.pl_module import build_module, feature_stats
+    from semantic_acoustic_codec.runtime import SemanticSupportConfig, load_artifact
 except TypeError as exc:
     if "SPEAKER_ID" not in str(exc):
         raise
@@ -69,36 +70,36 @@ class FakeRepaTeacher:
 
 
 def test_training_module_trains_and_exports_artifact(tmp_path) -> None:
-    teacher = LongCatTeacher(FakeCodec())
+    backend = LongCatBackend(FakeCodec())
     batch = collate_codes([torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)])
-    config = SemanticCodecConfig(
+    config = SemanticSupportConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
-    module = build_module(teacher, config, batch, normalize_features=True)
+    module = build_module(backend, config, batch, normalize_features=True)
 
     output = module.training_step(batch, 0)
     loss = output["loss"]
     loss.backward()
     module.export_artifact(tmp_path)
-    loaded = load_artifact(tmp_path, teacher=teacher)
+    loaded = load_artifact(tmp_path, backend=backend)
 
     assert torch.isfinite(loss)
     assert module.config.feature_mean is not None
-    assert module.codec.reference_conditioner.gate.grad is not None
-    assert loaded.feature_mean.shape == (1, 1, teacher.acoustic_feature_dim)
+    assert module.support.reference_conditioner.gate.grad is not None
+    assert loaded.feature_mean.shape == (1, 1, backend.acoustic_feature_dim)
     assert loaded.sample_features(batch.semantic_codes, mask=batch.mask).shape == (
         1,
         2,
-        teacher.acoustic_feature_dim,
+        backend.acoustic_feature_dim,
     )
 
 
 def test_training_module_adds_repa_loss_with_teacher() -> None:
-    teacher = LongCatTeacher(FakeCodec())
+    backend = LongCatBackend(FakeCodec())
     batch = collate_codes([torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)])
-    config = SemanticCodecConfig(
+    config = SemanticSupportConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(
@@ -111,7 +112,7 @@ def test_training_module_adds_repa_loss_with_teacher() -> None:
         ),
     )
     module = build_module(
-        teacher,
+        backend,
         config,
         batch,
         normalize_features=True,
@@ -127,9 +128,9 @@ def test_training_module_adds_repa_loss_with_teacher() -> None:
 
 
 def test_training_module_requires_repa_teacher() -> None:
-    teacher = LongCatTeacher(FakeCodec())
+    backend = LongCatBackend(FakeCodec())
     batch = collate_codes([torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)])
-    config = SemanticCodecConfig(
+    config = SemanticSupportConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(
@@ -142,11 +143,11 @@ def test_training_module_requires_repa_teacher() -> None:
     )
 
     with pytest.raises(ValueError, match="REPA requires a teacher"):
-        build_module(teacher, config, batch, normalize_features=True)
+        build_module(backend, config, batch, normalize_features=True)
 
 
 def test_feature_stats_use_only_valid_frames() -> None:
-    teacher = LongCatTeacher(FakeCodec())
+    backend = LongCatBackend(FakeCodec())
     batch = collate_codes(
         [
             torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long),
@@ -154,8 +155,8 @@ def test_feature_stats_use_only_valid_frames() -> None:
         ]
     )
 
-    mean, std = feature_stats(teacher, batch)
+    mean, std = feature_stats(backend, batch)
 
-    assert len(mean) == teacher.acoustic_feature_dim
-    assert len(std) == teacher.acoustic_feature_dim
+    assert len(mean) == backend.acoustic_feature_dim
+    assert len(std) == backend.acoustic_feature_dim
     assert all(value > 0 for value in std)

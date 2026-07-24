@@ -36,7 +36,7 @@ def create_adapter(
 
 
 class SemanticConditioner(nn.Module):
-    """Frame-level semantic conditioner copied from the speech-to-speech oracle shape."""
+    """Frame-level semantic conditioner for codec semantic codes and token spans."""
 
     def __init__(
         self,

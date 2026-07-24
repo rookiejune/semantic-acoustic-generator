@@ -5,6 +5,7 @@ import importlib.util
 import pytest
 import torch
 
+from semantic_acoustic_codec.backend import LongCatBackend
 from semantic_acoustic_codec.config import AdapterType, DecoderConfig, Route, RVQPredictor
 from semantic_acoustic_codec.data import SemanticCodecBatch
 from semantic_acoustic_codec.loss import FlowLoss, RepaLoss, RVQLoss
@@ -12,17 +13,17 @@ from semantic_acoustic_codec.model import (
     AcousticRVQDecoder,
     AcousticRVQMTPDecoder,
     DiTDecoder,
-    FlowAcousticDecoder,
+    FMFeatureGenerator,
     RectifiedFlowRuntime,
     ReferenceConditioner,
-    RVQAcousticDecoder,
+    RVQCodeGenerator,
     SemanticConditioner,
+    backend_features,
     build_route,
-    teacher_features,
 )
 from semantic_acoustic_codec.runtime import (
-    SemanticCodecConfig,
-    build_codec,
+    SemanticSupportConfig,
+    build_support,
     load_artifact,
     save_artifact,
 )
@@ -144,61 +145,50 @@ def test_repa_loss_detaches_teacher_and_ignores_padding() -> None:
     assert torch.equal(representation.grad[:, 1], torch.zeros_like(representation.grad[:, 1]))
 
 
-def test_build_route_and_teacher_features() -> None:
-    from semantic_acoustic_codec.teacher import LongCatTeacher
-
-    teacher = LongCatTeacher(FakeCodec())
+def test_build_route_and_backend_features() -> None:
+    backend = LongCatBackend(FakeCodec())
     modules = build_route(
         Route.FM,
-        teacher,
+        backend,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     acoustic = torch.tensor([[[1, 2], [3, 4], [-1, -1]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
-    features = teacher_features(teacher, acoustic, mask)
+    features = backend_features(backend, acoustic, mask)
 
     assert modules.route is Route.FM
-    assert isinstance(modules.decoder, FlowAcousticDecoder)
-    assert teacher.sample_rate == 16_000
-    assert teacher.frame_rate == 50.0
-    assert teacher.acoustic_feature_dim == 4
-    assert teacher.acoustic_codebook_sizes == (5, 7)
+    assert isinstance(modules.generator, FMFeatureGenerator)
+    assert backend.sample_rate == 16_000
+    assert backend.frame_rate == 50.0
+    assert backend.acoustic_feature_dim == 4
+    assert backend.acoustic_codebook_sizes == (5, 7)
     assert features.shape == (1, 3, 4)
     assert torch.equal(features[:, 2], torch.zeros_like(features[:, 2]))
 
 
-def test_semantic_codec_decodes_and_roundtrips_artifact(tmp_path) -> None:
-    from semantic_acoustic_codec.teacher import LongCatTeacher
-
-    teacher = LongCatTeacher(FakeCodec())
-    config = SemanticCodecConfig(
+def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
+    backend = LongCatBackend(FakeCodec())
+    config = SemanticSupportConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
-    codec = build_codec(teacher, config).eval()
+    support = build_support(backend, config).eval()
     semantic = torch.tensor([[[1], [2], [-1]]], dtype=torch.long)
     reference = torch.tensor([[[1, 2], [3, 4], [0, 0]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
 
-    features = codec.sample_features(semantic, mask=mask, generator=torch.Generator().manual_seed(0))
-    reference_features = codec.sample_features(
+    features = support.sample_features(semantic, mask=mask, generator=torch.Generator().manual_seed(0))
+    condition = support.condition(
         semantic,
         mask=mask,
         reference_acoustic_codes=reference,
         reference_mask=mask,
-        generator=torch.Generator().manual_seed(0),
     )
-    waveform = codec.decode(
-        semantic,
-        mask=mask,
-        reference_acoustic_codes=reference,
-        reference_mask=mask,
-        generator=torch.Generator().manual_seed(1),
-    )
-    save_artifact(tmp_path, codec, config)
-    loaded = load_artifact(tmp_path, teacher=teacher)
+    waveform = support.decode(semantic, mask=mask, generator=torch.Generator().manual_seed(1))
+    save_artifact(tmp_path, support, config)
+    loaded = load_artifact(tmp_path, backend=backend)
     loaded_features = loaded.sample_features(
         semantic,
         mask=mask,
@@ -206,41 +196,39 @@ def test_semantic_codec_decodes_and_roundtrips_artifact(tmp_path) -> None:
     )
 
     assert features.shape == (1, 3, 4)
-    assert reference_features.shape == (1, 3, 4)
+    assert condition.shape == (1, 3, 10)
     assert waveform.shape == (1, 1, 3 * 320)
     assert torch.equal(features[:, 2], torch.zeros_like(features[:, 2]))
     assert torch.allclose(features, loaded_features)
 
 
 def test_fm_route_trains_one_step() -> None:
-    from semantic_acoustic_codec.teacher import LongCatTeacher
-
-    teacher = LongCatTeacher(FakeCodec())
+    backend = LongCatBackend(FakeCodec())
     semantic = torch.tensor([[[1], [2], [0]]], dtype=torch.long)
     acoustic = torch.tensor([[[1, 2], [3, 4], [0, 0]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
-    target = teacher_features(teacher, acoustic, mask)
+    target = backend_features(backend, acoustic, mask)
 
     modules = build_route(
         Route.FM,
-        teacher,
+        backend,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     optimizer = torch.optim.AdamW(
         list(modules.conditioner.parameters())
         + list(modules.reference_conditioner.parameters())
-        + list(modules.decoder.parameters()),
+        + list(modules.generator.parameters()),
         lr=1e-3,
     )
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
-    output = modules.decoder.loss(
-        teacher,
+    output = modules.generator.loss(
+        backend,
         SemanticCodecBatch(semantic_codes=semantic, acoustic_codes=acoustic, mask=mask),
         condition,
-        feature_mean=torch.zeros(1, 1, teacher.acoustic_feature_dim),
-        feature_std=torch.ones(1, 1, teacher.acoustic_feature_dim),
+        feature_mean=torch.zeros(1, 1, backend.acoustic_feature_dim),
+        feature_std=torch.ones(1, 1, backend.acoustic_feature_dim),
     )
     loss = output.loss
     loss.backward()
@@ -249,37 +237,35 @@ def test_fm_route_trains_one_step() -> None:
     assert torch.isfinite(loss)
 
 
-def test_rvq_route_trains_one_step_when_transformers_is_available() -> None:
-    if importlib.util.find_spec("transformers") is None:
-        pytest.skip("RVQ route requires transformers.")
+def test_rvq_route_trains_one_step_when_qwen3_builder_is_available() -> None:
+    if not _has_qwen3_builder():
+        pytest.skip("RVQ route requires transformers and anytrain.module.qwen.build_qwen3_model.")
 
-    from semantic_acoustic_codec.teacher import LongCatTeacher
-
-    teacher = LongCatTeacher(FakeCodec())
+    backend = LongCatBackend(FakeCodec())
     semantic = torch.tensor([[[1], [2], [0]]], dtype=torch.long)
     acoustic = torch.tensor([[[1, 2], [3, 4], [0, 0]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
     modules = build_route(
         Route.RVQ,
-        teacher,
+        backend,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     optimizer = torch.optim.AdamW(
         list(modules.conditioner.parameters())
         + list(modules.reference_conditioner.parameters())
-        + list(modules.decoder.parameters()),
+        + list(modules.generator.parameters()),
         lr=1e-3,
     )
-    target = teacher_features(teacher, acoustic, mask)
+    target = backend_features(backend, acoustic, mask)
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
-    output = modules.decoder.loss(
-        teacher,
+    output = modules.generator.loss(
+        backend,
         SemanticCodecBatch(semantic_codes=semantic, acoustic_codes=acoustic, mask=mask),
         condition,
-        feature_mean=torch.zeros(1, 1, teacher.acoustic_feature_dim),
-        feature_std=torch.ones(1, 1, teacher.acoustic_feature_dim),
+        feature_mean=torch.zeros(1, 1, backend.acoustic_feature_dim),
+        feature_std=torch.ones(1, 1, backend.acoustic_feature_dim),
     )
     loss = output.loss
     loss.backward()
@@ -292,15 +278,13 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
     if importlib.util.find_spec("transformers") is None:
         pytest.skip("RVQ MTP route requires transformers.")
 
-    from semantic_acoustic_codec.teacher import LongCatTeacher
-
-    teacher = LongCatTeacher(FakeCodec())
+    backend = LongCatBackend(FakeCodec())
     semantic = torch.tensor([[[1], [2], [0]]], dtype=torch.long)
     acoustic = torch.tensor([[[1, 2], [3, 4], [0, 0]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
     modules = build_route(
         Route.RVQ,
-        teacher,
+        backend,
         condition_dim=10,
         decoder=DecoderConfig(
             layers=1,
@@ -311,15 +295,15 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
             mtp_heads=2,
         ),
     )
-    target = teacher_features(teacher, acoustic, mask)
+    target = backend_features(backend, acoustic, mask)
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
-    decoder = modules.decoder
-    assert isinstance(decoder, RVQAcousticDecoder)
-    logits = decoder.core(condition, acoustic, mask=mask)
+    generator = modules.generator
+    assert isinstance(generator, RVQCodeGenerator)
+    logits = generator.core(condition, acoustic, mask=mask)
     loss = RVQLoss()(logits, acoustic, mask).loss.mean()
     loss.backward()
-    generated = decoder.sample_acoustic_codes(
+    generated = generator.sample_acoustic_codes(
         condition,
         mask,
         temperature=1.0,
@@ -327,7 +311,7 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
         generator=torch.Generator().manual_seed(0),
     )
 
-    assert isinstance(decoder.core, AcousticRVQMTPDecoder)
+    assert isinstance(generator.core, AcousticRVQMTPDecoder)
     assert torch.isfinite(loss)
     assert [value.shape for value in logits] == [(1, 3, 5), (1, 3, 7)]
     assert generated.shape == (1, 3, 2)
@@ -349,13 +333,23 @@ def test_rvq_loss_validates_per_codebook_logits() -> None:
 
 
 def test_rvq_decoder_import_is_lazy() -> None:
-    if importlib.util.find_spec("transformers") is not None:
+    if _has_qwen3_builder():
         decoder = AcousticRVQDecoder(4, 2, (5, 7), hidden_dim=4, layers=1, heads=1, ffn_ratio=2)
         assert decoder.codebook_sizes == (5, 7)
         return
 
     with pytest.raises(ImportError, match="transformers"):
         AcousticRVQDecoder(4, 2, (5, 7), hidden_dim=4, layers=1, heads=1, ffn_ratio=2)
+
+
+def _has_qwen3_builder() -> bool:
+    if importlib.util.find_spec("transformers") is None:
+        return False
+    try:
+        from anytrain.module.qwen import build_qwen3_model
+    except ImportError:
+        return False
+    return callable(build_qwen3_model)
 
 
 def test_rvq_mtp_decoder_import_is_lazy() -> None:

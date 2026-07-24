@@ -6,9 +6,9 @@ codebook 上训练一个可替换的 acoustic decoder，使调用方只需要持
 
 仓库边界：
 
-- 暴露 codec runtime、semantic-only decode 接口和 acoustic decoder 训练组件。
+- 暴露 codec backend、semantic-only support wrapper 和 acoustic decoder 训练组件。
 - 支持两条 acoustic decoder 路线：RVQ、FM。
-- 复用 anydataset/anytrain 的 LongCat prepared view 与 codec wrapper。
+- 复用 anydataset/anytrain 的 LongCat prepared view 与 codec backend adapter。
 - 不依赖 `speech-to-speech`；后续由 `speech-to-speech` 反向依赖本仓库。
 
 设计方案见 [docs/design.md](docs/design.md)。

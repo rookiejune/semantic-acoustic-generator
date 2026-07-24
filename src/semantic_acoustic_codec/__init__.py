@@ -1,50 +1,52 @@
 """Semantic-only acoustic codec distillation components."""
 
+from semantic_acoustic_codec.backend import LongCatBackend
 from semantic_acoustic_codec.config import DecoderConfig, Route
 from semantic_acoustic_codec.model import (
-    AcousticDecoder,
     AcousticDiT,
     AcousticRVQDecoder,
+    CodecUnitGenerator,
     DecoderLoss,
     DiTDecoder,
-    FlowAcousticDecoder,
+    FMFeatureGenerator,
     ReferenceConditioner,
     RouteModules,
-    RVQAcousticDecoder,
+    RVQCodeGenerator,
     SemanticConditioner,
+    backend_features,
     build_route,
-    teacher_features,
 )
 from semantic_acoustic_codec.runtime import (
+    CodecBackend,
     SamplingConfig,
-    SemanticAcousticCodec,
-    SemanticCodecConfig,
-    build_codec,
+    SemanticCodecSupport,
+    SemanticSupportConfig,
+    build_support,
     load_artifact,
     save_artifact,
 )
-from semantic_acoustic_codec.teacher import LongCatTeacher
 
 __all__ = [
-    "AcousticDecoder",
     "AcousticDiT",
     "AcousticRVQDecoder",
+    "CodecBackend",
+    "CodecUnitGenerator",
     "DecoderLoss",
     "DecoderConfig",
     "DiTDecoder",
-    "FlowAcousticDecoder",
-    "LongCatTeacher",
-    "RVQAcousticDecoder",
+    "FMFeatureGenerator",
+    "LongCatBackend",
+    "RVQCodeGenerator",
     "ReferenceConditioner",
     "Route",
     "RouteModules",
     "SamplingConfig",
-    "SemanticAcousticCodec",
-    "SemanticCodecConfig",
+    "SemanticCodecSupport",
+    "SemanticSupportConfig",
     "SemanticConditioner",
-    "build_codec",
+    "backend_features",
+    "build_support",
     "build_route",
     "load_artifact",
     "save_artifact",
-    "teacher_features",
 ]

@@ -3,23 +3,23 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-from semantic_acoustic_codec.runtime.protocol import TeacherCodec
+from semantic_acoustic_codec.runtime.protocol import CodecBackend
 
 _LAZY = {
     "SamplingConfig",
-    "SemanticAcousticCodec",
-    "SemanticCodecConfig",
-    "build_codec",
+    "SemanticCodecSupport",
+    "SemanticSupportConfig",
+    "build_support",
     "load_artifact",
     "save_artifact",
 }
 
 __all__ = [
     "SamplingConfig",
-    "SemanticAcousticCodec",
-    "SemanticCodecConfig",
-    "TeacherCodec",
-    "build_codec",
+    "CodecBackend",
+    "SemanticCodecSupport",
+    "SemanticSupportConfig",
+    "build_support",
     "load_artifact",
     "save_artifact",
 ]

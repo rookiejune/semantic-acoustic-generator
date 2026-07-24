@@ -5,7 +5,16 @@ from typing import Protocol
 from torch import Tensor
 
 
-class TeacherCodec(Protocol):
+class CodecBackend(Protocol):
+    """Adapter around a real semantic-acoustic codec implementation.
+
+    The backend is the source codec instance, such as LongCat or BiCodec. Training may use it
+    to produce supervision targets, but runtime code treats it as the codec capability provider
+    held by "SemanticCodecSupport".
+    """
+
+    name: str
+
     @property
     def sample_rate(self) -> int: ...
 

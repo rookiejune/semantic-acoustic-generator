@@ -10,24 +10,24 @@ from semantic_acoustic_codec.config import (
 )
 from semantic_acoustic_codec.model.condition import ReferenceConditioner, SemanticConditioner
 from semantic_acoustic_codec.model.decoder import (
-    AcousticDecoder,
-    FlowAcousticDecoder,
-    RVQAcousticDecoder,
+    CodecUnitGenerator,
+    FMFeatureGenerator,
+    RVQCodeGenerator,
 )
-from semantic_acoustic_codec.runtime.protocol import TeacherCodec
+from semantic_acoustic_codec.runtime.protocol import CodecBackend
 
 
 @dataclass(frozen=True)
 class RouteModules:
     conditioner: SemanticConditioner
     reference_conditioner: ReferenceConditioner
-    decoder: AcousticDecoder
+    generator: CodecUnitGenerator
     route: Route
 
 
 def build_route(
     route: Route,
-    teacher: TeacherCodec,
+    backend: CodecBackend,
     *,
     condition_dim: int,
     decoder: DecoderConfig | None = None,
@@ -37,29 +37,29 @@ def build_route(
 ) -> RouteModules:
     options = DecoderConfig() if decoder is None else decoder
     conditioner = SemanticConditioner(
-        teacher.semantic_codebook,
+        backend.semantic_codebook,
         condition_dim=condition_dim,
         adapter=adapter,
         initialization=initialization,
         seed=seed,
     )
     reference_conditioner = ReferenceConditioner(
-        teacher.acoustic_feature_dim,
+        backend.acoustic_feature_dim,
         condition_dim,
     )
     if route is Route.FM:
-        module = FlowAcousticDecoder(
+        module = FMFeatureGenerator(
             condition_dim,
-            teacher.acoustic_feature_dim,
+            backend.acoustic_feature_dim,
             options,
         )
     elif route is Route.RVQ:
-        module = RVQAcousticDecoder(condition_dim, teacher.acoustic_codebook_sizes, options)
+        module = RVQCodeGenerator(condition_dim, backend.acoustic_codebook_sizes, options)
     else:
         raise AssertionError(f"unsupported route: {route}")
     return RouteModules(
         conditioner=conditioner,
         reference_conditioner=reference_conditioner,
-        decoder=module,
+        generator=module,
         route=route,
     )

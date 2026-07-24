@@ -5,7 +5,6 @@ from typing import cast
 
 import torch
 from anytrain.module.qwen import QwenMTPCodebookPredictor, top_p_filter
-from anytrain.module.qwen3 import build_qwen3_model
 from torch import Tensor, nn
 
 from semantic_acoustic_codec._tensor import is_signed_integer_dtype
@@ -204,6 +203,8 @@ def _qwen3_model(
     attention_heads: int,
 ) -> nn.Module:
     try:
+        from anytrain.module.qwen import build_qwen3_model
+
         return build_qwen3_model(
             hidden_size=hidden_dim,
             intermediate_size=hidden_dim * ffn_ratio,

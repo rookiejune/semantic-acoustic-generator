@@ -10,19 +10,19 @@ from lightning import pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import DictConfig
 
+from semantic_acoustic_codec.backend import LongCatBackend
+from semantic_acoustic_codec.callback import ArtifactExport
 from semantic_acoustic_codec.config import AdapterType, DecoderConfig, Initialization, Route
-from semantic_acoustic_codec.runtime import SamplingConfig, SemanticCodecConfig
-from semantic_acoustic_codec.teacher import LongCatTeacher
-from semantic_acoustic_codec.training import (
-    ArtifactExport,
+from semantic_acoustic_codec.datamodule import (
     DataConfig,
     DataModule,
     LBAConfig,
-    build_module,
     collate_codes,
     load_codes,
     single_batch_loader,
 )
+from semantic_acoustic_codec.pl_module import build_module
+from semantic_acoustic_codec.runtime import SamplingConfig, SemanticSupportConfig
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
@@ -37,14 +37,14 @@ def run(config: DictConfig) -> None:
     output_dir = _output_dir(config)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    teacher = LongCatTeacher.from_pretrained(device=str(device))
+    backend = LongCatBackend.from_pretrained(device=str(device))
     data = _data_config(config.data)
-    fixed_codes = load_codes(data, frame_rate=teacher.frame_rate)
+    fixed_codes = load_codes(data, frame_rate=backend.frame_rate)
     fixed_batch = collate_codes([fixed_codes])
-    codec_config = _codec_config(config, seed=seed)
+    support_config = _support_config(config, seed=seed)
     module = build_module(
-        teacher,
-        codec_config,
+        backend,
+        support_config,
         fixed_batch,
         normalize_features=bool(config.get("normalize_features", True)),
         learning_rate=float(config.optimizer.learning_rate),
@@ -79,16 +79,16 @@ def run(config: DictConfig) -> None:
         use_distributed_sampler=bool(config.trainer.use_distributed_sampler),
     )
     if data.lba.enabled:
-        trainer.fit(module, datamodule=DataModule(data, frame_rate=teacher.frame_rate, output_dir=output_dir))
+        trainer.fit(module, datamodule=DataModule(data, frame_rate=backend.frame_rate, output_dir=output_dir))
     else:
         trainer.fit(module, train_dataloaders=single_batch_loader(fixed_codes))
 
 
-def _codec_config(config: DictConfig, *, seed: int) -> SemanticCodecConfig:
+def _support_config(config: DictConfig, *, seed: int) -> SemanticSupportConfig:
     decoder = config.decoder
     sampling = config.sampling
     adapter = config.get("adapter")
-    return SemanticCodecConfig(
+    return SemanticSupportConfig(
         route=_route(config.route),
         condition_dim=int(config.condition_dim),
         decoder=DecoderConfig(

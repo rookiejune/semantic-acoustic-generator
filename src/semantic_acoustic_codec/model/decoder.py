@@ -19,7 +19,7 @@ from semantic_acoustic_codec.loss import (
 )
 from semantic_acoustic_codec.model.dit import DiTDecoder
 from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder, AcousticRVQMTPDecoder
-from semantic_acoustic_codec.runtime.protocol import TeacherCodec
+from semantic_acoustic_codec.runtime.protocol import CodecBackend
 
 
 @dataclass(frozen=True)
@@ -31,13 +31,13 @@ class DecoderLoss:
     extras: dict[str, Any] = field(default_factory=dict)
 
 
-class AcousticDecoder(ABC, nn.Module):
+class CodecUnitGenerator(ABC, nn.Module):
     route: Route
 
     @abstractmethod
     def sample_features(
         self,
-        teacher: TeacherCodec,
+        backend: CodecBackend,
         condition: Tensor,
         mask: Tensor,
         *,
@@ -63,7 +63,7 @@ class AcousticDecoder(ABC, nn.Module):
     @abstractmethod
     def loss(
         self,
-        teacher: TeacherCodec,
+        backend: CodecBackend,
         batch: SemanticCodecBatch,
         condition: Tensor,
         *,
@@ -73,7 +73,7 @@ class AcousticDecoder(ABC, nn.Module):
     ) -> DecoderLoss: ...
 
 
-class FlowAcousticDecoder(AcousticDecoder):
+class FMFeatureGenerator(CodecUnitGenerator):
     route = Route.FM
 
     def __init__(
@@ -101,7 +101,7 @@ class FlowAcousticDecoder(AcousticDecoder):
     @torch.no_grad()
     def sample_features(
         self,
-        teacher: TeacherCodec,
+        backend: CodecBackend,
         condition: Tensor,
         mask: Tensor,
         *,
@@ -112,7 +112,7 @@ class FlowAcousticDecoder(AcousticDecoder):
         top_p: float,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        del teacher, temperature, top_p
+        del backend, temperature, top_p
         features = self.core.sample(
             condition,
             mask=mask,
@@ -123,7 +123,7 @@ class FlowAcousticDecoder(AcousticDecoder):
 
     def loss(
         self,
-        teacher: TeacherCodec,
+        backend: CodecBackend,
         batch: SemanticCodecBatch,
         condition: Tensor,
         *,
@@ -131,7 +131,7 @@ class FlowAcousticDecoder(AcousticDecoder):
         feature_std: Tensor,
         repa_teacher: Teacher | None = None,
     ) -> DecoderLoss:
-        target = _normalized_features(teacher, batch, feature_mean=feature_mean, feature_std=feature_std)
+        target = _normalized_features(backend, batch, feature_mean=feature_mean, feature_std=feature_std)
         if self.repa_loss_weight <= 0:
             item = self.flow_loss(self.core, condition, target, batch.mask, self.flow_runtime)
             return DecoderLoss(
@@ -149,8 +149,8 @@ class FlowAcousticDecoder(AcousticDecoder):
             batch.mask,
             self.flow_runtime,
         )
-        teacher_features = repa_teacher(batch.semantic_codes, batch.safe_acoustic_codes, batch.mask)
-        repa = self.repa_loss(representation, teacher_features, batch.mask)
+        repa_features = repa_teacher(batch.semantic_codes, batch.safe_acoustic_codes, batch.mask)
+        repa = self.repa_loss(representation, repa_features, batch.mask)
         item_loss = item.loss.mean()
         repa_loss = repa.loss.mean()
         loss = item_loss + self.repa_loss_weight * repa_loss
@@ -167,7 +167,7 @@ class FlowAcousticDecoder(AcousticDecoder):
         )
 
 
-class RVQAcousticDecoder(AcousticDecoder):
+class RVQCodeGenerator(CodecUnitGenerator):
     route = Route.RVQ
 
     def __init__(
@@ -208,7 +208,7 @@ class RVQAcousticDecoder(AcousticDecoder):
     @torch.no_grad()
     def sample_features(
         self,
-        teacher: TeacherCodec,
+        backend: CodecBackend,
         condition: Tensor,
         mask: Tensor,
         *,
@@ -227,7 +227,7 @@ class RVQAcousticDecoder(AcousticDecoder):
             top_p=top_p,
             generator=generator,
         )
-        return teacher.acoustic_codes_to_features(codes).to(device=condition.device, dtype=condition.dtype)
+        return backend.acoustic_codes_to_features(codes).to(device=condition.device, dtype=condition.dtype)
 
     @torch.no_grad()
     def sample_acoustic_codes(
@@ -249,7 +249,7 @@ class RVQAcousticDecoder(AcousticDecoder):
 
     def loss(
         self,
-        teacher: TeacherCodec,
+        backend: CodecBackend,
         batch: SemanticCodecBatch,
         condition: Tensor,
         *,
@@ -257,7 +257,7 @@ class RVQAcousticDecoder(AcousticDecoder):
         feature_std: Tensor,
         repa_teacher: Teacher | None = None,
     ) -> DecoderLoss:
-        del teacher, feature_mean, feature_std, repa_teacher
+        del backend, feature_mean, feature_std, repa_teacher
         labels = batch.safe_acoustic_codes
         item = self.rvq_loss(self.core(condition, labels, mask=batch.mask), labels, batch.mask)
         return DecoderLoss(
@@ -268,20 +268,20 @@ class RVQAcousticDecoder(AcousticDecoder):
 
 
 @torch.no_grad()
-def teacher_features(teacher: TeacherCodec, acoustic_codes: Tensor, mask: Tensor) -> Tensor:
+def backend_features(backend: CodecBackend, acoustic_codes: Tensor, mask: Tensor) -> Tensor:
     if acoustic_codes.dim() != 3 or mask.shape != acoustic_codes.shape[:2]:
         raise ValueError("acoustic_codes and mask must have shapes [B, F, K] and [B, F].")
-    features = teacher.acoustic_codes_to_features(acoustic_codes.masked_fill(~mask[..., None], 0))
+    features = backend.acoustic_codes_to_features(acoustic_codes.masked_fill(~mask[..., None], 0))
     return features.masked_fill(~mask[..., None], 0)
 
 
 def _normalized_features(
-    teacher: TeacherCodec,
+    backend: CodecBackend,
     batch: SemanticCodecBatch,
     *,
     feature_mean: Tensor,
     feature_std: Tensor,
 ) -> Tensor:
-    features = teacher_features(teacher, batch.safe_acoustic_codes, batch.mask)
+    features = backend_features(backend, batch.safe_acoustic_codes, batch.mask)
     features = features.to(device=feature_mean.device, dtype=feature_mean.dtype)
     return (features - feature_mean) / feature_std

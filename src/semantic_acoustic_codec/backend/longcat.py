@@ -5,8 +5,10 @@ from typing import Any, cast
 from torch import Tensor
 
 
-class LongCatTeacher:
-    """Adapter around anytrain LongCat matching the local teacher codec protocol."""
+class LongCatBackend:
+    """Adapter around anytrain LongCat matching the local codec backend protocol."""
+
+    name = "longcat"
 
     def __init__(self, codec: Any) -> None:
         self.codec = codec
@@ -17,7 +19,7 @@ class LongCatTeacher:
         self._acoustic_feature_dim = latent_dim
 
     @classmethod
-    def from_pretrained(cls, *, device: str | None = None) -> LongCatTeacher:
+    def from_pretrained(cls, *, device: str | None = None) -> LongCatBackend:
         from anytrain.codec.longcat import LongCat
 
         return cls(LongCat.from_pretrained(device=device))
@@ -54,3 +56,4 @@ class LongCatTeacher:
 
     def decode_features(self, semantic_codes: Tensor, acoustic_features: Tensor) -> Tensor:
         return cast(Tensor, self.codec.decode_features(semantic_codes, acoustic_features))
+
