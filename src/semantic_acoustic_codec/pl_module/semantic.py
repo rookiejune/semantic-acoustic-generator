@@ -7,13 +7,13 @@ import torch
 from lightning import LightningModule
 
 from semantic_acoustic_codec.config import Route
-from semantic_acoustic_codec.data.longcat import SemanticCodecBatch
 from semantic_acoustic_codec.runtime.semantic import (
     SemanticCodecSupport,
     SemanticSupportConfig,
     build_support,
     save_artifact,
 )
+from semantic_acoustic_codec.types import SemanticCodecBatch
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -117,7 +117,7 @@ class SemanticCodecModule(LightningModule):
 
     @torch.no_grad()
     def _target_features(self, batch: SemanticCodecBatch) -> Tensor:
-        features = self.backend.acoustic_codes_to_features(batch.safe_acoustic_codes)
+        features = self.backend.acoustic_codes_to_features(batch.acoustic_codes.masked_fill(~batch.mask[..., None], 0))
         return features.masked_fill(~batch.mask[..., None], 0)
 
 
@@ -155,7 +155,7 @@ def build_module(
 
 @torch.no_grad()
 def feature_stats(backend: CodecBackend, batch: SemanticCodecBatch) -> tuple[tuple[float, ...], tuple[float, ...]]:
-    target = backend.acoustic_codes_to_features(batch.safe_acoustic_codes).float()
+    target = backend.acoustic_codes_to_features(batch.acoustic_codes.masked_fill(~batch.mask[..., None], 0)).float()
     target = target.masked_fill(~batch.mask[..., None], 0)
     valid = target[batch.mask]
     if valid.numel() == 0:
@@ -170,6 +170,8 @@ def _move(batch: SemanticCodecBatch, device: torch.device) -> SemanticCodecBatch
         semantic_codes=batch.semantic_codes.to(device=device),
         acoustic_codes=batch.acoustic_codes.to(device=device),
         mask=batch.mask.to(device=device),
+        semantic_pad_id=batch.semantic_pad_id,
+        acoustic_pad_ids=batch.acoustic_pad_ids,
     )
 
 

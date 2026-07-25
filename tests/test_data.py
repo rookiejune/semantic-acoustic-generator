@@ -13,7 +13,8 @@ except TypeError as exc:
         allow_module_level=True,
     )
 
-from semantic_acoustic_codec.data import SemanticCodecBatch, codes, collate, split_codes
+from semantic_acoustic_codec.backend.longcat import batch_samples, codes, split_codes
+from semantic_acoustic_codec.types import SemanticCodecBatch
 
 
 def sample(value: torch.Tensor):
@@ -34,19 +35,21 @@ def test_longcat_codes_split_target_sample() -> None:
 
 
 def test_collate_pads_right_side_only() -> None:
-    batch = collate(
+    batch = batch_samples(
         [
             sample(torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)),
             sample(torch.tensor([[7, 8, 9]], dtype=torch.long)),
-        ]
+        ],
+        semantic_pad_id=10,
+        acoustic_pad_ids=(11, 12),
     )
 
     assert isinstance(batch, SemanticCodecBatch)
-    assert batch.semantic_codes.tolist() == [[[1], [4]], [[7], [-1]]]
-    assert batch.acoustic_codes.tolist() == [[[2, 3], [5, 6]], [[8, 9], [-1, -1]]]
+    assert batch.semantic_codes.tolist() == [[[1], [4]], [[7], [10]]]
+    assert batch.acoustic_codes.tolist() == [[[2, 3], [5, 6]], [[8, 9], [11, 12]]]
     assert batch.mask.tolist() == [[True, True], [True, False]]
-    assert batch.semantic_tokens.tolist() == [[1, 4], [7, 0]]
-    assert batch.safe_acoustic_codes.tolist() == [[[2, 3], [5, 6]], [[8, 9], [0, 0]]]
+    assert batch.semantic_pad_id == 10
+    assert batch.acoustic_pad_ids == (11, 12)
 
 
 def test_rejects_missing_acoustic_codebook() -> None:

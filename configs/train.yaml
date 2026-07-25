@@ -4,7 +4,6 @@ defaults:
 
 route: fm
 condition_dim: 1024
-adapter: linear
 initialization: codec
 normalize_features: true
 device: null

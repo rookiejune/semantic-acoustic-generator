@@ -3,12 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from semantic_acoustic_codec.config import (
-    AdapterType,
-    DecoderConfig,
-    Initialization,
-    Route,
-)
+from semantic_acoustic_codec.config import DecoderConfig, Initialization, Route
 from semantic_acoustic_codec.model.condition import ReferenceConditioner, SemanticConditioner
 from semantic_acoustic_codec.model.decoder import (
     CodecUnitGenerator,
@@ -38,7 +33,6 @@ def build_route(
     *,
     condition_dim: int,
     decoder: DecoderConfig | None = None,
-    adapter: AdapterType | None = AdapterType.LINEAR,
     initialization: Initialization = Initialization.CODEC,
     seed: int = 0,
 ) -> RouteModules:
@@ -46,7 +40,6 @@ def build_route(
     conditioner = SemanticConditioner(
         semantic_codebook,
         condition_dim=condition_dim,
-        adapter=adapter,
         initialization=initialization,
         seed=seed,
     )

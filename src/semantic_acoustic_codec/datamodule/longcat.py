@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from lightning import pytorch as pl
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, Subset
 from zhuyin.datasets.wmt19_tts import wmt19_tts_codec
 
-from semantic_acoustic_codec.data.longcat import PAD_ID, SemanticCodecBatch, codes, split_codes
+from semantic_acoustic_codec.backend.longcat import batch_codes
+from semantic_acoustic_codec.backend.longcat import codes as longcat_codes
+from semantic_acoustic_codec.types import SemanticCodecBatch
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -111,11 +112,15 @@ class DataModule(pl.LightningDataModule):
         *,
         frame_rate: float,
         output_dir: Path,
+        semantic_pad_id: int,
+        acoustic_pad_ids: Sequence[int],
     ) -> None:
         super().__init__()
         self.data = data
         self.frame_rate = frame_rate
         self.output_dir = output_dir
+        self.semantic_pad_id = semantic_pad_id
+        self.acoustic_pad_ids = tuple(acoustic_pad_ids)
         self.dataset: Dataset[Any] | None = None
         self.filtered_samples = 0
 
@@ -150,7 +155,13 @@ class DataModule(pl.LightningDataModule):
             raise RuntimeError("semantic codec DataModule.setup() must run first.")
         data = self.data
         lba = data.lba
-        collate_fn = partial(collate_samples, data=data, frame_rate=self.frame_rate)
+        collate_fn = partial(
+            collate_samples,
+            data=data,
+            frame_rate=self.frame_rate,
+            semantic_pad_id=self.semantic_pad_id,
+            acoustic_pad_ids=self.acoustic_pad_ids,
+        )
         persistent_workers = data.persistent_workers and data.num_workers > 0
         if not lba.enabled:
             return DataLoader(
@@ -189,7 +200,7 @@ def load_codes(data: DataConfig, *, frame_rate: float) -> Tensor:
 
 
 def sample_codes(sample: Mapping[Any, Any], *, data: DataConfig, frame_rate: float) -> Tensor:
-    value = codes(sample)
+    value = longcat_codes(sample)
     max_seconds = _max_seconds(data)
     if max_seconds is None:
         return value
@@ -214,25 +225,44 @@ def collate_samples(
     *,
     data: DataConfig,
     frame_rate: float,
+    semantic_pad_id: int,
+    acoustic_pad_ids: Sequence[int],
 ) -> SemanticCodecBatch:
     if not samples:
         raise ValueError("cannot collate an empty semantic codec batch.")
-    return collate_codes([sample_codes(sample, data=data, frame_rate=frame_rate) for sample in samples])
+    return collate_codes(
+        [sample_codes(sample, data=data, frame_rate=frame_rate) for sample in samples],
+        semantic_pad_id=semantic_pad_id,
+        acoustic_pad_ids=acoustic_pad_ids,
+    )
 
 
-def collate_codes(values: Sequence[Tensor]) -> SemanticCodecBatch:
-    if not values:
-        raise ValueError("cannot collate an empty semantic codec code batch.")
-    split = [split_codes(value) for value in values]
-    semantic = pad_sequence([item[0] for item in split], batch_first=True, padding_value=PAD_ID)
-    acoustic = pad_sequence([item[1] for item in split], batch_first=True, padding_value=PAD_ID)
-    mask = semantic[..., 0] != PAD_ID
-    return SemanticCodecBatch(semantic_codes=semantic, acoustic_codes=acoustic, mask=mask)
+def collate_codes(
+    values: Sequence[Tensor],
+    *,
+    semantic_pad_id: int,
+    acoustic_pad_ids: Sequence[int],
+) -> SemanticCodecBatch:
+    return batch_codes(values, semantic_pad_id=semantic_pad_id, acoustic_pad_ids=acoustic_pad_ids)
 
 
-def single_batch_loader(value: Tensor) -> DataLoader[SemanticCodecBatch]:
+def single_batch_loader(
+    value: Tensor,
+    *,
+    semantic_pad_id: int,
+    acoustic_pad_ids: Sequence[int],
+) -> DataLoader[SemanticCodecBatch]:
     dataset = cast(Dataset[Tensor], cast(object, [value]))
-    loader = DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=collate_codes)
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        num_workers=0,
+        collate_fn=partial(
+            collate_codes,
+            semantic_pad_id=semantic_pad_id,
+            acoustic_pad_ids=acoustic_pad_ids,
+        ),
+    )
     return cast(DataLoader[SemanticCodecBatch], cast(object, loader))
 
 
@@ -247,7 +277,7 @@ def _filter(
         return dataset, 0
     max_frames = _frames(max_seconds, frame_rate)
     size = len(cast(Sized, cast(object, dataset)))
-    indices = [index for index in range(size) if codes(dataset[index]).size(0) <= max_frames]
+    indices = [index for index in range(size) if longcat_codes(dataset[index]).size(0) <= max_frames]
     dropped = size - len(indices)
     if not indices:
         raise ValueError("semantic codec duration filter removed every sample.")

@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from semantic_acoustic_codec.backend import LongCatBackend
+from semantic_acoustic_codec.backend.longcat import LONGCAT_CODEBOOK_SIZES, batch_samples
 from semantic_acoustic_codec.config import DecoderConfig, Route
-from semantic_acoustic_codec.data import collate
 from semantic_acoustic_codec.loss import FlowLoss, RVQLoss
 from semantic_acoustic_codec.model import RectifiedFlowRuntime, backend_features, build_route
 from semantic_acoustic_codec.runtime import (
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
     from torch import Tensor
 
-    from semantic_acoustic_codec.data.longcat import SemanticCodecBatch
+    from semantic_acoustic_codec.types import SemanticCodecBatch
 
 
 class FakeEncoder:
@@ -111,14 +111,14 @@ def _batch() -> tuple[Tensor, Tensor, Tensor]:
     semantic = torch.tensor(
         [
             [[1], [2], [3]],
-            [[4], [5], [0]],
+            [[4], [5], [16]],
         ],
         dtype=torch.long,
     )
     acoustic = torch.tensor(
         [
             [[1, 2], [3, 4], [5, 6]],
-            [[6, 10], [2, 1], [0, 0]],
+            [[6, 10], [2, 1], [7, 11]],
         ],
         dtype=torch.long,
     )
@@ -205,7 +205,11 @@ def _data_smoke(root: Path, *, split: str, index: int) -> None:
 
     dataset = wmt19_tts_codec(codec="longcat", root=root, split=split)
     sample = dataset[index]
-    batch = collate([sample])
+    batch = batch_samples(
+        [sample],
+        semantic_pad_id=LONGCAT_CODEBOOK_SIZES[0],
+        acoustic_pad_ids=LONGCAT_CODEBOOK_SIZES[1:],
+    )
     _validate_batch(batch)
     print(
         "data smoke ok: "

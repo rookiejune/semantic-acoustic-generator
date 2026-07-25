@@ -19,10 +19,10 @@ if TYPE_CHECKING:
 
     from torch import Tensor
 
-    from semantic_acoustic_codec.data.longcat import SemanticCodecBatch
     from semantic_acoustic_codec.loss.repa import Teacher
     from semantic_acoustic_codec.loss.types import LossItem
     from semantic_acoustic_codec.runtime.protocol import CodecBackend
+    from semantic_acoustic_codec.types import SemanticCodecBatch
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,7 @@ class FMFeatureGenerator(CodecUnitGenerator):
             batch.mask,
             self.flow_runtime,
         )
-        repa_features = repa_teacher(batch.semantic_codes, batch.safe_acoustic_codes, batch.mask)
+        repa_features = repa_teacher(batch.semantic_codes, batch.acoustic_codes, batch.mask)
         repa = self.repa_loss(representation, repa_features, batch.mask)
         item_loss = item.loss.mean()
         repa_loss = repa.loss.mean()
@@ -253,7 +253,7 @@ class RVQCodeGenerator(CodecUnitGenerator):
         repa_teacher: Teacher | None = None,
     ) -> DecoderLoss:
         del target_features, feature_mean, feature_std, repa_teacher
-        labels = batch.safe_acoustic_codes
+        labels = batch.acoustic_codes
         item = self.rvq_loss(self.core(condition, labels, mask=batch.mask), labels, batch.mask)
         return DecoderLoss(
             loss=item.loss.mean(),

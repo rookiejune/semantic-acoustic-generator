@@ -14,11 +14,6 @@ class Route(StrEnum):
     RVQ = auto()
 
 
-class AdapterType(StrEnum):
-    LINEAR = auto()
-    MLP = auto()
-
-
 class Initialization(StrEnum):
     CODEC = auto()
     RANDOM = auto()
@@ -101,7 +96,6 @@ def _float(value: object, *, name: str) -> float:
 
 
 __all__ = [
-    "AdapterType",
     "DecoderConfig",
     "Initialization",
     "RVQPredictor",

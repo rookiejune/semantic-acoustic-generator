@@ -3,41 +3,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from anytrain.module.idspace import Embedding, Layout
 from torch import nn
 
-from semantic_acoustic_codec.config import AdapterType, Initialization
+from semantic_acoustic_codec._tensor import is_signed_integer_dtype
+from semantic_acoustic_codec.config import Initialization
 
 if TYPE_CHECKING:
     from torch import Tensor
-
-
-class MLPAdapter(nn.Module):
-    def __init__(self, in_features: int, out_features: int) -> None:
-        super().__init__()
-        intermediate_size = int(round((8.0 / 3.0) * in_features))
-        self.gate_proj = nn.Linear(in_features, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(in_features, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, out_features, bias=False)
-        self.act_fn = nn.SiLU()
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
-def create_adapter(
-    adapter_type: AdapterType | None,
-    in_features: int,
-    out_features: int,
-) -> nn.Module:
-    if adapter_type is None:
-        if in_features != out_features:
-            raise ValueError("identity adapter requires matching feature dimensions.")
-        return nn.Identity()
-    if adapter_type is AdapterType.LINEAR:
-        return nn.Linear(in_features=in_features, out_features=out_features)
-    if adapter_type is AdapterType.MLP:
-        return MLPAdapter(in_features=in_features, out_features=out_features)
-    raise AssertionError(f"unsupported adapter type: {adapter_type}")
 
 
 class SemanticConditioner(nn.Module):
@@ -48,7 +21,6 @@ class SemanticConditioner(nn.Module):
         semantic_codebook: Tensor,
         *,
         condition_dim: int,
-        adapter: AdapterType | None = AdapterType.LINEAR,
         initialization: Initialization = Initialization.CODEC,
         seed: int = 0,
     ) -> None:
@@ -60,12 +32,32 @@ class SemanticConditioner(nn.Module):
             initialization=initialization,
             seed=seed,
         )
-        self.embedding = nn.Embedding.from_pretrained(weight, freeze=False)
-        self.adapter = create_adapter(adapter, self.embedding.embedding_dim, condition_dim)
+        pad = weight.new_zeros(1, weight.size(-1))
+        weight = torch.cat([weight, pad], dim=0)
+        self.embedding = nn.Embedding.from_pretrained(
+            weight,
+            freeze=False,
+            padding_idx=weight.size(0) - 1,
+        )
+        self.layout = Layout(semantic=(0, weight.size(0)))
+        self.id_embedding = Embedding(self.layout, semantic=self.embedding)
+        self.projection = (
+            nn.Identity()
+            if self.embedding.embedding_dim == condition_dim
+            else nn.Linear(self.embedding.embedding_dim, condition_dim)
+        )
+
+    @property
+    def semantic_codebook_size(self) -> int:
+        return self.embedding.num_embeddings - 1
+
+    @property
+    def semantic_pad_id(self) -> int:
+        return self.semantic_codebook_size
 
     @property
     def condition_dim(self) -> int:
-        value = self.adapter(self.embedding.weight[:1])
+        value = self.projection(self.embedding.weight[:1])
         return int(value.size(-1))
 
     def forward(
@@ -83,7 +75,11 @@ class SemanticConditioner(nn.Module):
             semantic_tokens = semantic_codes
         else:
             raise ValueError("semantic_codes must have shape [B, F, 1] or [B, T].")
-        condition = self.adapter(self.embedding(semantic_tokens.to(dtype=torch.long)))
+        _validate_semantic_tokens(semantic_tokens, pad_id=self.semantic_pad_id)
+        tokens = semantic_tokens.to(dtype=torch.long)
+        input_ids = self.layout.to_global("semantic", tokens)
+        condition = self.projection(self.id_embedding(input_ids))
+        condition = condition.masked_fill(tokens.eq(self.semantic_pad_id)[..., None], 0)
         if spans is None:
             return condition
         return repeat_condition(condition, spans, frames=frames)
@@ -99,7 +95,7 @@ class ReferenceConditioner(nn.Module):
         self.feature_dim = feature_dim
         self.condition_dim = condition_dim
         self.default_feature = nn.Parameter(torch.zeros(1, feature_dim))
-        self.adapter = nn.Linear(feature_dim, condition_dim)
+        self.projection = nn.Linear(feature_dim, condition_dim)
         self.norm = nn.LayerNorm(condition_dim)
         self.gate = nn.Parameter(torch.zeros(condition_dim))
 
@@ -130,7 +126,7 @@ class ReferenceConditioner(nn.Module):
             if not bool(mask.any(dim=1).all()):
                 raise ValueError("each reference row must contain at least one valid frame.")
 
-        reference = self.adapter(features)
+        reference = self.projection(features)
         weights = mask[..., None].to(dtype=reference.dtype)
         pooled = (reference * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
         pooled = self.norm(pooled)
@@ -166,6 +162,15 @@ def repeat_condition(condition: Tensor, spans: Tensor, *, frames: int | None) ->
             raise ValueError("semantic token spans exceed the target frame count.")
         output[row_index, : repeated.size(0)] = repeated
     return output
+
+
+def _validate_semantic_tokens(values: Tensor, *, pad_id: int) -> None:
+    if not is_signed_integer_dtype(values.dtype):
+        raise TypeError("semantic_codes must use a signed integer dtype.")
+    if bool((values < 0).any()):
+        raise ValueError("semantic_codes must not contain negative IDs.")
+    if bool((values > pad_id).any()):
+        raise ValueError("semantic_codes contain an ID outside the semantic codebook and pad token.")
 
 
 def matched_random_weight(reference: Tensor, *, seed: int, rows: int | None = None) -> Tensor:

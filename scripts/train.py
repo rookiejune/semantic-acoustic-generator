@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import hydra
 import torch
 from lightning import pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 
 from semantic_acoustic_codec.backend import LongCatBackend
 from semantic_acoustic_codec.callback import ArtifactExport
-from semantic_acoustic_codec.config import AdapterType, DecoderConfig, Initialization, Route
+from semantic_acoustic_codec.config import DecoderConfig, Initialization, Route
 from semantic_acoustic_codec.datamodule import (
     DataConfig,
     DataModule,
@@ -24,8 +24,6 @@ from semantic_acoustic_codec.pl_module import build_module
 from semantic_acoustic_codec.runtime import SamplingConfig, SemanticSupportConfig
 
 if TYPE_CHECKING:
-    from typing import Any
-
     from omegaconf import DictConfig
 
 
@@ -42,9 +40,15 @@ def run(config: DictConfig) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     backend = LongCatBackend.from_pretrained(device=str(device))
+    semantic_pad_id = int(backend.semantic_codebook.size(0))
+    acoustic_pad_ids = backend.acoustic_codebook_sizes
     data = _data_config(config.data)
     fixed_codes = load_codes(data, frame_rate=backend.frame_rate)
-    fixed_batch = collate_codes([fixed_codes])
+    fixed_batch = collate_codes(
+        [fixed_codes],
+        semantic_pad_id=semantic_pad_id,
+        acoustic_pad_ids=acoustic_pad_ids,
+    )
     support_config = _support_config(config, seed=seed)
     module = build_module(
         backend,
@@ -55,7 +59,7 @@ def run(config: DictConfig) -> None:
         weight_decay=float(config.optimizer.weight_decay),
     )
 
-    callbacks = [ArtifactExport(output_dir)]
+    callbacks: list[Callback] = [ArtifactExport(output_dir)]
     if bool(config.trainer.enable_checkpointing):
         callbacks.append(
             ModelCheckpoint(
@@ -72,7 +76,7 @@ def run(config: DictConfig) -> None:
         accelerator=str(config.trainer.accelerator),
         devices=cast(str | int, config.trainer.devices),
         strategy=str(config.trainer.strategy),
-        precision=cast(str, config.trainer.precision),
+        precision=cast(Any, config.trainer.precision),
         max_steps=int(config.train.max_steps),
         max_epochs=int(config.trainer.max_epochs),
         log_every_n_steps=int(config.trainer.log_every_n_steps),
@@ -83,15 +87,30 @@ def run(config: DictConfig) -> None:
         use_distributed_sampler=bool(config.trainer.use_distributed_sampler),
     )
     if data.lba.enabled:
-        trainer.fit(module, datamodule=DataModule(data, frame_rate=backend.frame_rate, output_dir=output_dir))
+        trainer.fit(
+            module,
+            datamodule=DataModule(
+                data,
+                frame_rate=backend.frame_rate,
+                output_dir=output_dir,
+                semantic_pad_id=semantic_pad_id,
+                acoustic_pad_ids=acoustic_pad_ids,
+            ),
+        )
     else:
-        trainer.fit(module, train_dataloaders=single_batch_loader(fixed_codes))
+        trainer.fit(
+            module,
+            train_dataloaders=single_batch_loader(
+                fixed_codes,
+                semantic_pad_id=semantic_pad_id,
+                acoustic_pad_ids=acoustic_pad_ids,
+            ),
+        )
 
 
 def _support_config(config: DictConfig, *, seed: int) -> SemanticSupportConfig:
     decoder = config.decoder
     sampling = config.sampling
-    adapter = config.get("adapter")
     return SemanticSupportConfig(
         route=_route(config.route),
         condition_dim=int(config.condition_dim),
@@ -104,7 +123,6 @@ def _support_config(config: DictConfig, *, seed: int) -> SemanticSupportConfig:
             repa_student_layer=cast(int | None, decoder.get("repa_student_layer")),
             repa_loss_weight=float(decoder.get("repa_loss_weight", 0.0)),
         ),
-        adapter=None if adapter is None else _adapter(adapter),
         initialization=_initialization(config.initialization),
         seed=seed,
         sampling=SamplingConfig(
@@ -133,7 +151,7 @@ def _data_config(config: DictConfig) -> DataConfig:
             max_batch_seconds=float(lba.max_batch_seconds),
             max_padding_ratio=float(lba.max_padding_ratio),
             prefetch_batches=int(lba.prefetch_batches),
-            planner_mode=str(lba.planner_mode),
+            planner_mode=cast(Literal["quality", "throughput"], str(lba.planner_mode)),
             drop_last_flush=bool(lba.drop_last_flush),
         ),
     )
@@ -160,11 +178,6 @@ def _device(value: str | None) -> torch.device:
 def _route(value: Any) -> Route:
     raw = str(value)
     return Route[raw] if raw in Route.__members__ else Route(raw)
-
-
-def _adapter(value: Any) -> AdapterType:
-    raw = str(value)
-    return AdapterType[raw] if raw in AdapterType.__members__ else AdapterType(raw)
 
 
 def _initialization(value: Any) -> Initialization:

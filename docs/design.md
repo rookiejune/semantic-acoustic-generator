@@ -91,9 +91,10 @@ class CodecUnitGenerator(Protocol):
 src/semantic_acoustic_codec/
   backend/        # LongCatBackend / BiCodecBackend adapters around real codec instances
   runtime/        # codec-free support, codec runtime composition, artifact loader and Protocols
-  datamodule/     # wmt19_tts_codec(longcat) batch extraction, collate and Lightning data modules
+  types.py        # SemanticCodecBatch and other cross-backend training contracts
+  datamodule/     # wmt19_tts_codec(longcat) dataset loading, filtering and Lightning data modules
   model/
-    condition.py  # semantic embedding, BPE span repeat, adapter
+    condition.py  # semantic embedding, BPE span repeat, linear projection
     dit.py        # FM decoder backbone
     rvq.py        # acoustic RVQ code predictor
   loss/           # route-specific losses
@@ -110,7 +111,7 @@ jobs/
 docs/
 ```
 
-`runtime/`、`backend/` 和 `model/` 是 `speech-to-speech` 未来依赖的稳定层；
+`runtime/`、`backend/`、`types.py` 和 `model/` 是 `speech-to-speech` 未来依赖的稳定层；
 `datamodule/`、`pl_module/`、`callback/`、`scripts/` 是本仓库训练实现，不应被
 `speech-to-speech` 直接 import。
 
@@ -130,7 +131,8 @@ docs/
 
 1. 从 anydataset/anytrain workspace 读取 prepared sample。
 2. 取 target audio 的 LongCat view。
-3. 将完整 codes 拆成 semantic/acoustic 两组。
+3. 由 `backend/longcat.py` 将完整 codes 拆成 semantic/acoustic 两组并生成通用
+   `SemanticCodecBatch`。
 4. 用 acoustic codes 通过 LongCat backend 得到 acoustic features，作为 FM 的连续目标。
 5. RVQ 路线直接监督 acoustic codebook IDs。
 
@@ -172,7 +174,7 @@ FM 路线复用 DiT backbone，但 objective 使用 continuous flow matching：
 
 1. native LongCat：`semantic_codes[..., 0]` 直接查 `codec.semantic_codebook` 初始化的 embedding。
 2. CodecBPE：BPE token embedding 按 `semantic_token_spans` repeat 到 frame 轴。
-3. adapter：将 codec embedding dim 转换到 decoder condition dim。
+3. projection：仅在 codec embedding dim 和 decoder condition dim 不一致时做线性投影。
 
 semantic condition 层只负责 semantic 表示，不读取 acoustic target，也不构造 text/audio vocabulary head。
 初始化策略由枚举控制，例如 codec initialization 和 matched random initialization，字符串只在配置边界解析一次。

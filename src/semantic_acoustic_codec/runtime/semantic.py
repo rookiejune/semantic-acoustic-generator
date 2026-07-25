@@ -11,7 +11,6 @@ from torch import Tensor, nn
 
 from semantic_acoustic_codec._tensor import is_signed_integer_dtype
 from semantic_acoustic_codec.config import (
-    AdapterType,
     DecoderConfig,
     Initialization,
     Route,
@@ -22,7 +21,7 @@ from semantic_acoustic_codec.model.routes import RouteModules, build_route
 if TYPE_CHECKING:
     from semantic_acoustic_codec.runtime.protocol import CodecBackend
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 CONFIG_NAME = "codec.json"
 CHECKPOINT_NAME = "model.ckpt"
 
@@ -47,7 +46,6 @@ class SemanticSupportConfig:
     route: Route
     condition_dim: int
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
-    adapter: AdapterType | None = AdapterType.LINEAR
     initialization: Initialization = Initialization.CODEC
     seed: int = 0
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
@@ -210,9 +208,9 @@ class SemanticCodecSupport(nn.Module):
         valid = prepared[..., 0][frame_mask]
         if bool((valid < 0).any()):
             raise ValueError("valid semantic_codes must not contain negative IDs.")
-        if bool((valid >= self.conditioner.embedding.num_embeddings).any()):
+        if bool((valid >= self.conditioner.semantic_codebook_size).any()):
             raise ValueError("semantic_codes contain an ID outside the semantic codebook.")
-        return prepared.masked_fill(~frame_mask[..., None], 0), frame_mask
+        return prepared.masked_fill(~frame_mask[..., None], self.conditioner.semantic_pad_id), frame_mask
 
 
 class SemanticCodecRuntime:
@@ -289,7 +287,6 @@ def build_support(
         acoustic_codebook_sizes,
         condition_dim=config.condition_dim,
         decoder=config.decoder,
-        adapter=config.adapter,
         initialization=config.initialization,
         seed=config.seed,
     )
@@ -334,7 +331,7 @@ def load_artifact(
     config = _config(data["config"])
     support = build_support(
         config,
-        semantic_codebook=torch.empty(
+        semantic_codebook=torch.zeros(
             _metadata_int(backend_data, "semantic_vocab_size"),
             _metadata_int(backend_data, "semantic_embedding_dim"),
         ),
@@ -363,7 +360,6 @@ def _load_state(path: Path, *, device: str | torch.device | None) -> Mapping[str
 def _config_dict(config: SemanticSupportConfig) -> dict[str, object]:
     data = asdict(config)
     data["route"] = config.route.value
-    data["adapter"] = None if config.adapter is None else config.adapter.value
     data["initialization"] = config.initialization.value
     decoder = cast(dict[str, object], data["decoder"])
     decoder["rvq_predictor"] = config.decoder.rvq_predictor.value
@@ -373,7 +369,6 @@ def _config_dict(config: SemanticSupportConfig) -> dict[str, object]:
 def _config(data: Mapping[str, Any]) -> SemanticSupportConfig:
     decoder = cast(Mapping[str, Any], data["decoder"])
     sampling = cast(Mapping[str, Any], data["sampling"])
-    adapter = data.get("adapter")
     return SemanticSupportConfig(
         route=Route(cast(str, data["route"])),
         condition_dim=int(data["condition_dim"]),
@@ -391,7 +386,6 @@ def _config(data: Mapping[str, Any]) -> SemanticSupportConfig:
             repa_student_layer=cast(Optional[int], decoder.get("repa_student_layer")),
             repa_loss_weight=float(decoder.get("repa_loss_weight", 0.0)),
         ),
-        adapter=None if adapter is None else AdapterType(cast(str, adapter)),
         initialization=Initialization(cast(str, data["initialization"])),
         seed=int(data["seed"]),
         sampling=SamplingConfig(
@@ -432,7 +426,7 @@ def _codebook_sizes(support: SemanticCodecSupport) -> tuple[int, ...]:
 
 def _support_metadata(support: SemanticCodecSupport) -> dict[str, object]:
     return {
-        "semantic_vocab_size": support.conditioner.embedding.num_embeddings,
+        "semantic_vocab_size": support.conditioner.semantic_codebook_size,
         "semantic_embedding_dim": support.conditioner.embedding.embedding_dim,
         "acoustic_feature_dim": support.acoustic_feature_dim,
         "acoustic_codebook_sizes": list(_codebook_sizes(support)),

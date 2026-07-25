@@ -6,8 +6,7 @@ import pytest
 import torch
 
 from semantic_acoustic_codec.backend import LongCatBackend
-from semantic_acoustic_codec.config import AdapterType, DecoderConfig, Route, RVQPredictor
-from semantic_acoustic_codec.data import SemanticCodecBatch
+from semantic_acoustic_codec.config import DecoderConfig, Route, RVQPredictor
 from semantic_acoustic_codec.loss import FlowLoss, RepaLoss, RVQLoss
 from semantic_acoustic_codec.model import (
     AcousticRVQDecoder,
@@ -28,6 +27,7 @@ from semantic_acoustic_codec.runtime import (
     load_artifact,
     save_artifact,
 )
+from semantic_acoustic_codec.types import SemanticCodecBatch
 
 
 class FakeEncoder:
@@ -64,12 +64,28 @@ def test_conditioner_shapes() -> None:
     conditioner = SemanticConditioner(
         torch.randn(16, 8),
         condition_dim=12,
-        adapter=AdapterType.LINEAR,
     )
     semantic = torch.tensor([[[1], [2], [3]], [[4], [5], [0]]], dtype=torch.long)
     condition = conditioner(semantic)
 
     assert condition.shape == (2, 3, 12)
+    assert conditioner.semantic_pad_id == 16
+    assert torch.equal(
+        conditioner.embedding.weight[conditioner.semantic_pad_id],
+        torch.zeros_like(conditioner.embedding.weight[conditioner.semantic_pad_id]),
+    )
+    padded = conditioner(torch.tensor([[[conditioner.semantic_pad_id]]], dtype=torch.long))
+    assert torch.equal(padded, torch.zeros_like(padded))
+
+
+def test_conditioner_validates_semantic_ids() -> None:
+    conditioner = SemanticConditioner(torch.randn(8, 6), condition_dim=6)
+
+    conditioner(torch.tensor([[[conditioner.semantic_pad_id]]], dtype=torch.long))
+    with pytest.raises(ValueError, match="negative"):
+        conditioner(torch.tensor([[[-1]]], dtype=torch.long))
+    with pytest.raises(ValueError, match="outside"):
+        conditioner(torch.tensor([[[conditioner.semantic_pad_id + 1]]], dtype=torch.long))
 
 
 def test_fm_loss_and_sample_shapes() -> None:
@@ -156,7 +172,7 @@ def test_build_route_and_backend_features() -> None:
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
-    acoustic = torch.tensor([[[1, 2], [3, 4], [-1, -1]]], dtype=torch.long)
+    acoustic = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
     features = backend_features(backend, acoustic, mask)
 
@@ -183,8 +199,8 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
         acoustic_feature_dim=backend.acoustic_feature_dim,
         acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
     ).eval()
-    semantic = torch.tensor([[[1], [2], [-1]]], dtype=torch.long)
-    reference = torch.tensor([[[1, 2], [3, 4], [0, 0]]], dtype=torch.long)
+    semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
+    reference = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
 
     features = support.sample_features(semantic, mask=mask, generator=torch.Generator().manual_seed(0))
@@ -214,8 +230,8 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
 
 def test_fm_route_trains_one_step() -> None:
     backend = LongCatBackend(FakeCodec())
-    semantic = torch.tensor([[[1], [2], [0]]], dtype=torch.long)
-    acoustic = torch.tensor([[[1, 2], [3, 4], [0, 0]]], dtype=torch.long)
+    semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
+    acoustic = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
     target = backend_features(backend, acoustic, mask)
 
@@ -236,7 +252,7 @@ def test_fm_route_trains_one_step() -> None:
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
     output = modules.generator.loss(
-        SemanticCodecBatch(semantic_codes=semantic, acoustic_codes=acoustic, mask=mask),
+        _batch(semantic, acoustic, mask),
         condition,
         target,
         feature_mean=torch.zeros(1, 1, backend.acoustic_feature_dim),
@@ -254,8 +270,8 @@ def test_rvq_route_trains_one_step_when_qwen3_builder_is_available() -> None:
         pytest.skip("RVQ route requires transformers and anytrain.module.qwen.build_qwen3_model.")
 
     backend = LongCatBackend(FakeCodec())
-    semantic = torch.tensor([[[1], [2], [0]]], dtype=torch.long)
-    acoustic = torch.tensor([[[1, 2], [3, 4], [0, 0]]], dtype=torch.long)
+    semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
+    acoustic = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
     modules = build_route(
         Route.RVQ,
@@ -275,7 +291,7 @@ def test_rvq_route_trains_one_step_when_qwen3_builder_is_available() -> None:
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
     output = modules.generator.loss(
-        SemanticCodecBatch(semantic_codes=semantic, acoustic_codes=acoustic, mask=mask),
+        _batch(semantic, acoustic, mask),
         condition,
         feature_mean=torch.zeros(1, 1, backend.acoustic_feature_dim),
         feature_std=torch.ones(1, 1, backend.acoustic_feature_dim),
@@ -292,8 +308,8 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
         pytest.skip("RVQ MTP route requires transformers.")
 
     backend = LongCatBackend(FakeCodec())
-    semantic = torch.tensor([[[1], [2], [0]]], dtype=torch.long)
-    acoustic = torch.tensor([[[1, 2], [3, 4], [0, 0]]], dtype=torch.long)
+    semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
+    acoustic = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
     modules = build_route(
         Route.RVQ,
@@ -365,6 +381,16 @@ def _has_qwen3_builder() -> bool:
     except ImportError:
         return False
     return callable(build_qwen3_model)
+
+
+def _batch(semantic: torch.Tensor, acoustic: torch.Tensor, mask: torch.Tensor) -> SemanticCodecBatch:
+    return SemanticCodecBatch(
+        semantic_codes=semantic,
+        acoustic_codes=acoustic,
+        mask=mask,
+        semantic_pad_id=8,
+        acoustic_pad_ids=(5, 7),
+    )
 
 
 def test_rvq_mtp_decoder_import_is_lazy() -> None:

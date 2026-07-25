@@ -71,7 +71,11 @@ class FakeRepaTeacher:
 
 def test_training_module_trains_and_exports_artifact(tmp_path) -> None:
     backend = LongCatBackend(FakeCodec())
-    batch = collate_codes([torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)])
+    batch = collate_codes(
+        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
+        semantic_pad_id=backend.semantic_codebook.size(0),
+        acoustic_pad_ids=backend.acoustic_codebook_sizes,
+    )
     config = SemanticSupportConfig(
         route=Route.FM,
         condition_dim=10,
@@ -98,7 +102,11 @@ def test_training_module_trains_and_exports_artifact(tmp_path) -> None:
 
 def test_training_module_adds_repa_loss_with_teacher() -> None:
     backend = LongCatBackend(FakeCodec())
-    batch = collate_codes([torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)])
+    batch = collate_codes(
+        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
+        semantic_pad_id=backend.semantic_codebook.size(0),
+        acoustic_pad_ids=backend.acoustic_codebook_sizes,
+    )
     config = SemanticSupportConfig(
         route=Route.FM,
         condition_dim=10,
@@ -129,7 +137,11 @@ def test_training_module_adds_repa_loss_with_teacher() -> None:
 
 def test_training_module_requires_repa_teacher() -> None:
     backend = LongCatBackend(FakeCodec())
-    batch = collate_codes([torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)])
+    batch = collate_codes(
+        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
+        semantic_pad_id=backend.semantic_codebook.size(0),
+        acoustic_pad_ids=backend.acoustic_codebook_sizes,
+    )
     config = SemanticSupportConfig(
         route=Route.FM,
         condition_dim=10,
@@ -152,7 +164,9 @@ def test_feature_stats_use_only_valid_frames() -> None:
         [
             torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long),
             torch.tensor([[5, 3, 4]], dtype=torch.long),
-        ]
+        ],
+        semantic_pad_id=backend.semantic_codebook.size(0),
+        acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
 
     mean, std = feature_stats(backend, batch)
