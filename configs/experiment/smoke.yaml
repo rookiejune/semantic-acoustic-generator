@@ -1,3 +1,5 @@
+# @package _global_
+
 data:
   sample_limit: 1
   max_seconds: 4.0

@@ -30,7 +30,7 @@ class DecoderConfig:
     layers: int = 8
     heads: int = 8
     ffn_ratio: int = 4
-    rvq_predictor: RVQPredictor = RVQPredictor.CODEBOOK_AR
+    rvq_predictor: RVQPredictor = RVQPredictor.MTP
     mtp_layers: int = 2
     mtp_heads: int = 4
     repa_feature_dim: int | None = None
@@ -55,7 +55,7 @@ def decoder_options(
         return DecoderConfig()
     if isinstance(config, DecoderConfig):
         return config
-    predictor = config.get("rvq_predictor", RVQPredictor.CODEBOOK_AR.value)
+    predictor = config.get("rvq_predictor", RVQPredictor.MTP.value)
     if not isinstance(predictor, str):
         raise TypeError("rvq_predictor must be a string.")
     return DecoderConfig(

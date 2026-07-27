@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
+from anytrain.codec import AcousticLayout
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 
@@ -15,59 +16,6 @@ if TYPE_CHECKING:
 
 
 LONGCAT_CODEBOOK_SIZES = (8192, 8100, 8100, 8100)
-
-
-class LongCatBackend:
-    """Adapter around anytrain LongCat matching the local codec backend protocol."""
-
-    name = "longcat"
-
-    def __init__(self, codec: Any) -> None:
-        self.codec = codec
-        decoders = list(getattr(codec, "decoders", {}).values())
-        latent_dim = None if not decoders else getattr(decoders[0], "latent_dim", None)
-        if not isinstance(latent_dim, int):
-            raise TypeError("LongCat decoder must expose an integer latent_dim.")
-        self._acoustic_feature_dim = latent_dim
-
-    @classmethod
-    def from_pretrained(cls, *, device: str | None = None) -> LongCatBackend:
-        from anytrain.codec.longcat import LongCat
-
-        return cls(LongCat.from_pretrained(device=device))
-
-    @property
-    def sample_rate(self) -> int:
-        return int(self.codec.sample_rate)
-
-    @property
-    def frame_rate(self) -> float:
-        encoder = self.codec.encoder
-        return float(encoder.input_sample_rate / encoder.hop_length)
-
-    @property
-    def acoustic_feature_dim(self) -> int:
-        return self._acoustic_feature_dim
-
-    @property
-    def semantic_codebook(self) -> Tensor:
-        return self.codec.semantic_codebook
-
-    @property
-    def acoustic_codebook_sizes(self) -> tuple[int, ...]:
-        return tuple(int(size) for size in self.codec.codebook_sizes[1:])
-
-    def encode(self, audio: Tensor, sample_rate: int) -> Tensor:
-        return self.codec.encode(audio, sample_rate)
-
-    def decode(self, codes: Tensor) -> Tensor:
-        return self.codec.decode(codes)
-
-    def acoustic_codes_to_features(self, acoustic_codes: Tensor) -> Tensor:
-        return self.codec.acoustic_codes_to_features(acoustic_codes)
-
-    def decode_features(self, semantic_codes: Tensor, acoustic_features: Tensor) -> Tensor:
-        return self.codec.decode_features(semantic_codes, acoustic_features)
 
 
 def codes(sample: Mapping[Any, Any], *, role: Role | None = None) -> Tensor:
@@ -108,6 +56,8 @@ def batch_codes(
         mask=mask,
         semantic_pad_id=semantic_pad_id,
         acoustic_pad_ids=acoustic_pads,
+        acoustic_mask=mask,
+        acoustic_layout=AcousticLayout.FRAME_ALIGNED,
     )
 
 
@@ -141,11 +91,11 @@ def _check_codes(value: object, *, source: str) -> None:
 
 
 def _pad_semantic(values: Sequence[Tensor], *, semantic_pad_id: int) -> Tensor:
-    return pad_sequence(values, batch_first=True, padding_value=semantic_pad_id)
+    return pad_sequence(list(values), batch_first=True, padding_value=semantic_pad_id)
 
 
 def _pad_acoustic(values: Sequence[Tensor], *, mask: Tensor, acoustic_pad_ids: tuple[int, ...]) -> Tensor:
-    padded = pad_sequence(values, batch_first=True, padding_value=0)
+    padded = pad_sequence(list(values), batch_first=True, padding_value=0)
     pad_ids = torch.tensor(acoustic_pad_ids, device=padded.device, dtype=padded.dtype)
     return torch.where(mask[..., None], padded, pad_ids)
 
@@ -171,7 +121,6 @@ def _anydataset_types() -> tuple[type[Any], Any, Any, Any]:
 
 
 __all__ = [
-    "LongCatBackend",
     "LONGCAT_CODEBOOK_SIZES",
     "batch_codes",
     "batch_samples",

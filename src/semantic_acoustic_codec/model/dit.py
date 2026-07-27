@@ -7,75 +7,7 @@ from anytrain.module.dit import DiT, DiTConditionType
 from torch import nn
 
 if TYPE_CHECKING:
-    from anytrain.module.dit import DiTConditionState
     from torch import Tensor
-
-
-class AcousticDiT(DiT):
-    """Compatibility wrapper for the package's acoustic feature DiT route."""
-
-    def __init__(
-        self,
-        condition_dim: int,
-        latent_dim: int,
-        *,
-        hidden_dim: int | None = None,
-        layers: int = 8,
-        heads: int = 8,
-        ffn_ratio: int = 4,
-        repa_feature_dim: int | None = None,
-        repa_student_layer: int | None = None,
-    ) -> None:
-        super().__init__(
-            input_dim=latent_dim,
-            output_dim=latent_dim,
-            hidden_dim=hidden_dim,
-            layers=layers,
-            heads=heads,
-            ffn_ratio=ffn_ratio,
-            condition_dim=condition_dim,
-            condition_type=DiTConditionType.FRAME_FILM,
-            feature_dim=repa_feature_dim,
-            feature_layer=repa_student_layer,
-        )
-
-    def forward(
-        self,
-        x_t: Tensor,
-        t: Tensor,
-        *,
-        condition: Tensor | None = None,
-        condition_mask: Tensor | None = None,
-        condition_state: DiTConditionState | None = None,
-        mask: Tensor | None = None,
-    ) -> Tensor:
-        return super().forward(
-            x_t,
-            t,
-            condition=condition,
-            condition_mask=condition_mask,
-            condition_state=condition_state,
-            mask=mask,
-        )
-
-    def forward_with_features(
-        self,
-        x_t: Tensor,
-        t: Tensor,
-        *,
-        condition: Tensor | None = None,
-        condition_mask: Tensor | None = None,
-        condition_state: DiTConditionState | None = None,
-        mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        return super().forward_with_features(
-            x_t,
-            t,
-            condition=condition,
-            condition_mask=condition_mask,
-            condition_state=condition_state,
-            mask=mask,
-        )
 
 
 class DiTDecoder(nn.Module):
@@ -94,15 +26,17 @@ class DiTDecoder(nn.Module):
         repa_student_layer: int | None = None,
     ) -> None:
         super().__init__()
-        self.decoder = AcousticDiT(
-            condition_dim,
-            feature_dim,
+        self.decoder = DiT(
+            input_dim=feature_dim,
+            output_dim=feature_dim,
             hidden_dim=hidden_dim,
             layers=layers,
             heads=heads,
             ffn_ratio=ffn_ratio,
-            repa_feature_dim=repa_feature_dim,
-            repa_student_layer=repa_student_layer,
+            condition_dim=condition_dim,
+            condition_type=DiTConditionType.FRAME_FILM,
+            feature_dim=repa_feature_dim,
+            feature_layer=repa_student_layer,
         )
 
     def forward(
@@ -112,8 +46,9 @@ class DiTDecoder(nn.Module):
         *,
         condition: Tensor,
         mask: Tensor | None = None,
+        validate: bool = True,
     ) -> Tensor:
-        return self.decoder(x_t, t, condition=condition, mask=mask)
+        return self.decoder(x_t, t, condition=condition, mask=mask, validate=validate)
 
     def forward_with_features(
         self,
@@ -122,8 +57,15 @@ class DiTDecoder(nn.Module):
         *,
         condition: Tensor,
         mask: Tensor | None = None,
+        validate: bool = True,
     ) -> tuple[Tensor, Tensor]:
-        return self.decoder.forward_with_features(x_t, t, condition=condition, mask=mask)
+        return self.decoder.forward_with_features(
+            x_t,
+            t,
+            condition=condition,
+            mask=mask,
+            validate=validate,
+        )
 
     @torch.no_grad()
     def sample(
@@ -157,4 +99,4 @@ class DiTDecoder(nn.Module):
         return latent
 
 
-__all__ = ["AcousticDiT", "DiTDecoder"]
+__all__ = ["DiTDecoder"]

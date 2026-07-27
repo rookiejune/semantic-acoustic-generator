@@ -1,9 +1,7 @@
 """Semantic-only acoustic codec distillation components."""
 
-from semantic_acoustic_codec.backend import LongCatBackend
 from semantic_acoustic_codec.config import DecoderConfig, Route
 from semantic_acoustic_codec.model import (
-    AcousticDiT,
     AcousticRVQDecoder,
     CodecUnitGenerator,
     DecoderLoss,
@@ -13,11 +11,9 @@ from semantic_acoustic_codec.model import (
     RouteModules,
     RVQCodeGenerator,
     SemanticConditioner,
-    backend_features,
     build_route,
 )
 from semantic_acoustic_codec.runtime import (
-    CodecBackend,
     SamplingConfig,
     SemanticCodecRuntime,
     SemanticCodecSupport,
@@ -28,15 +24,12 @@ from semantic_acoustic_codec.runtime import (
 )
 
 __all__ = [
-    "AcousticDiT",
     "AcousticRVQDecoder",
-    "CodecBackend",
     "CodecUnitGenerator",
     "DecoderLoss",
     "DecoderConfig",
     "DiTDecoder",
     "FMFeatureGenerator",
-    "LongCatBackend",
     "RVQCodeGenerator",
     "ReferenceConditioner",
     "Route",
@@ -46,7 +39,6 @@ __all__ = [
     "SemanticCodecSupport",
     "SemanticSupportConfig",
     "SemanticConditioner",
-    "backend_features",
     "build_support",
     "build_route",
     "load_artifact",

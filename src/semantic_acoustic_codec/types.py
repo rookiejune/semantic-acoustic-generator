@@ -164,6 +164,35 @@ class SemanticCodecBatch:
     def has_reference(self) -> bool:
         return self.reference_acoustic_codes is not None
 
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = False,
+    ) -> SemanticCodecBatch:
+        """Move all codec tensors while preserving pair metadata and layout."""
+
+        def move(value: Tensor | None) -> Tensor | None:
+            return None if value is None else value.to(device=device, non_blocking=non_blocking)
+
+        return SemanticCodecBatch(
+            semantic_codes=self.semantic_codes.to(device=device, non_blocking=non_blocking),
+            acoustic_codes=self.acoustic_codes.to(device=device, non_blocking=non_blocking),
+            mask=self.mask.to(device=device, non_blocking=non_blocking),
+            semantic_pad_id=self.semantic_pad_id,
+            acoustic_pad_ids=self.acoustic_pad_ids,
+            acoustic_mask=self.target_acoustic_mask.to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            acoustic_layout=self.acoustic_layout,
+            reference_semantic_codes=move(self.reference_semantic_codes),
+            reference_acoustic_codes=move(self.reference_acoustic_codes),
+            reference_mask=move(self.reference_mask),
+            reference_acoustic_mask=move(self.reference_acoustic_mask),
+            metadata=self.metadata,
+        )
+
 
 def _validate_side(
     *,

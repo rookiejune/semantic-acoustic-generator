@@ -2,20 +2,16 @@
 
 本文只记录未完成事项。完成项应移动到 `docs/experiments/results/` 或由 git 历史保留。
 
-## P0 最小闭环
+## Cross-Text 训练验证
 
-- 修复或绕过 `third_party/anydataset` 的 `TextMeta.SPEAKER_ID` 重复定义问题，再运行
-  `wmt19_tts_codec(codec="longcat")` 单样本 data smoke。
-- 实现每条路线的 single-step training smoke：forward/backward/optimizer 和 finite loss。
-- 实现 `scripts/smoke.py`：覆盖数据读取、backend feature、两条 route 的一次前后向和 runtime decode。
-- 实现正式训练入口、Hydra configs 和 jobs wrapper。
+- 用新的 `qwen_cross_text` pair contract 重跑 LongCat / BiCodec × FM / RVQ single-pair overfit，分别记录
+  with-reference 与 without-reference 的 loss、feature MSE、音频和 `reference_gain`。
+- 对 BiCodec RVQ 的真实 backend 运行 32-slot generation，确认 temporal AR 的逐 slot 输出、finite decode
+  和推理耗时；本地 contract test 不能替代真实 artifact 验证。
 
-## P1 质量前验证
+## Screening 与 Fixed Eval
 
-- 单样本 overfit：两条路线分别记录 loss、waveform 长度、finite audio。
-- 32-sample smoke：确认 dataloader、checkpoint、resume、metrics 和 audio logging。
-- 与 full LongCat backend reconstruction 做固定样本 A/B：不声明质量，只记录 baseline。
-
-## speech-to-speech 接入前
-
-- 用 `model/acoustic=none` 跑一条 TTS generation decode smoke。
+- 完成约 1000 样本的四路线 screening，记录吞吐、显存、MFU、checkpoint、双路 reference 指标和失败样本。
+- 在 held-out cross-text target/reference pairs 上完成至少 16 条 fixed eval，同时导出 with-reference、
+  without-reference、full-unit reconstruction；BiCodec 额外导出 reference-token passthrough。
+- 检查 reference 是否泄漏文本内容；验证完成前不把 reference gain 或音色保持写入 conclusion。

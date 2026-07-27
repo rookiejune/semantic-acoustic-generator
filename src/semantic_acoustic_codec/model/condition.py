@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
-from anytrain.module.idspace import Embedding, Layout
 from torch import nn
 
 from semantic_acoustic_codec._tensor import is_signed_integer_dtype
@@ -39,8 +39,6 @@ class SemanticConditioner(nn.Module):
             freeze=False,
             padding_idx=weight.size(0) - 1,
         )
-        self.layout = Layout(semantic=(0, weight.size(0)))
-        self.id_embedding = Embedding(self.layout, semantic=self.embedding)
         self.projection = (
             nn.Identity()
             if self.embedding.embedding_dim == condition_dim
@@ -66,6 +64,7 @@ class SemanticConditioner(nn.Module):
         spans: Tensor | None = None,
         *,
         frames: int | None = None,
+        validate: bool = True,
     ) -> Tensor:
         if semantic_codes.dim() == 3:
             if semantic_codes.size(-1) != 1:
@@ -75,10 +74,10 @@ class SemanticConditioner(nn.Module):
             semantic_tokens = semantic_codes
         else:
             raise ValueError("semantic_codes must have shape [B, F, 1] or [B, T].")
-        _validate_semantic_tokens(semantic_tokens, pad_id=self.semantic_pad_id)
+        if validate:
+            _validate_semantic_tokens(semantic_tokens, pad_id=self.semantic_pad_id)
         tokens = semantic_tokens.to(dtype=torch.long)
-        input_ids = self.layout.to_global("semantic", tokens)
-        condition = self.projection(self.id_embedding(input_ids))
+        condition = self.projection(self.embedding(tokens))
         condition = condition.masked_fill(tokens.eq(self.semantic_pad_id)[..., None], 0)
         if spans is None:
             return condition
@@ -86,7 +85,7 @@ class SemanticConditioner(nn.Module):
 
 
 class ReferenceConditioner(nn.Module):
-    """Pool optional acoustic reference features into frame-level condition space."""
+    """Pool acoustic references or emit a learned null condition."""
 
     def __init__(self, feature_dim: int, condition_dim: int) -> None:
         super().__init__()
@@ -94,7 +93,7 @@ class ReferenceConditioner(nn.Module):
             raise ValueError("feature_dim and condition_dim must be positive.")
         self.feature_dim = feature_dim
         self.condition_dim = condition_dim
-        self.default_feature = nn.Parameter(torch.zeros(1, feature_dim))
+        self.null_condition = nn.Parameter(torch.zeros(condition_dim))
         self.projection = nn.Linear(feature_dim, condition_dim)
         self.norm = nn.LayerNorm(condition_dim)
         self.gate = nn.Parameter(torch.zeros(condition_dim))
@@ -105,32 +104,110 @@ class ReferenceConditioner(nn.Module):
         *,
         mask: Tensor | None = None,
         batch_size: int | None = None,
+        use_reference: Tensor | None = None,
+        validate: bool = True,
     ) -> Tensor:
         if features is None:
-            if batch_size is None or batch_size < 1:
-                raise ValueError("batch_size is required for the default reference.")
-            features = self.default_feature[None].expand(batch_size, 1, self.feature_dim)
-            mask = torch.ones(batch_size, 1, device=features.device, dtype=torch.bool)
-        else:
-            if features.dim() != 3 or features.size(-1) != self.feature_dim:
-                raise ValueError("reference features must have shape [B, F, feature_dim].")
-            if batch_size is not None and features.size(0) != batch_size:
-                raise ValueError("reference batch must match semantic batch.")
-            if mask is None:
-                mask = torch.ones(features.shape[:2], device=features.device, dtype=torch.bool)
-            elif mask.shape != features.shape[:2]:
-                raise ValueError("reference mask must align with reference features.")
-            elif mask.dtype != torch.bool:
-                raise TypeError("reference mask must be boolean.")
-            mask = mask.to(device=features.device)
-            if not bool(mask.any(dim=1).all()):
-                raise ValueError("each reference row must contain at least one valid frame.")
+            if validate and (batch_size is None or batch_size < 1):
+                raise ValueError("batch_size is required for the null reference.")
+            if validate and (mask is not None or use_reference is not None):
+                raise ValueError("reference mask/presence require explicit reference features.")
+            return self.null_condition.view(1, 1, -1).expand(batch_size, 1, -1)
+
+        if validate and (features.dim() != 3 or features.size(-1) != self.feature_dim):
+            raise ValueError("reference features must have shape [B, F, feature_dim].")
+        if validate and batch_size is not None and features.size(0) != batch_size:
+            raise ValueError("reference batch must match semantic batch.")
+        if mask is None:
+            mask = torch.ones(features.shape[:2], device=features.device, dtype=torch.bool)
+        elif validate and mask.shape != features.shape[:2]:
+            raise ValueError("reference mask must align with reference features.")
+        elif validate and mask.dtype != torch.bool:
+            raise TypeError("reference mask must be boolean.")
+        mask = mask.to(device=features.device)
+        if validate and not bool(mask.any(dim=1).all()):
+            raise ValueError("each reference row must contain at least one valid frame.")
 
         reference = self.projection(features)
         weights = mask[..., None].to(dtype=reference.dtype)
         pooled = (reference * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
         pooled = self.norm(pooled)
-        return pooled[:, None] * torch.tanh(self.gate)[None, None]
+        conditioned = pooled[:, None] * torch.tanh(self.gate)[None, None]
+        if use_reference is None:
+            return conditioned
+        if validate and (
+            use_reference.shape != (features.size(0),) or use_reference.dtype != torch.bool
+        ):
+            raise ValueError("use_reference must be boolean with shape [B].")
+        use_reference = use_reference.to(device=features.device)
+        null = self.null_condition.view(1, 1, -1).expand(features.size(0), 1, -1)
+        return torch.where(use_reference[:, None, None], conditioned, null)
+
+
+class FixedLengthConditioner(nn.Module):
+    """Read semantic memory with one learned query per fixed acoustic slot."""
+
+    def __init__(self, condition_dim: int, *, slots: int) -> None:
+        super().__init__()
+        if (
+            isinstance(condition_dim, bool)
+            or not isinstance(condition_dim, int)
+            or isinstance(slots, bool)
+            or not isinstance(slots, int)
+        ):
+            raise TypeError("condition_dim and slots must be integers.")
+        if condition_dim <= 0 or slots <= 0:
+            raise ValueError("condition_dim and slots must be positive.")
+        self.condition_dim = condition_dim
+        self.slots = slots
+        self.slot_queries = nn.Parameter(torch.empty(slots, condition_dim))
+        _ = nn.init.normal_(self.slot_queries, std=condition_dim**-0.5)
+        self.query_norm = _norm(condition_dim)
+        self.memory_norm = _norm(condition_dim)
+        self.output_norm = _norm(condition_dim)
+
+    def forward(
+        self,
+        memory: Tensor,
+        mask: Tensor,
+        *,
+        output_length: int,
+        validate: bool = True,
+    ) -> Tensor:
+        if validate and (memory.dim() != 3 or memory.size(-1) != self.condition_dim):
+            raise ValueError("semantic memory must have shape [B, F, condition_dim].")
+        if validate and (not torch.is_floating_point(memory) or torch.is_complex(memory)):
+            raise TypeError("semantic memory must be floating point.")
+        if validate and mask.shape != memory.shape[:2]:
+            raise ValueError("semantic memory mask must align on [B, F].")
+        if validate and mask.dtype != torch.bool:
+            raise TypeError("semantic memory mask must be boolean.")
+        if validate and mask.device != memory.device:
+            raise ValueError("semantic memory and mask must use the same device.")
+        if validate and not bool(mask.any(dim=1).all()):
+            raise ValueError("each semantic memory row must contain at least one valid unit.")
+        if validate and (isinstance(output_length, bool) or not isinstance(output_length, int)):
+            raise TypeError("fixed-length output_length must be an integer.")
+        if validate and (output_length < 1 or output_length > self.slots):
+            raise ValueError(
+                f"fixed-length output_length must be in [1, {self.slots}], got {output_length}."
+            )
+
+        positions = _sinusoidal_positions(
+            memory.size(1),
+            self.condition_dim,
+            device=memory.device,
+            dtype=memory.dtype,
+        )
+        normalized_memory = self.memory_norm(memory + positions[None])
+        queries = self.query_norm(self.slot_queries[:output_length].to(dtype=memory.dtype))
+        queries = queries[None].expand(memory.size(0), -1, -1)
+        scores = torch.matmul(queries, normalized_memory.transpose(1, 2))
+        scores = scores * self.condition_dim**-0.5
+        scores = scores.masked_fill(~mask[:, None], torch.finfo(scores.dtype).min)
+        weights = scores.float().softmax(dim=-1).to(dtype=normalized_memory.dtype)
+        context = torch.matmul(weights, normalized_memory)
+        return self.output_norm(queries + context)
 
 
 def repeat_condition(condition: Tensor, spans: Tensor, *, frames: int | None) -> Tensor:
@@ -201,3 +278,26 @@ def _semantic_weight(
     if initialization is Initialization.RANDOM:
         return matched_random_weight(codebook.detach(), seed=seed)
     raise AssertionError(f"unsupported initialization: {initialization}")
+
+
+def _sinusoidal_positions(
+    length: int,
+    dim: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    positions = torch.arange(length, device=device, dtype=torch.float32)[:, None]
+    frequencies = torch.exp(
+        torch.arange(0, dim, 2, device=device, dtype=torch.float32)
+        * (-math.log(10_000.0) / dim)
+    )
+    angles = positions * frequencies[None]
+    encoding = torch.zeros(length, dim, device=device, dtype=torch.float32)
+    encoding[:, 0::2] = angles.sin()
+    encoding[:, 1::2] = angles[:, : dim // 2].cos()
+    return encoding.to(dtype=dtype)
+
+
+def _norm(dim: int) -> nn.Module:
+    return nn.Identity() if dim == 1 else nn.LayerNorm(dim)

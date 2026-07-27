@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 import torch
-from anytrain.module.qwen import QwenMTPCodebookPredictor, top_p_filter
+from anytrain.module.qwen import top_p_filter
 from torch import nn
 
 from semantic_acoustic_codec._tensor import is_signed_integer_dtype
@@ -104,12 +104,21 @@ class AcousticRVQDecoder(nn.Module):
         target_acoustic_codes: Tensor | None = None,
         *,
         mask: Tensor | None = None,
+        validate: bool = True,
     ) -> tuple[Tensor, ...]:
         """Return one teacher-forced [B, F, K_q] tensor per codebook."""
-        self._validate_condition(condition)
-        frame_mask = _frame_mask(condition, mask)
+        if validate:
+            self._validate_condition(condition)
+        frame_mask = _frame_mask(condition, mask, validate=validate)
         if target_acoustic_codes is not None:
-            _validate_targets(target_acoustic_codes, condition, self.codebooks, self.codebook_sizes, frame_mask)
+            if validate:
+                _validate_targets(
+                    target_acoustic_codes,
+                    condition,
+                    self.codebooks,
+                    self.codebook_sizes,
+                    frame_mask,
+                )
             packed_targets = target_acoustic_codes.flatten(0, 1)[frame_mask.flatten()]
         else:
             packed_targets = None
@@ -187,20 +196,6 @@ class AcousticRVQDecoder(nn.Module):
         return _scatter(torch.stack(output, dim=-1), frame_mask)
 
 
-class AcousticRVQMTPDecoder(QwenMTPCodebookPredictor):
-    """Acoustic-compatible wrapper around anytrain.module.qwen.mtp."""
-
-    def forward(
-        self,
-        condition: Tensor,
-        target_codes: Tensor | None = None,
-        *,
-        mask: Tensor | None = None,
-    ) -> tuple[Tensor, ...]:
-        """Return one teacher-forced [B, F, K_q] tensor per codebook."""
-        return super().forward(condition, target_codes, mask=mask)
-
-
 def _qwen3_model(
     *,
     hidden_dim: int,
@@ -234,7 +229,7 @@ def _validate_embeddings(values: Sequence[Tensor], sizes: Sequence[int]) -> None
         raise TypeError("codebook_embeddings must be floating point.")
     if any(value.dim() != 2 for value in values):
         raise ValueError("each codebook embedding must have shape [size_q, dim].")
-    if any(value.size(0) != size for value, size in zip(values, sizes, strict=True)):
+    if any(value.size(0) != size for value, size in zip(values, sizes)):
         raise ValueError("codebook embeddings must match codebook sizes.")
     embedding_dim = values[0].size(-1)
     if any(value.size(-1) != embedding_dim for value in values):
@@ -265,18 +260,18 @@ def _heads(hidden_dim: int, requested: int) -> int:
     raise RuntimeError("Qwen3 RVQ decoder requires an even attention head dimension")
 
 
-def _frame_mask(condition: Tensor, mask: Tensor | None) -> Tensor:
+def _frame_mask(condition: Tensor, mask: Tensor | None, *, validate: bool = True) -> Tensor:
     if mask is None:
         frame_mask = torch.ones(condition.shape[:2], dtype=torch.bool, device=condition.device)
     else:
-        if mask.shape != condition.shape[:2]:
+        if validate and mask.shape != condition.shape[:2]:
             raise ValueError("acoustic frame mask must align with condition.")
-        if mask.dtype != torch.bool:
+        if validate and mask.dtype != torch.bool:
             raise TypeError("acoustic frame mask must be boolean.")
-        if mask.device != condition.device:
+        if validate and mask.device != condition.device:
             raise ValueError("acoustic frame mask and condition must use the same device.")
         frame_mask = mask
-    if frame_mask.size(0) < 1 or not bool(frame_mask.any(dim=1).all()):
+    if validate and (frame_mask.size(0) < 1 or not bool(frame_mask.any(dim=1).all())):
         raise ValueError("each acoustic condition row must contain a valid frame.")
     return frame_mask
 

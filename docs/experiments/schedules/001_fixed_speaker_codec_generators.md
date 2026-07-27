@@ -7,6 +7,10 @@ LongCat / BiCodec 两个 codec backend 与 DiT / RVQ 两条 generator route 的�
 条可重复运行的训练脚本，每条脚本只改变 codec backend 和 generator route，底层 decoder 统一使用
 8 层 Qwen decoder 配置。
 
+训练样本使用 `qwen_cross_text`：每个 target 必须配同 speaker、不同 sample/utterance/text 的 reference。
+训练逐样本做 0.5 reference dropout；固定 pair 日志用相同 seed 的独立 RNG 同时导出 with-reference 与
+without-reference 两条结果。
+
 这版实验同时保留 `wmt19_tts` 和 `wmt19_tts_codec` 真实数据入口，用来验证训练 / codec encode /
 prepared data 的真实链路；固定 speaker 合成数据只是 001 screening 的默认实验数据，不是项目唯一数据源。
 
@@ -100,12 +104,12 @@ TTS 生成耗时、失败和随机性污染训练速度与复现实验。
 
 4 个脚本都应只设置必要环境和 Hydra override，最终调用真实 Python 入口，并保留 `"$@"`：
 
-- `codec=longcat route=fm data.source=qwen_fixed_speaker output_subdir=longcat/dit-8l/fixed-speaker`
-- `codec=longcat route=rvq data.source=qwen_fixed_speaker output_subdir=longcat/rvq-8l/fixed-speaker`
-- `codec=bicodec route=fm data.source=qwen_fixed_speaker output_subdir=bicodec/dit-8l/fixed-speaker`
-- `codec=bicodec route=rvq data.source=qwen_fixed_speaker output_subdir=bicodec/rvq-8l/fixed-speaker`
+- `codec=longcat route=fm data.source=qwen_cross_text output_subdir=longcat/dit-8l/fixed-speaker`
+- `codec=longcat route=rvq data.source=qwen_cross_text output_subdir=longcat/rvq-8l/fixed-speaker`
+- `codec=bicodec route=fm data.source=qwen_cross_text output_subdir=bicodec/dit-8l/fixed-speaker`
+- `codec=bicodec route=rvq data.source=qwen_cross_text output_subdir=bicodec/rvq-8l/fixed-speaker`
 
-实现前需要先把当前单一 `LongCatBackend.from_pretrained` 入口提升为 codec backend factory，否则 BiCodec 脚本会只是空壳。
+实现前需要先把训练入口切到 `anytrain.codec.load_semantic_acoustic(codec)`，否则 BiCodec 脚本会只是空壳。
 
 ## 执行顺序
 
@@ -145,4 +149,3 @@ TTS 生成耗时、失败和随机性污染训练速度与复现实验。
 - BiCodec backend 是否已有可调用 encode/decode 与 side-unit layout 文档。
 - DiT 路线是否沿用配置名 `route=fm`，还是新增 `route=dit` 枚举来匹配实验命名。
 - 第一版 hidden dim 是否完全固定，还是只固定 `decoder.layers=8`。
-

@@ -7,17 +7,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
-from anytrain.codec import AcousticLayout, SemanticAcousticCodes, load_semantic_acoustic
+from anytrain.codec import (
+    AcousticLayout,
+    SemanticAcousticCodes,
+    load_semantic_acoustic,
+    masked_acoustic_features,
+)
+from anytrain.framework.flow_matching import ContinuousFlowRuntime
+from anytrain.loss import MaskedCodebookCrossEntropyLoss
 
 from semantic_acoustic_codec.config import DecoderConfig, Route
 from semantic_acoustic_codec.datamodule import DataConfig, LBAConfig, load_batch
-from semantic_acoustic_codec.loss import FlowLoss, RVQLoss
-from semantic_acoustic_codec.model import (
-    RectifiedFlowRuntime,
-    RVQCodeGenerator,
-    backend_features,
-    build_route,
-)
+from semantic_acoustic_codec.loss import FlowLoss
+from semantic_acoustic_codec.model import RVQCodeGenerator, build_route
 from semantic_acoustic_codec.runtime import (
     SemanticCodecRuntime,
     SemanticSupportConfig,
@@ -184,8 +186,8 @@ def _route_smoke(
 ) -> None:
     semantic, acoustic, mask = _batch()
     _, reference_acoustic, reference_mask = _reference_batch()
-    target = backend_features(backend, acoustic, mask)
-    reference_target = backend_features(backend, reference_acoustic, reference_mask)
+    target = masked_acoustic_features(backend, acoustic, mask)
+    reference_target = masked_acoustic_features(backend, reference_acoustic, reference_mask)
     for route in routes:
         if route is Route.RVQ and importlib.util.find_spec("transformers") is None:
             print("rvq smoke skipped: transformers is not installed")
@@ -211,13 +213,19 @@ def _route_smoke(
         )
         condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
         if route is Route.FM:
-            item = FlowLoss()(modules.generator.core, condition, target, mask, RectifiedFlowRuntime())
+            item = FlowLoss()(
+                modules.generator.core,
+                condition,
+                target,
+                mask,
+                ContinuousFlowRuntime(),
+            )
         elif route is Route.RVQ:
             generator = modules.generator
             if not isinstance(generator, RVQCodeGenerator):
                 raise RuntimeError("RVQ route built a non-RVQ generator.")
             logits = generator.core(condition, acoustic, mask=mask)
-            item = RVQLoss()(logits, acoustic, mask)
+            item = MaskedCodebookCrossEntropyLoss()(logits, acoustic, mask)
         else:
             raise AssertionError(f"unsupported route: {route}")
         loss = item.loss.mean()
@@ -231,7 +239,7 @@ def _route_smoke(
 def _artifact_smoke(backend: FakeCodec, decoder: DecoderConfig) -> None:
     semantic, _, mask = _batch()
     _, reference_acoustic, reference_mask = _reference_batch()
-    reference_features = backend_features(backend, reference_acoustic, reference_mask)
+    reference_features = masked_acoustic_features(backend, reference_acoustic, reference_mask)
     config = SemanticSupportConfig(route=Route.FM, condition_dim=12, decoder=decoder)
     support = build_support(
         config,
@@ -333,7 +341,7 @@ def _data_smoke(
     if source == "qwen_cross_text" and not batch.has_reference:
         raise RuntimeError("qwen_cross_text data smoke requires a target/reference pair.")
     _validate_batch(batch)
-    target = backend_features(
+    target = masked_acoustic_features(
         backend,
         batch.acoustic_codes.to(device),
         batch.target_acoustic_mask.to(device),
@@ -344,7 +352,7 @@ def _data_smoke(
     if batch.has_reference:
         reference_acoustic = _reference_acoustic(batch).to(device)
         reference_mask = _reference_acoustic_mask(batch).to(device)
-        reference = backend_features(backend, reference_acoustic, reference_mask)
+        reference = masked_acoustic_features(backend, reference_acoustic, reference_mask)
         if not bool(torch.isfinite(reference).all()):
             raise RuntimeError("real reference acoustic features must be finite.")
         reference_shape = tuple(reference.shape)

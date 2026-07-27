@@ -1,14 +1,15 @@
 # semantic-acoustic-codec
 
-`semantic-acoustic-codec` 提供从语义码重建波形的 codec 组件。第一阶段只使用现有
-`wmt19_tts_codec(longcat)` prepared data，不新增 TTS 合成流程；目标是在 LongCat 的语义
-codebook 上训练一个可替换的 acoustic decoder，使调用方只需要持有 semantic codes 也能生成波形。
+`semantic-acoustic-codec` 提供从语义码重建波形的 codec 组件。当前训练主线使用 Qwen speaker
+grid 离线生成的 codec units；`qwen_cross_text` 为每个 target 选择同 speaker、不同 grid text row、
+不同样本且不同文本的 reference。推理可以提供 reference acoustic features，也可以只使用 semantic
+codes 和 learned null condition。
 
 仓库边界：
 
-- 暴露 codec backend、semantic-only support wrapper 和 acoustic decoder 训练组件。
-- 支持两条 acoustic decoder 路线：RVQ、FM。
-- 复用 anydataset/anytrain 的 LongCat prepared view 与 codec backend adapter。
+- 消费 anytrain 的 LongCat / BiCodec backend，暴露 codec-free support、runtime 和训练组件。
+- 支持 RVQ 与 FM 两条 generator 路线；BiCodec RVQ 通过 temporal MTP 沿 32-slot 轴自回归生成。
+- 固定 pair 日志以相同 seed 的独立 RNG 比较有 reference 与无 reference 两条路径。
 - 不依赖 `speech-to-speech`；后续由 `speech-to-speech` 反向依赖本仓库。
 
 设计方案见 [docs/design.md](docs/design.md)。

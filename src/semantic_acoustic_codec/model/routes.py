@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from anytrain.codec import AcousticLayout
+
 from semantic_acoustic_codec.config import DecoderConfig, Initialization, Route
 from semantic_acoustic_codec.model.condition import ReferenceConditioner, SemanticConditioner
 from semantic_acoustic_codec.model.decoder import (
@@ -35,7 +37,19 @@ def build_route(
     decoder: DecoderConfig | None = None,
     initialization: Initialization = Initialization.CODEC,
     seed: int = 0,
+    acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
+    acoustic_unit_length: int | None = None,
 ) -> RouteModules:
+    if not isinstance(acoustic_layout, AcousticLayout):
+        raise TypeError("acoustic_layout must be an AcousticLayout.")
+    if acoustic_layout is AcousticLayout.FIXED_LENGTH:
+        if acoustic_unit_length is None or acoustic_unit_length <= 0:
+            raise ValueError("fixed-length routes require a positive acoustic_unit_length.")
+        fixed_length = acoustic_unit_length
+    else:
+        if acoustic_unit_length is not None:
+            raise ValueError("frame-aligned routes must not set acoustic_unit_length.")
+        fixed_length = None
     options = DecoderConfig() if decoder is None else decoder
     conditioner = SemanticConditioner(
         semantic_codebook,
@@ -52,9 +66,15 @@ def build_route(
             condition_dim,
             acoustic_feature_dim,
             options,
+            fixed_length=fixed_length,
         )
     elif route is Route.RVQ:
-        module = RVQCodeGenerator(condition_dim, acoustic_codebook_sizes, options)
+        module = RVQCodeGenerator(
+            condition_dim,
+            acoustic_codebook_sizes,
+            options,
+            fixed_length=fixed_length,
+        )
     else:
         raise AssertionError(f"unsupported route: {route}")
     return RouteModules(

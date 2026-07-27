@@ -1,4 +1,3 @@
-from semantic_acoustic_codec.runtime.protocol import CodecBackend
 from semantic_acoustic_codec.runtime.semantic import (
     SamplingConfig,
     SemanticCodecRuntime,
@@ -11,7 +10,6 @@ from semantic_acoustic_codec.runtime.semantic import (
 
 __all__ = [
     "SamplingConfig",
-    "CodecBackend",
     "SemanticCodecRuntime",
     "SemanticCodecSupport",
     "SemanticSupportConfig",

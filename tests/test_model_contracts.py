@@ -4,20 +4,20 @@ import importlib.util
 
 import pytest
 import torch
-from anytrain.codec import AcousticLayout, SemanticAcousticCodes
+from anytrain.codec import AcousticLayout, SemanticAcousticCodes, masked_acoustic_features
+from anytrain.framework.flow_matching import ContinuousFlowRuntime
+from anytrain.loss import MaskedCodebookCrossEntropyLoss, MaskedCosineAlignmentLoss
+from anytrain.module.qwen import QwenMTPCodebookPredictor
 
 from semantic_acoustic_codec.config import DecoderConfig, Route, RVQPredictor
-from semantic_acoustic_codec.loss import FlowLoss, RepaLoss, RVQLoss
+from semantic_acoustic_codec.loss import FlowLoss
 from semantic_acoustic_codec.model import (
     AcousticRVQDecoder,
-    AcousticRVQMTPDecoder,
     DiTDecoder,
     FMFeatureGenerator,
-    RectifiedFlowRuntime,
     ReferenceConditioner,
     RVQCodeGenerator,
     SemanticConditioner,
-    backend_features,
     build_route,
 )
 from semantic_acoustic_codec.model.condition import FixedLengthConditioner
@@ -102,7 +102,7 @@ def test_fm_loss_and_sample_shapes() -> None:
     mask = torch.tensor([[True, True, True, True], [True, True, False, False]])
     decoder = DiTDecoder(10, 6, layers=1, heads=2, ffn_ratio=2)
 
-    loss = FlowLoss()(decoder, condition, target, mask, RectifiedFlowRuntime())
+    loss = FlowLoss()(decoder, condition, target, mask, ContinuousFlowRuntime())
     sample = decoder.sample(condition, mask=mask, steps=2)
 
     assert loss.loss.shape == (2,)
@@ -181,7 +181,7 @@ def test_fm_loss_returns_repa_features_when_configured() -> None:
         condition,
         target,
         mask,
-        RectifiedFlowRuntime(),
+        ContinuousFlowRuntime(),
     )
 
     assert item.loss.shape == (2,)
@@ -199,7 +199,7 @@ def test_repa_loss_detaches_teacher_and_ignores_padding() -> None:
     )
     mask = torch.tensor([[True, False]])
 
-    item = RepaLoss()(representation, target, mask)
+    item = MaskedCosineAlignmentLoss()(representation, target, mask)
     item.loss.mean().backward()
 
     assert torch.isfinite(item.loss).all()
@@ -209,7 +209,7 @@ def test_repa_loss_detaches_teacher_and_ignores_padding() -> None:
     assert torch.equal(representation.grad[:, 1], torch.zeros_like(representation.grad[:, 1]))
 
 
-def test_build_route_and_backend_features() -> None:
+def test_build_route_and_masked_acoustic_features() -> None:
     backend = FakeCodec()
     modules = build_route(
         Route.FM,
@@ -221,7 +221,7 @@ def test_build_route_and_backend_features() -> None:
     )
     acoustic = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
-    features = backend_features(backend, acoustic, mask)
+    features = masked_acoustic_features(backend, acoustic, mask)
 
     assert modules.route is Route.FM
     assert isinstance(modules.generator, FMFeatureGenerator)
@@ -254,7 +254,7 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     condition = support.condition(
         semantic,
         mask=mask,
-        reference_features=backend_features(backend, reference, mask),
+        reference_features=masked_acoustic_features(backend, reference, mask),
         reference_mask=mask,
     )
     runtime = SemanticCodecRuntime(support, backend)
@@ -280,7 +280,7 @@ def test_fm_route_trains_one_step() -> None:
     semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
     acoustic = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
-    target = backend_features(backend, acoustic, mask)
+    target = masked_acoustic_features(backend, acoustic, mask)
 
     modules = build_route(
         Route.FM,
@@ -317,7 +317,7 @@ def test_fm_generator_accepts_external_condition() -> None:
     semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
     acoustic = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
-    target = backend_features(backend, acoustic, mask)
+    target = masked_acoustic_features(backend, acoustic, mask)
     modules = build_route(
         Route.FM,
         backend.semantic_codebook,
@@ -362,7 +362,7 @@ def test_rvq_route_trains_one_step_when_qwen3_builder_is_available() -> None:
         + list(modules.generator.parameters()),
         lr=1e-3,
     )
-    target = backend_features(backend, acoustic, mask)
+    target = masked_acoustic_features(backend, acoustic, mask)
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
     output = modules.generator.loss(
@@ -401,7 +401,7 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
             mtp_heads=2,
         ),
     )
-    target = backend_features(backend, acoustic, mask)
+    target = masked_acoustic_features(backend, acoustic, mask)
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
     generator = modules.generator
@@ -418,7 +418,7 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
         generator=torch.Generator().manual_seed(0),
     )
 
-    assert isinstance(generator.core, AcousticRVQMTPDecoder)
+    assert isinstance(generator.core, QwenMTPCodebookPredictor)
     assert torch.isfinite(loss)
     assert [value.shape for value in logits] == [(1, 3, 5), (1, 3, 7)]
     assert generated.shape == (1, 3, 2)
@@ -489,7 +489,7 @@ def test_fixed_length_rvq_rejects_codebook_ar_and_uses_mtp_slot_axis() -> None:
         generator=torch.Generator().manual_seed(0),
     )
 
-    assert isinstance(generator.core, AcousticRVQMTPDecoder)
+    assert isinstance(generator.core, QwenMTPCodebookPredictor)
     assert torch.isfinite(output.loss)
     fixed_conditioner = generator.fixed_conditioner
     assert fixed_conditioner is not None
@@ -504,7 +504,7 @@ def test_rvq_loss_validates_per_codebook_logits() -> None:
     labels = torch.tensor([[[1, 2], [3, 4]]], dtype=torch.long)
     mask = torch.tensor([[True, False]])
 
-    item = RVQLoss()(logits, labels, mask)
+    item = MaskedCodebookCrossEntropyLoss()(logits, labels, mask)
 
     assert item.loss.shape == (1,)
     assert item.details is not None
@@ -543,7 +543,7 @@ def _batch(semantic: torch.Tensor, acoustic: torch.Tensor, mask: torch.Tensor) -
 
 def test_rvq_mtp_decoder_import_is_lazy() -> None:
     if importlib.util.find_spec("transformers") is not None:
-        decoder = AcousticRVQMTPDecoder(
+        decoder = QwenMTPCodebookPredictor(
             4,
             2,
             (5, 7),
@@ -558,7 +558,7 @@ def test_rvq_mtp_decoder_import_is_lazy() -> None:
         return
 
     with pytest.raises(ImportError, match="transformers"):
-        AcousticRVQMTPDecoder(
+        QwenMTPCodebookPredictor(
             4,
             2,
             (5, 7),

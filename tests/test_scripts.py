@@ -1,0 +1,371 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+import torch
+from anytrain.codec import AcousticLayout, SemanticAcousticCodes
+
+from scripts import eval_artifact, smoke
+from semantic_acoustic_codec.config import DecoderConfig
+from semantic_acoustic_codec.runtime import SemanticCodecRuntime
+from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
+
+
+class EvalBackend:
+    name = "eval-test"
+    sample_rate = 16_000
+    frame_rate = 50.0
+    semantic_frame_rate = 50.0
+    semantic_codebook = torch.arange(32, dtype=torch.float32).view(8, 4)
+    semantic_codebook_sizes = (8,)
+    acoustic_codebook_sizes = (8,)
+    acoustic_feature_dim = 1
+
+    def __init__(self, layout: AcousticLayout) -> None:
+        self.acoustic_layout = layout
+        self.acoustic_unit_length = 3 if layout is AcousticLayout.FIXED_LENGTH else None
+        self.detokenized: list[SemanticAcousticCodes] = []
+        self.feature_inputs: list[torch.Tensor] = []
+
+    def tokenize(self, audio: torch.Tensor, sample_rate: int) -> SemanticAcousticCodes:
+        del sample_rate
+        semantic = torch.zeros(audio.size(0), 2, 1, dtype=torch.long, device=audio.device)
+        units = semantic.size(1) if self.acoustic_unit_length is None else self.acoustic_unit_length
+        acoustic = torch.zeros(audio.size(0), units, 1, dtype=torch.long, device=audio.device)
+        return SemanticAcousticCodes(semantic=semantic, acoustic=acoustic)
+
+    def detokenize(self, codes: SemanticAcousticCodes) -> torch.Tensor:
+        self.detokenized.append(codes)
+        value = codes.semantic.float().sum() + codes.acoustic.float().sum()
+        return value.expand(codes.semantic.size(0), 1, codes.acoustic.size(1)).clone()
+
+    def acoustic_codes_to_features(self, acoustic_codes: torch.Tensor) -> torch.Tensor:
+        self.feature_inputs.append(acoustic_codes.detach().clone())
+        return acoustic_codes.float()
+
+    def decode_features(
+        self,
+        semantic_codes: torch.Tensor,
+        acoustic_features: torch.Tensor,
+    ) -> torch.Tensor:
+        del semantic_codes
+        return acoustic_features.transpose(1, 2).contiguous()
+
+
+class EvalRuntime:
+    sample_rate = EvalBackend.sample_rate
+
+    def __init__(self, units: int) -> None:
+        self.units = units
+        self.calls: list[dict[str, Any]] = []
+        self.generated: list[torch.Tensor] = []
+
+    def sample_features(
+        self,
+        semantic_codes: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        reference_features: torch.Tensor | None = None,
+        reference_mask: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        if generator is None:
+            raise AssertionError("evaluation must provide a seeded generator")
+        self.calls.append(
+            {
+                "generator": generator,
+                "generator_state": generator.get_state().clone(),
+                "mask": mask,
+                "reference_features": reference_features,
+                "reference_mask": reference_mask,
+            }
+        )
+        noise = torch.rand(
+            semantic_codes.size(0),
+            self.units,
+            1,
+            generator=generator,
+            device=semantic_codes.device,
+        )
+        output = noise if reference_features is None else noise + 1
+        self.generated.append(output)
+        return output
+
+    def decode_features(
+        self,
+        semantic_codes: torch.Tensor,
+        features: torch.Tensor,
+    ) -> torch.Tensor:
+        del semantic_codes
+        return features.transpose(1, 2).contiguous()
+
+
+def test_eval_artifact_generates_seeded_pair_metrics() -> None:
+    backend = EvalBackend(AcousticLayout.FRAME_ALIGNED)
+    batch = _pair(AcousticLayout.FRAME_ALIGNED)
+    runtime = EvalRuntime(units=batch.acoustic_codes.size(1))
+
+    audio, metrics = eval_artifact._evaluate(
+        cast(SemanticCodecRuntime, cast(object, runtime)),
+        backend,
+        batch,
+        device=torch.device("cpu"),
+        seed=13,
+    )
+
+    assert len(runtime.calls) == 2
+    assert runtime.calls[0]["generator"] is not runtime.calls[1]["generator"]
+    assert torch.equal(runtime.calls[0]["generator_state"], runtime.calls[1]["generator_state"])
+    assert runtime.calls[0]["reference_features"] is None
+    assert runtime.calls[0]["reference_mask"] is None
+    reference_acoustic = batch.reference_acoustic_codes
+    reference_acoustic_mask = batch.reference_acoustic_mask
+    assert reference_acoustic is not None
+    assert reference_acoustic_mask is not None
+    torch.testing.assert_close(
+        cast(torch.Tensor, runtime.calls[1]["reference_features"]),
+        reference_acoustic.float(),
+    )
+    assert torch.equal(
+        cast(torch.Tensor, runtime.calls[1]["reference_mask"]),
+        reference_acoustic_mask,
+    )
+    target = batch.acoustic_codes.float()
+    expected_without = float((runtime.generated[0] - target).pow(2).mean())
+    expected_with = float((runtime.generated[1] - target).pow(2).mean())
+    assert metrics == pytest.approx(
+        {
+            "feature_mse_without_reference": expected_without,
+            "feature_mse_with_reference": expected_with,
+            "reference_gain": expected_without - expected_with,
+        }
+    )
+    assert set(audio) == {
+        "generated_without_reference",
+        "generated_with_reference",
+        "target_reconstruction",
+        "reference_reconstruction",
+    }
+    assert len(backend.detokenized) == 2
+
+
+def test_eval_artifact_fixed_layout_adds_reference_passthrough() -> None:
+    backend = EvalBackend(AcousticLayout.FIXED_LENGTH)
+    batch = _pair(AcousticLayout.FIXED_LENGTH)
+    runtime = EvalRuntime(units=batch.acoustic_codes.size(1))
+
+    audio, _ = eval_artifact._evaluate(
+        cast(SemanticCodecRuntime, cast(object, runtime)),
+        backend,
+        batch,
+        device=torch.device("cpu"),
+        seed=3,
+    )
+
+    assert "reference_token_passthrough" in audio
+    assert len(backend.detokenized) == 3
+    target, reference, passthrough = backend.detokenized
+    reference_semantic = batch.reference_semantic_codes
+    reference_acoustic = batch.reference_acoustic_codes
+    assert reference_semantic is not None
+    assert reference_acoustic is not None
+    assert torch.equal(target.semantic, batch.semantic_codes)
+    assert torch.equal(target.acoustic, batch.acoustic_codes)
+    assert torch.equal(reference.semantic, reference_semantic)
+    assert torch.equal(reference.acoustic, reference_acoustic)
+    assert torch.equal(passthrough.semantic, batch.semantic_codes)
+    assert torch.equal(passthrough.acoustic, reference_acoustic)
+
+
+def test_eval_artifact_main_loads_cross_text_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = EvalBackend(AcousticLayout.FRAME_ALIGNED)
+    batch = _pair(AcousticLayout.FRAME_ALIGNED)
+    runtime = EvalRuntime(units=batch.acoustic_codes.size(1))
+    loaded: dict[str, Any] = {}
+    args = argparse.Namespace(
+        artifact=tmp_path / "artifact",
+        codec="longcat",
+        data_source="qwen_cross_text",
+        data_root=None,
+        split="train",
+        sample_index=2,
+        max_seconds=None,
+        overlong="error",
+        device="cpu",
+        seed=5,
+        output_json=None,
+        without_reference_wav=None,
+        with_reference_wav=None,
+        target_reconstruction_wav=None,
+        reference_reconstruction_wav=None,
+        passthrough_wav=None,
+    )
+
+    def load_pair(data, **kwargs):
+        loaded["data"] = data
+        loaded["kwargs"] = kwargs
+        return batch
+
+    monkeypatch.setattr(eval_artifact, "_args", lambda: args)
+    monkeypatch.setattr(eval_artifact, "load_semantic_acoustic", lambda *args, **kwargs: backend)
+    monkeypatch.setattr(eval_artifact, "load_artifact", lambda *args, **kwargs: object())
+    monkeypatch.setattr(eval_artifact, "load_batch", load_pair)
+    monkeypatch.setattr(eval_artifact, "SemanticCodecRuntime", lambda *args: runtime)
+
+    eval_artifact.main()
+
+    assert loaded["data"].source == "qwen_cross_text"
+    assert loaded["data"].sample_index == 2
+    assert loaded["kwargs"]["acoustic_layout"] is AcousticLayout.FRAME_ALIGNED
+    result = json.loads(capsys.readouterr().out)
+    assert result["pair"]["target_utterance_id"] == "target"
+    assert result["generated_without_reference"]["finite"] is True
+    assert result["generated_with_reference"]["finite"] is True
+    assert result["reference_gain"] == pytest.approx(
+        result["feature_mse_without_reference"] - result["feature_mse_with_reference"]
+    )
+
+
+def test_smoke_uses_independent_fake_reference_and_seeded_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = smoke._batch()
+    reference = smoke._reference_batch()
+    assert len(target) == len(reference)
+    for target_value, reference_value in zip(target, reference):
+        assert target_value.data_ptr() != reference_value.data_ptr()
+        assert not torch.equal(target_value, reference_value)
+
+    states: list[tuple[int, torch.Generator, torch.Tensor]] = []
+    decode_calls: list[tuple[torch.Tensor | None, torch.Tensor | None]] = []
+    original_generator = smoke._generator
+    original_decode = SemanticCodecRuntime.decode
+
+    def generator(seed: int) -> torch.Generator:
+        value = original_generator(seed)
+        states.append((seed, value, value.get_state().clone()))
+        return value
+
+    def decode(
+        runtime: SemanticCodecRuntime,
+        semantic_codes: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        reference_features: torch.Tensor | None = None,
+        reference_mask: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        decode_calls.append((reference_features, reference_mask))
+        return original_decode(
+            runtime,
+            semantic_codes,
+            mask=mask,
+            reference_features=reference_features,
+            reference_mask=reference_mask,
+            generator=generator,
+        )
+
+    monkeypatch.setattr(smoke, "_generator", generator)
+    monkeypatch.setattr(SemanticCodecRuntime, "decode", decode)
+    smoke._artifact_smoke(
+        smoke.FakeCodec(),
+        DecoderConfig(hidden_dim=12, layers=1, heads=2, ffn_ratio=2),
+    )
+
+    assert [item[0] for item in states] == [0, 0, 1, 1, 0, 0]
+    for left, right in ((0, 1), (2, 3), (4, 5)):
+        assert states[left][1] is not states[right][1]
+        assert torch.equal(states[left][2], states[right][2])
+    assert len(decode_calls) == 2
+    assert decode_calls[0] == (None, None)
+    assert decode_calls[1][0] is not None
+    assert decode_calls[1][1] is not None
+
+
+def test_smoke_real_data_defaults_to_cross_text_and_loads_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["smoke.py"])
+    assert smoke._args().data_source == "qwen_cross_text"
+
+    backend = EvalBackend(AcousticLayout.FRAME_ALIGNED)
+    batch = _pair(AcousticLayout.FRAME_ALIGNED)
+    loaded: dict[str, Any] = {}
+
+    def load_pair(data, **kwargs):
+        loaded["data"] = data
+        loaded["kwargs"] = kwargs
+        return batch
+
+    monkeypatch.setattr(smoke, "load_semantic_acoustic", lambda *args, **kwargs: backend)
+    monkeypatch.setattr(smoke, "load_batch", load_pair)
+    smoke._data_smoke(
+        None,
+        codec="longcat",
+        source="qwen_cross_text",
+        split="train",
+        index=0,
+        device="cpu",
+    )
+
+    assert loaded["data"].source == "qwen_cross_text"
+    assert loaded["kwargs"]["acoustic_layout"] is AcousticLayout.FRAME_ALIGNED
+    assert len(backend.feature_inputs) == 2
+    reference_acoustic = batch.reference_acoustic_codes
+    assert reference_acoustic is not None
+    assert torch.equal(backend.feature_inputs[0], batch.acoustic_codes)
+    assert torch.equal(backend.feature_inputs[1], reference_acoustic)
+
+
+def _pair(layout: AcousticLayout) -> SemanticCodecBatch:
+    target_semantic = torch.tensor([[[1], [2]]], dtype=torch.long)
+    reference_semantic = torch.tensor([[[3], [4], [5]]], dtype=torch.long)
+    if layout is AcousticLayout.FRAME_ALIGNED:
+        target_acoustic = torch.tensor([[[2], [2]]], dtype=torch.long)
+        reference_acoustic = torch.tensor([[[4], [4], [4]]], dtype=torch.long)
+    else:
+        target_acoustic = torch.tensor([[[2], [2], [2]]], dtype=torch.long)
+        reference_acoustic = torch.tensor([[[4], [4], [4]]], dtype=torch.long)
+    target_mask = torch.ones(target_semantic.shape[:2], dtype=torch.bool)
+    target_acoustic_mask = torch.ones(target_acoustic.shape[:2], dtype=torch.bool)
+    reference_mask = torch.ones(reference_semantic.shape[:2], dtype=torch.bool)
+    reference_acoustic_mask = torch.ones(reference_acoustic.shape[:2], dtype=torch.bool)
+    metadata = SemanticCodecPairMetadata(
+        target_index=0,
+        reference_index=1,
+        target_text_index=0,
+        reference_text_index=1,
+        target_source_index=10,
+        reference_source_index=11,
+        target_role="default",
+        reference_role="default",
+        target_utterance_id="target",
+        reference_utterance_id="reference",
+        target_speaker_id="speaker",
+        reference_speaker_id="speaker",
+        target_text="target text",
+        reference_text="reference text",
+    )
+    return SemanticCodecBatch(
+        semantic_codes=target_semantic,
+        acoustic_codes=target_acoustic,
+        mask=target_mask,
+        semantic_pad_id=8,
+        acoustic_pad_ids=(8,),
+        acoustic_mask=target_acoustic_mask,
+        acoustic_layout=layout,
+        reference_semantic_codes=reference_semantic,
+        reference_acoustic_codes=reference_acoustic,
+        reference_mask=reference_mask,
+        reference_acoustic_mask=reference_acoustic_mask,
+        metadata=(metadata,),
+    )

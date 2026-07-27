@@ -4,7 +4,6 @@ from typing import Protocol, cast
 
 import torch
 import torch.nn.functional as F
-from anytrain.loss import LossItem, MaskedCosineAlignmentLoss
 from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 
@@ -26,9 +25,6 @@ class Teacher(Protocol):
         acoustic_codes: Tensor,
         mask: Tensor,
     ) -> Tensor: ...
-
-
-RepaLoss = MaskedCosineAlignmentLoss
 
 
 class WavLMTeacher(nn.Module):
@@ -157,4 +153,4 @@ class WavLMTeacher(nn.Module):
         return output
 
 
-__all__ = ["RepaLoss", "Teacher", "WavLMTeacher", "LossItem"]
+__all__ = ["Teacher", "WavLMTeacher"]

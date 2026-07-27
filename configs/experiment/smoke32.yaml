@@ -1,0 +1,47 @@
+# @package _global_
+
+# Representative 32-sample fixed-speaker smoke. This is intentionally small,
+# but it exercises the real DataModule, checkpointing, resume, metrics, and
+# sample audio logging paths.
+codec: longcat
+route: fm
+output_subdir: smoke32/${codec}/${route}
+
+data:
+  source: qwen_cross_text
+  root: ${oc.env:DYNAMIC_HOME}/debug/semantic-acoustic-codec/qwen-fixed-speaker-codec-32
+  split: train
+  sample_index: 0
+  sample_limit: 32
+  max_seconds: 8.0
+  overlong: truncate
+  batch_size: 8
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  lba:
+    enabled: false
+
+train:
+  fixed_batch: false
+  max_steps: 4
+
+sample:
+  enabled: true
+  every_n_train_steps: 2
+  seed: 0
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  precision: bf16-mixed
+  max_epochs: -1
+  log_every_n_steps: 1
+  enable_checkpointing: true
+  gradient_clip_val: 1.0
+
+checkpoint:
+  save_last: true
+  save_top_k: -1
+  every_n_train_steps: 2
