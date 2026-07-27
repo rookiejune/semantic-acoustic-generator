@@ -2,19 +2,23 @@ defaults:
   - _self_
   - optional experiment: null
 
+codec: longcat
 route: fm
 condition_dim: 1024
 initialization: codec
 normalize_features: true
 device: null
 output_dir: null
-output_subdir: longcat/${route}-${decoder.layers}l/${initialization}
+output_subdir: ${codec}/${route}-${decoder.layers}l/${initialization}
 
 decoder:
   hidden_dim: null
   layers: 8
   heads: 8
   ffn_ratio: 4
+  rvq_predictor: mtp
+  mtp_layers: 2
+  mtp_heads: 4
   repa_feature_dim: null
   repa_student_layer: null
   repa_loss_weight: 0.0
@@ -29,8 +33,11 @@ optimizer:
   weight_decay: 0.01
 
 data:
+  source: qwen_cross_text
   root: null
   split: train
+  role: target
+  speaker_id: vivian
   sample_index: 0
   max_seconds: null
   overlong: error
@@ -49,7 +56,14 @@ data:
 
 train:
   seed: 0
+  fixed_batch: false
+  reference_dropout: 0.5
   max_steps: 1000000
+
+sample:
+  enabled: true
+  every_n_train_steps: 10000
+  seed: 0
 
 trainer:
   accelerator: auto
@@ -62,7 +76,16 @@ trainer:
   enable_checkpointing: true
   gradient_clip_val: 1.0
 
+performance:
+  enabled: true
+  model_flops_per_step: null
+  hardware_peak_flops: null
+  log_every_n_steps: 100
+  warmup_steps: 20
+  measure_window_steps: 100
+
 checkpoint:
+  resume_from: null
   filename: step-{step:08d}
   save_last: true
   save_top_k: -1
