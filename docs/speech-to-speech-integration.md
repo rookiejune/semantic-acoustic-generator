@@ -116,19 +116,29 @@ artifact schema 或 semantic-only waveform reconstruction，就属于本仓库�
 checkpoint_dir/
     model.ckpt
     codec.json
-    config.json
-    metrics.json
 ```
 
-`codec.json` 至少记录：
+当前 artifact schema 为 `6`。`codec.json` 的顶层结构为：
 
-- route：`rvq` / `fm`；
-- backend-compatible semantic/acoustic layout；
-- semantic vocab size；
-- acoustic feature dim；
-- decode sampling config；
-- feature normalization；
-- checkpoint schema version。
+```json
+{
+  "schema_version": 6,
+  "config": {"route": "fm", "...": "..."},
+  "backend": {"...": "..."},
+  "checkpoint": "model.ckpt"
+}
+```
+
+其中 `config` 保存 generator 和 sampling 配置，`backend` 保存 runtime 兼容性 metadata。`backend` 至少
+包含：
+
+- acoustic layout：`frame_aligned` / `fixed_length`；
+- semantic vocab size 与 embedding dim；
+- acoustic codebook sizes 与 feature dim；
+- fixed-length layout 的 acoustic unit length（如适用）。
+
+训练目录中的 `sample_metrics.json`、TensorBoard events 和周期 checkpoint 属于训练产物，不是 runtime
+artifact 的必需文件。
 
 sample rate 和 frame rate 由绑定的 anytrain backend 提供，`SemanticCodecRuntime` 使用 backend
 metadata 做兼容性校验；artifact 不在 anytrain 中复制一份 codec 实例或 decoder。

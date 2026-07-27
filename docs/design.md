@@ -46,16 +46,22 @@ class SemanticCodecSupport(nn.Module):
         self,
         semantic_codes: Tensor,
         *,
+        mask: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
+        output_length: int | None = None,
+        generator: torch.Generator | None = None,
     ) -> Tensor: ...
 
     def sample_acoustic_codes(
         self,
         semantic_codes: Tensor,
         *,
+        mask: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
+        output_length: int | None = None,
+        generator: torch.Generator | None = None,
     ) -> Tensor: ...
 
 
@@ -64,14 +70,29 @@ class SemanticCodecRuntime:
     backend: anytrain.codec.SemanticAcousticCodec
 
     def encode(self, audio: Tensor, sample_rate: int) -> Tensor: ...
+    def sample_features(
+        self,
+        semantic_codes: Tensor,
+        *,
+        mask: Tensor | None = None,
+        reference_features: Tensor | None = None,
+        reference_mask: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor: ...
     def decode(
         self,
         semantic_codes: Tensor,
         *,
+        mask: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> Tensor: ...
 ```
+
+`SemanticCodecSupport` 不持有 codec backend：FM 路线可直接生成 features，RVQ 路线的 code-to-feature
+转换必须通过 `SemanticCodecRuntime` 完成。`mask` 用于 semantic padding，`output_length` 只适用于
+`FIXED_LENGTH` acoustic layout，`generator` 用于固定 seed 的采样对照。
 
 训练侧另外定义 codec unit generator，不要求调用方知道 FM/RVQ 或 codec-specific side-unit 路线：
 
@@ -145,9 +166,9 @@ src/semantic_acoustic_codec/
 scripts/
   train.py        # production train entry
   smoke.py        # minimal local validation
+  eval_artifact.py # one-pair artifact evaluation and WAV export
 configs/
-  codec/
-  model/
+  train.yaml
   experiment/
 jobs/
 docs/
@@ -249,17 +270,27 @@ reconstruction。
 
 ## 训练与验收
 
-P0 文档落地后，代码实现按以下闭环推进：
+当前已完成的闭环包括：
 
-1. paired data smoke：固定 target/reference pair，校验同 speaker、不同 index/utterance/text、双侧 layout、
-   dtype、mask 和 finite backend features。
-2. FM overfit：单 pair 训练到 feature MSE 明显下降，sample waveform finite。
-3. RVQ overfit：单 pair 训练到 acoustic codebook CE 和 accuracy 明显改善；BiCodec 明确覆盖 32-slot
-   temporal AR sampling。
-4. optional-reference decode smoke：分别确认 reference 与 learned-null 两条路径都能生成 finite waveform。
-5. fixed-pair logging：两条路径使用分别初始化但相同 seed 的 RNG，同时记录生成音频、feature MSE 和
-   `reference_gain`；固定长度 backend 额外记录 target semantic + reference acoustic passthrough。
-6. 32/1000 sample screening：记录 loss、双路 feature MSE、waveform finite、RTF、显存和 MFU。
+- paired data contract、FM/RVQ route contract 和 artifact roundtrip 的本地测试；
+- LongCat / BiCodec 四条路线的 fixed-sample overfit 与 finite waveform decode；
+- 32-sample LongCat FM 的 checkpoint/resume、sample metrics、TensorBoard audio 和 artifact export；
+- `speech-to-speech` 中一条真实 semantic-only TTS decode smoke。
+
+验收证据见 [experiments/results/](experiments/results/)。当前仍待验证的是：
+
+1. 用当前 `qwen_cross_text` pair contract 重跑 LongCat / BiCodec × FM / RVQ single-pair overfit，分别记录
+   with-reference 与 without-reference 的 loss、feature MSE、音频和 `reference_gain`。
+2. 对 BiCodec RVQ 的真实 backend 运行 32-slot temporal AR generation，确认 finite decode 和推理耗时。
+3. 在 `speech-to-speech` 真实 generation 中同时跑通省略 reference 和提供 reference 的两条路径，并保留
+   可核对的 pair metadata 与同 seed A/B 指标。
+4. 完成约 1000 样本的四路线 screening，以及至少 16 条 held-out cross-text fixed eval；记录 loss、双路
+   feature MSE、waveform finite、RTF、显存、MFU 和失败样本。
+5. 检查 reference 是否泄漏文本内容；验证完成前不把 reference gain 或音色保持写入 conclusion。
+
+其中 fixed-speaker 结果不等同于当前默认的 `qwen_cross_text` 训练契约；cross-text 重跑、真实 BiCodec
+RVQ 32-slot generation、held-out fixed eval 和 reference leakage 检查以
+[experiments/todo.md](experiments/todo.md) 为准。
 
 正式训练默认面向完整数据和长预算；smoke/overfit 配置只放在 `configs/experiment/`，不反向污染
 生产 preset。
