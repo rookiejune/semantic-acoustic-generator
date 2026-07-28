@@ -13,8 +13,8 @@ import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes, load_semantic_acoustic
 
 from semantic_acoustic_codec.datamodule import (
+    BatchingConfig,
     DataConfig,
-    LBAConfig,
     load_batch,
 )
 from semantic_acoustic_codec.runtime import SemanticCodecRuntime, load_artifact
@@ -38,7 +38,7 @@ def main() -> None:
         sample_index=args.sample_index,
         max_seconds=args.max_seconds,
         overlong=args.overlong,
-        lba=LBAConfig(enabled=False),
+        batching=BatchingConfig(enabled=False),
     )
     batch = load_batch(
         data,

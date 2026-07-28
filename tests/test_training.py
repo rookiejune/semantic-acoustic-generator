@@ -7,7 +7,9 @@ from typing import Any, cast
 
 import pytest
 import torch
+from anydataset.dataset import MapStyleABC
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
+from lightning import pytorch as pl
 from torch import Tensor
 
 pytest.importorskip("lightning")
@@ -199,6 +201,74 @@ def _paired_batch(backend: FakeCodec) -> SemanticCodecBatch:
         reference_acoustic_mask=reference.target_acoustic_mask,
         metadata=metadata,
     )
+
+
+def test_lightning_runs_anydataset_dynamic_loader_across_epochs() -> None:
+    class Dataset(MapStyleABC):
+        def __init__(self) -> None:
+            self.epochs: list[int] = []
+
+        def __len__(self) -> int:
+            return 4
+
+        def __getitem__(self, index: int) -> Tensor:
+            return torch.tensor(float(index + 1))
+
+        def _shuffle(
+            self,
+            *,
+            shuffle: bool,
+            seed: int,
+            epoch: int,
+            num_replicas: int,
+            rank: int,
+        ):
+            self.epochs.append(epoch)
+            yield from super()._shuffle(
+                shuffle=shuffle,
+                seed=seed,
+                epoch=epoch,
+                num_replicas=num_replicas,
+                rank=rank,
+            )
+
+    class Module(pl.LightningModule):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(()))
+
+        def training_step(self, batch: Tensor, batch_index: int) -> Tensor:
+            del batch_index
+            return (self.weight * batch).mean()
+
+        def configure_optimizers(self):
+            return torch.optim.SGD(self.parameters(), lr=0.01)
+
+    dataset = Dataset()
+    loader = dataset.dataloader(
+        cost_fn=lambda _index: 1,
+        max_batch_memory=2,
+        max_batch_samples=2,
+        shuffle=True,
+        epoch=0,
+    )
+    trainer = pl.Trainer(
+        accelerator="cpu",
+        devices=1,
+        max_epochs=2,
+        use_distributed_sampler=False,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=False,
+    )
+
+    trainer.fit(Module(), train_dataloaders=loader)
+
+    assert trainer.train_dataloader is loader
+    assert type(loader.batch_sampler.sampler).__module__ == "anydataset.dataset.batching"
+    assert dataset.epochs == [0, 1]
+    assert trainer.current_epoch == 2
 
 
 def test_training_module_trains_and_exports_artifact(tmp_path) -> None:
@@ -553,13 +623,13 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
                 "pin_memory": False,
                 "persistent_workers": False,
                 "fixed_batch": False,
-                "lba": {
+                "batching": {
                     "enabled": False,
                     "max_batch_seconds": 8.0,
-                    "max_padding_ratio": 0.05,
-                    "prefetch_batches": 0,
-                    "planner_mode": "quality",
-                    "drop_last_flush": True,
+                    "planning_window": 256,
+                    "prefetch_factor": 4,
+                    "drop_distributed_tail": True,
+                    "seed": 0,
                 },
             },
             "callback": {

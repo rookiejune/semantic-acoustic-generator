@@ -218,7 +218,7 @@ generated semantic tokens
     -> waveform
 ```
 
-因此 backend acoustic codes、backend feature loss、overfit dataloader、LBA planner 都不进入
+因此 backend acoustic codes、backend feature loss、overfit dataloader、训练期 dynamic batch planner 都不进入
 `speech-to-speech` runtime。请求提供 reference audio 时，S2S 只额外准备 backend acoustic features 和
 mask；reference 的配对约束和有/无 reference A/B 口径仍遵循第 2 节契约。
 

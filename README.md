@@ -91,6 +91,10 @@ FM 正式训练的 feature normalization 会遍历有效训练 subset 计算；�
 `datamodule.validation_sample_limit=<count>` 限制固定评估集。验证以固定顺序分别记录有/无 reference 的
 FM feature MSE 或 RVQ code error。
 
+变长训练通过 anydataset `MapStyleABC.dataloader(...)` 按预计算 semantic frame cost 规划 batch；
+`datamodule.batching.max_batch_seconds` 转换为 additive frame budget，`batch_size` 只限制单批最大样本数。
+planner 在 worker 物化 codec Tensor 前完成，不依赖已归档的 length-based batching adapter。
+
 ## Artifact 评估
 
 使用 `scripts/eval_artifact.py` 在一个 target/reference pair 上同时评估有 reference 和无 reference 路径：

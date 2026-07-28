@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import hydra
 import torch
@@ -19,9 +19,9 @@ from semantic_acoustic_codec.config import (
     RVQPredictor,
 )
 from semantic_acoustic_codec.datamodule import (
+    BatchingConfig,
     DataConfig,
     DataModule,
-    LBAConfig,
     load_batch,
     single_batch_loader,
 )
@@ -55,7 +55,6 @@ def run(config: DictConfig) -> None:
         codec=codec,
         acoustic_layout=backend.acoustic_layout,
         frame_rate=backend.frame_rate,
-        output_dir=output_dir,
         semantic_pad_id=semantic_pad_id,
         acoustic_pad_ids=acoustic_pad_ids,
     )
@@ -208,7 +207,7 @@ def _support_config(config: DictConfig, *, seed: int) -> SemanticSupportConfig:
 
 
 def _data_config(config: DictConfig) -> DataConfig:
-    lba = config.lba
+    batching = config.batching
     return DataConfig(
         source=str(config.get("source", "qwen_cross_text")),
         root=cast(Optional[str], config.get("root")),
@@ -225,13 +224,13 @@ def _data_config(config: DictConfig) -> DataConfig:
         num_workers=int(config.num_workers),
         pin_memory=bool(config.pin_memory),
         persistent_workers=bool(config.persistent_workers),
-        lba=LBAConfig(
-            enabled=bool(lba.enabled),
-            max_batch_seconds=float(lba.max_batch_seconds),
-            max_padding_ratio=float(lba.max_padding_ratio),
-            prefetch_batches=int(lba.prefetch_batches),
-            planner_mode=cast(Literal["quality", "throughput"], str(lba.planner_mode)),
-            drop_last_flush=bool(lba.drop_last_flush),
+        batching=BatchingConfig(
+            enabled=bool(batching.enabled),
+            max_batch_seconds=float(batching.max_batch_seconds),
+            planning_window=int(batching.planning_window),
+            prefetch_factor=int(batching.prefetch_factor),
+            drop_distributed_tail=bool(batching.drop_distributed_tail),
+            seed=int(batching.seed),
         ),
     )
 

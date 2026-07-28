@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from anydataset.dataset import SpeakerAudioGrid, SpeakerAudioRow
@@ -14,7 +16,7 @@ from anydataset.types import (
 )
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
-from semantic_acoustic_codec.datamodule import DataConfig, DataModule, LBAConfig
+from semantic_acoustic_codec.datamodule import BatchingConfig, DataConfig, DataModule
 from semantic_acoustic_codec.datamodule import qwen as qwen_data
 
 
@@ -45,7 +47,7 @@ def test_qwen_fixed_speaker_source_batches_fixed_length_units(
         batch_size=1,
         num_workers=0,
         persistent_workers=False,
-        lba=LBAConfig(enabled=False),
+        batching=BatchingConfig(enabled=False),
     )
     module = _module(data, tmp_path)
 
@@ -76,7 +78,7 @@ def test_qwen_cross_text_source_batches_explicit_pair_and_metadata(
         batch_size=2,
         num_workers=0,
         persistent_workers=False,
-        lba=LBAConfig(enabled=False),
+        batching=BatchingConfig(enabled=False),
     )
     module = _module(data, tmp_path)
 
@@ -100,6 +102,50 @@ def test_qwen_cross_text_source_batches_explicit_pair_and_metadata(
         ("target text", "reference text"),
         ("reference text", "target text"),
     }
+
+
+def test_qwen_cross_text_uses_anydataset_cost_batching(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grid = _grid(
+        [
+            (
+                f"text {index}",
+                torch.ones(2, 1, dtype=torch.long),
+                torch.ones(4, 1, dtype=torch.long),
+            )
+            for index in range(4)
+        ]
+    )
+    monkeypatch.setattr(qwen_data, "qwen_tts_speaker_codec_grid", lambda **_: grid)
+    data = DataConfig(
+        source="qwen_cross_text",
+        root=str(tmp_path / "prepared"),
+        batch_size=4,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        batching=BatchingConfig(
+            max_batch_seconds=2.0,
+            planning_window=4,
+        ),
+    )
+    module = _module(data, tmp_path, frame_rate=2.0)
+    module.trainer = SimpleNamespace(current_epoch=3)
+
+    module.setup()
+    loader = module.train_dataloader()
+    batches = list(loader)
+
+    assert type(loader).__module__ == "anydataset.dataset.batching"
+    assert loader.batch_sampler.epoch == 3
+    assert [len(batch.metadata) for batch in batches] == [2, 2]
+    assert sorted(
+        item.target_index
+        for batch in batches
+        for item in batch.metadata
+    ) == [0, 1, 2, 3]
 
 
 def test_qwen_pair_dataset_construction_does_not_load_codec_samples() -> None:
@@ -173,7 +219,7 @@ def test_datamodule_exposes_deterministic_held_out_split(
         num_workers=0,
         pin_memory=False,
         persistent_workers=False,
-        lba=LBAConfig(enabled=False),
+        batching=BatchingConfig(enabled=False),
     )
     module = _module(data, tmp_path)
 
@@ -212,7 +258,7 @@ def test_qwen_cross_text_filter_checks_target_and_reference_raw_lengths(
         num_workers=0,
         pin_memory=False,
         persistent_workers=False,
-        lba=LBAConfig(enabled=False),
+        batching=BatchingConfig(enabled=False),
     )
     module = _module(data, tmp_path, frame_rate=2.0)
 
@@ -234,7 +280,6 @@ def _module(data: DataConfig, tmp_path, *, frame_rate: float = 50.0) -> DataModu
         codec="bicodec",
         acoustic_layout=AcousticLayout.FIXED_LENGTH,
         frame_rate=frame_rate,
-        output_dir=tmp_path / "out",
         semantic_pad_id=10,
         acoustic_pad_ids=(20,),
     )

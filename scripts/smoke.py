@@ -17,7 +17,7 @@ from anytrain.framework.flow_matching import ContinuousFlowRuntime
 from anytrain.loss import MaskedCodebookCrossEntropyLoss
 
 from semantic_acoustic_codec.config import DecoderConfig, Route
-from semantic_acoustic_codec.datamodule import DataConfig, LBAConfig, load_batch
+from semantic_acoustic_codec.datamodule import BatchingConfig, DataConfig, load_batch
 from semantic_acoustic_codec.loss import FlowLoss
 from semantic_acoustic_codec.model import RVQCodeGenerator, build_route
 from semantic_acoustic_codec.runtime import (
@@ -328,7 +328,7 @@ def _data_smoke(
         root=None if root is None else str(root),
         split=split,
         sample_index=index,
-        lba=LBAConfig(enabled=False),
+        batching=BatchingConfig(enabled=False),
     )
     batch = load_batch(
         data,

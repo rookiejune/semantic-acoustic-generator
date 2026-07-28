@@ -11,7 +11,7 @@ dependencies = ["torch>=2.0", "anytrain"]
 
 [project.optional-dependencies]
 rvq = ["transformers>=4.50"]
-train = ["lightning>=2.0", "hydra-core>=1.3", "lba>=2.0", "anytrain[flow]", "anydataset"]
+train = ["lightning>=2.0", "hydra-core>=1.3", "anytrain[flow]", "anydataset"]
 test = ["pytest>=8.0", "anydataset"]
 
 [tool.setuptools.packages.find]
@@ -31,7 +31,6 @@ pythonpath = [
     "../workspace/src",
     "../third_party/anytrain/src",
     "../third_party/anydataset/src",
-    "../third_party/length-based-batching-adapter/src",
 ]
 
 [tool.basedpyright]
@@ -41,7 +40,6 @@ extraPaths = [
     "../workspace/src",
     "../third_party/anytrain/src",
     "../third_party/anydataset/src",
-    "../third_party/length-based-batching-adapter/src",
 ]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"

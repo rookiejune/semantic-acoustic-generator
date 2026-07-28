@@ -17,7 +17,7 @@ output_subdir: screening/${backend.name}/${model.route}-${model.decoder.layers}l
 datamodule:
   sample_limit: 984
   overlong: filter
-  lba:
+  batching:
     # Retains 980/984 pairs; the remaining four exceed 32 seconds.
     max_batch_seconds: 32.0
 

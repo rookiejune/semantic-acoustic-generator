@@ -1,7 +1,7 @@
 from semantic_acoustic_codec.datamodule.longcat import (
+    BatchingConfig,
     DataConfig,
     DataModule,
-    LBAConfig,
     collate_codes,
     collate_samples,
     length,
@@ -13,9 +13,9 @@ from semantic_acoustic_codec.datamodule.longcat import (
 from semantic_acoustic_codec.datamodule.structured import collate_structured_codes
 
 __all__ = [
+    "BatchingConfig",
     "DataConfig",
     "DataModule",
-    "LBAConfig",
     "collate_codes",
     "collate_samples",
     "collate_structured_codes",

@@ -67,7 +67,9 @@ def test_screening_uses_disjoint_training_partition() -> None:
 
     assert config.datamodule.sample_limit == 984
     assert config.datamodule.overlong == "filter"
-    assert config.datamodule.lba.max_batch_seconds == 32.0
+    assert "lba" not in config.datamodule
+    assert config.datamodule.batching.max_batch_seconds == 32.0
+    assert config.trainer.use_distributed_sampler is False
     assert config.trainer.max_steps == -1
     assert config.trainer.max_epochs == 1
     assert config.callback.performance.profile_flops is False

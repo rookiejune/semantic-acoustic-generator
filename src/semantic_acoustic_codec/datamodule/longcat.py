@@ -6,13 +6,14 @@ from collections.abc import Mapping, Sequence, Sized
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
+from anydataset.dataset import MapStyleABC
 from anydataset.types import Role
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 from lightning import pytorch as pl
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from zhuyin.datasets.wmt19_tts import wmt19_tts_codec
 
 from semantic_acoustic_codec.backend.longcat import batch_codes
@@ -27,37 +28,32 @@ from semantic_acoustic_codec.datamodule.qwen import (
 from semantic_acoustic_codec.datamodule.structured import collate_structured_codes
 from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
 
-if TYPE_CHECKING:
-    from typing import Literal
-
 
 @dataclass(frozen=True)
-class LBAConfig:
+class BatchingConfig:
     enabled: bool = True
     max_batch_seconds: float = 8.0
-    max_padding_ratio: float = 0.05
-    prefetch_batches: int = 4
-    planner_mode: Literal["quality", "throughput"] = "quality"
-    drop_last_flush: bool = True
+    planning_window: int = 256
+    prefetch_factor: int = 4
+    drop_distributed_tail: bool = True
+    seed: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
-            raise TypeError("lba.enabled must be a boolean.")
+            raise TypeError("batching.enabled must be a boolean.")
         _positive_number(self.max_batch_seconds, name="max_batch_seconds")
-        if isinstance(self.max_padding_ratio, bool) or not isinstance(
-            self.max_padding_ratio, (int, float)
+        for name, value in (
+            ("planning_window", self.planning_window),
+            ("prefetch_factor", self.prefetch_factor),
         ):
-            raise TypeError("max_padding_ratio must be a number.")
-        if not math.isfinite(self.max_padding_ratio) or not (0 <= self.max_padding_ratio <= 1):
-            raise ValueError("max_padding_ratio must be between 0 and 1.")
-        if isinstance(self.prefetch_batches, bool) or not isinstance(self.prefetch_batches, int):
-            raise TypeError("prefetch_batches must be an integer.")
-        if self.prefetch_batches < 0:
-            raise ValueError("prefetch_batches must be non-negative.")
-        if self.planner_mode not in {"quality", "throughput"}:
-            raise ValueError("planner_mode must be 'quality' or 'throughput'.")
-        if not isinstance(self.drop_last_flush, bool):
-            raise TypeError("drop_last_flush must be a boolean.")
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer.")
+            if value <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if not isinstance(self.drop_distributed_tail, bool):
+            raise TypeError("drop_distributed_tail must be a boolean.")
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise TypeError("batching.seed must be an integer.")
 
 
 @dataclass(frozen=True)
@@ -77,7 +73,7 @@ class DataConfig:
     num_workers: int = 8
     pin_memory: bool = True
     persistent_workers: bool = True
-    lba: LBAConfig = field(default_factory=LBAConfig)
+    batching: BatchingConfig = field(default_factory=BatchingConfig)
 
     def __post_init__(self) -> None:
         if self.source not in {"wmt19_tts_codec", "qwen_fixed_speaker", "qwen_cross_text"}:
@@ -112,11 +108,11 @@ class DataConfig:
             raise ValueError("overlong must be 'error', 'filter', or 'truncate'.")
         if (
             self.max_seconds is not None
-            and self.lba.enabled
-            and self.max_seconds > self.lba.max_batch_seconds
+            and self.batching.enabled
+            and self.max_seconds > self.batching.max_batch_seconds
         ):
             raise ValueError(
-                "max_seconds must not exceed lba.max_batch_seconds when LBA is enabled."
+                "max_seconds must not exceed batching.max_batch_seconds when batching is enabled."
             )
         for name, value, minimum in (
             ("batch_size", self.batch_size, 1),
@@ -144,6 +140,32 @@ class DataConfig:
                 raise TypeError(f"{name} must be a boolean.")
 
 
+class _PreparedDataset(MapStyleABC):
+    """Expose preplanned source indexes without retaining materialized samples."""
+
+    def __init__(
+        self,
+        source: Dataset[Any],
+        *,
+        indexes: Sequence[int],
+        costs: Sequence[int],
+    ) -> None:
+        if len(indexes) != len(costs):
+            raise ValueError("prepared dataset indexes and costs must have equal length.")
+        self.source = source
+        self.indexes = tuple(indexes)
+        self.costs = tuple(costs)
+
+    def __len__(self) -> int:
+        return len(self.indexes)
+
+    def __getitem__(self, index: int) -> Any:
+        return self.source[self.indexes[index]]
+
+    def cost(self, index: int) -> int:
+        return self.costs[index]
+
+
 class DataModule(pl.LightningDataModule):
     def __init__(
         self,
@@ -152,7 +174,6 @@ class DataModule(pl.LightningDataModule):
         codec: str,
         acoustic_layout: AcousticLayout,
         frame_rate: float,
-        output_dir: Path,
         semantic_pad_id: int,
         acoustic_pad_ids: Sequence[int],
     ) -> None:
@@ -161,11 +182,10 @@ class DataModule(pl.LightningDataModule):
         self.codec = codec
         self.acoustic_layout = acoustic_layout
         self.frame_rate = frame_rate
-        self.output_dir = output_dir
         self.semantic_pad_id = semantic_pad_id
         self.acoustic_pad_ids = tuple(acoustic_pad_ids)
-        self.dataset: Dataset[Any] | None = None
-        self.val_dataset: Dataset[Any] | None = None
+        self.dataset: _PreparedDataset | None = None
+        self.val_dataset: _PreparedDataset | None = None
         self.validation_data: DataConfig | None = None
         self.filtered_samples = 0
         self.validation_filtered_samples = 0
@@ -195,29 +215,43 @@ class DataModule(pl.LightningDataModule):
         data: DataConfig,
         *,
         label: str,
-    ) -> tuple[Dataset[Any], int]:
-        dataset = _dataset(data, codec=self.codec)
+    ) -> tuple[_PreparedDataset, int]:
+        source = _dataset(data, codec=self.codec)
+        size = len(cast(Sized, cast(object, source)))
         sample_limit = data.sample_limit
         if sample_limit is not None:
-            size = len(cast(Sized, cast(object, dataset)))
-            dataset = Subset(dataset, range(min(sample_limit, size)))
+            size = min(sample_limit, size)
+        candidates = range(size)
+        indexes: list[int] = []
+        costs: list[int] = []
         filtered = 0
-        if data.overlong == "filter":
-            dataset, filtered = _filter(
-                dataset,
-                data=data,
-                frame_rate=self.frame_rate,
+        max_seconds = _max_seconds(data)
+        if data.overlong == "filter" and max_seconds is None:
+            raise ValueError("duration filtering requires a hard limit.")
+        max_frames = None if max_seconds is None else _frames(max_seconds, self.frame_rate)
+        inspect_lengths = data.batching.enabled or data.overlong == "filter"
+        for index in candidates:
+            frames = 1
+            if inspect_lengths:
+                frames = _raw_length(source[index], source=data.source)
+                if data.overlong == "filter" and max_frames is not None and frames > max_frames:
+                    filtered += 1
+                    continue
+                if data.overlong == "truncate" and max_frames is not None:
+                    frames = min(frames, max_frames)
+            indexes.append(index)
+            costs.append(frames)
+        if not indexes:
+            raise ValueError("semantic codec duration filter removed every sample.")
+        if filtered:
+            if max_seconds is None:
+                raise RuntimeError("duration filtering requires a hard limit.")
+            warnings.warn(
+                f"filtered {filtered} {label} semantic codec samples longer "
+                f"than {max_seconds:g} seconds.",
+                stacklevel=2,
             )
-            if filtered:
-                max_seconds = _max_seconds(data)
-                if max_seconds is None:
-                    raise RuntimeError("duration filtering requires a hard limit.")
-                warnings.warn(
-                    f"filtered {filtered} {label} semantic codec samples longer "
-                    f"than {max_seconds:g} seconds.",
-                    stacklevel=2,
-                )
-        return dataset, filtered
+        return _PreparedDataset(source, indexes=indexes, costs=costs), filtered
 
     def _collate(self, data: DataConfig):
         return partial(
@@ -233,10 +267,10 @@ class DataModule(pl.LightningDataModule):
         if self.dataset is None:
             raise RuntimeError("semantic codec DataModule.setup() must run first.")
         data = self.data
-        lba = data.lba
+        batching = data.batching
         collate_fn = self._collate(data)
         persistent_workers = data.persistent_workers and data.num_workers > 0
-        if not lba.enabled:
+        if not batching.enabled:
             return DataLoader(
                 self.dataset,
                 batch_size=data.batch_size,
@@ -246,29 +280,20 @@ class DataModule(pl.LightningDataModule):
                 persistent_workers=persistent_workers,
                 collate_fn=collate_fn,
             )
-
-        from lba import LBA
-
-        return LBA(
-            self.dataset,
-            batch_size=data.batch_size,
+        return self.dataset.dataloader(
+            cost_fn=self.dataset.cost,
+            max_batch_memory=_frames(batching.max_batch_seconds, self.frame_rate),
+            max_batch_samples=data.batch_size,
+            planning_window=batching.planning_window,
+            drop_distributed_tail=batching.drop_distributed_tail,
             shuffle=True,
+            seed=batching.seed,
+            epoch=0 if self.trainer is None else self.trainer.current_epoch,
             num_workers=data.num_workers,
             pin_memory=data.pin_memory,
             persistent_workers=persistent_workers,
             collate_fn=collate_fn,
-            len_fn=partial(
-                length,
-                data=data,
-                frame_rate=self.frame_rate,
-                acoustic_layout=self.acoustic_layout,
-            ),
-            max_padded_length=_frames(lba.max_batch_seconds, self.frame_rate),
-            max_padding_ratio=lba.max_padding_ratio,
-            prefetch_batches=lba.prefetch_batches,
-            planner_mode=lba.planner_mode,
-            drop_last_flush=lba.drop_last_flush,
-            log_dir=self.output_dir / "lba",
+            prefetch_factor=batching.prefetch_factor if data.num_workers > 0 else None,
         )
 
     def val_dataloader(self) -> DataLoader[SemanticCodecBatch] | list[DataLoader[SemanticCodecBatch]]:
@@ -288,7 +313,7 @@ class DataModule(pl.LightningDataModule):
         )
 
     def feature_stats_dataloader(self) -> DataLoader[SemanticCodecBatch]:
-        """Iterate the effective training subset once without shuffle or LBA dropping."""
+        """Iterate the effective training subset once without shuffle or dynamic batching."""
         if self.dataset is None:
             raise RuntimeError("semantic codec DataModule.setup() must run first.")
         data = self.data
@@ -505,52 +530,24 @@ def _single_batch(values: Sequence[SemanticCodecBatch]) -> SemanticCodecBatch:
     return values[0]
 
 
-def _filter(
-    dataset: Dataset[Any],
-    *,
-    data: DataConfig,
-    frame_rate: float,
-) -> tuple[Dataset[Any], int]:
-    max_seconds = _max_seconds(data)
-    if max_seconds is None:
-        return dataset, 0
-    max_frames = _frames(max_seconds, frame_rate)
-    size = len(cast(Sized, cast(object, dataset)))
-    indices = [
-        index
-        for index in range(size)
-        if _fits(
-            dataset[index],
-            source=data.source,
-            max_frames=max_frames,
-        )
-    ]
-    dropped = size - len(indices)
-    if not indices:
-        raise ValueError("semantic codec duration filter removed every sample.")
-    return Subset(dataset, indices), dropped
-
-
-def _fits(
+def _raw_length(
     sample: Mapping[Any, Any] | QwenCodecSample | QwenCodecPairSample,
     *,
     source: str,
-    max_frames: int,
-) -> bool:
+) -> int:
     target = _sample_codes(sample, source=source)
-    if target.semantic.size(0) > max_frames:
-        return False
     if source != "qwen_cross_text":
-        return True
-    return _pair(sample).reference.codes.semantic.size(0) <= max_frames
+        return target.semantic.size(0)
+    reference = _pair(sample).reference.codes.semantic.size(0)
+    return max(target.semantic.size(0), reference)
 
 
 def _max_seconds(data: DataConfig) -> float | None:
-    if not data.lba.enabled:
+    if not data.batching.enabled:
         return data.max_seconds
     if data.max_seconds is None:
-        return data.lba.max_batch_seconds
-    return min(data.max_seconds, data.lba.max_batch_seconds)
+        return data.batching.max_batch_seconds
+    return min(data.max_seconds, data.batching.max_batch_seconds)
 
 
 def _frames(seconds: float, frame_rate: float) -> int:
@@ -644,9 +641,9 @@ def _metadata(pair: QwenCodecPairSample) -> SemanticCodecPairMetadata:
 
 
 __all__ = [
+    "BatchingConfig",
     "DataConfig",
     "DataModule",
-    "LBAConfig",
     "collate_codes",
     "collate_samples",
     "length",

@@ -14,7 +14,7 @@
    只保留 fixed eval 需要的 role/speaker，held-out 数据使用独立目录，不能被训练 dataloader 读取。
 3. codec materializer 的 resume check 必须识别当前 anydataset store 的 `.ready` 和 `dataset.json`。
 4. 当前 `PerformanceCallback` 在没有 `model_flops_per_step` 或 `model_flops_per_batch` 时只记录 step
-   time，不会产生 MFU。screening 启动前必须提供可信 FLOPs 输入；变长 LBA batch 优先使用按 batch
+   time，不会产生 MFU。screening 启动前必须提供可信 FLOPs 输入；变长 anydataset cost batch 优先使用按 batch
    计算的 provider，不用单个静态数冒充所有 batch。
 
 ## 训练矩阵
@@ -22,18 +22,19 @@
 沿用四个 001 experiment composition，只增加 screening 专属 override：
 
 - `datamodule.sample_limit=984`；
-- screening 单独设置 `datamodule.lba.max_batch_seconds=32`：LongCat/BiCodec 的 pair semantic
+- screening 单独设置 `datamodule.batching.max_batch_seconds=32`：LongCat/BiCodec 的 pair semantic
   duration 中位数分别为 13.32/13.26 秒，p95 为 23.42/23.38 秒，最大值为 33.78/33.74 秒；
   32 秒保留 980/984（99.6%），只过滤四个包含两个最长 utterance 的 pair；
 - `trainer.max_steps=-1`、`trainer.max_epochs=1`，完整遍历一次 screening 数据；
-- 保留默认 batch size、LBA、bf16 和 `reference_dropout=0.5`；
+- 保留默认 batch size 上限、anydataset cost batching、bf16 和 `reference_dropout=0.5`；
 - sample/checkpoint 间隔缩短到本次 step budget 内，并保留 `last` 与所有周期 checkpoint；
 - performance warmup/window 缩短到本次 budget 内，但不修改生产默认 preset。
 
 四条路线使用独立输出目录。可以并行占用四张空闲 GPU；每条路线先单卡运行，避免把 DDP 差异混入
 codec/route 对比。
 
-32 秒同时是 LBA 的总 padded-duration budget。四路线先用该预算跑 20-step FLOPs calibration 并记录
+32 秒同时转换为 anydataset 的 additive semantic-frame batch budget，`batch_size=8` 只作为样本数上限。
+四路线先用该预算跑 20-step FLOPs calibration 并记录
 峰值显存；如果任一路线发生 OOM，则全矩阵统一回退到 24 秒（保留 940/984，95.5%），不按路线使用
 不同数据子集。生产 datamodule 的 8 秒默认值不随 screening 修改。
 
