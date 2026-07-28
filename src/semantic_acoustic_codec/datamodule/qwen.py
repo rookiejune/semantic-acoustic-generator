@@ -114,24 +114,31 @@ class QwenCodecPairDataset(Dataset[QwenCodecPairSample]):
     def __init__(self, source: QwenCodecColumnDataset) -> None:
         super().__init__()
         self.source = source
-        samples = tuple(source[index] for index in range(len(source)))
-        self.samples = samples
-        self.reference_indices = _reference_indices(samples)
+        if len(source) < 2:
+            raise ValueError("cross-text pairing requires at least two Qwen codec samples.")
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.source)
 
     def __getitem__(self, index: int) -> QwenCodecPairSample:
         if index < 0:
             index += len(self)
         if index < 0 or index >= len(self):
             raise IndexError("Qwen codec pair sample index out of range.")
-        reference_index = self.reference_indices[index]
-        return QwenCodecPairSample(
-            target_index=index,
-            reference_index=reference_index,
-            target=self.samples[index],
-            reference=self.samples[reference_index],
+        target = self.source[index]
+        for offset in range(1, len(self)):
+            reference_index = (index + offset) % len(self)
+            reference = self.source[reference_index]
+            if _is_reference(target, reference):
+                return QwenCodecPairSample(
+                    target_index=index,
+                    reference_index=reference_index,
+                    target=target,
+                    reference=reference,
+                )
+        raise ValueError(
+            f"Qwen codec sample {target.utterance_id!r} has no same-speaker "
+            "reference from a different text row with a different utterance id and text."
         )
 
 
@@ -162,30 +169,13 @@ def _codes(
     raise ValueError(f"unsupported Qwen codec: {codec!r}.")
 
 
-def _reference_indices(samples: tuple[QwenCodecSample, ...]) -> tuple[int, ...]:
-    if len(samples) < 2:
-        raise ValueError("cross-text pairing requires at least two Qwen codec samples.")
-    references: list[int] = []
-    for target_index, target in enumerate(samples):
-        for offset in range(1, len(samples)):
-            reference_index = (target_index + offset) % len(samples)
-            reference = samples[reference_index]
-            if reference.speaker_id != target.speaker_id:
-                continue
-            if reference.text_index == target.text_index:
-                continue
-            if reference.utterance_id == target.utterance_id:
-                continue
-            if reference.text == target.text:
-                continue
-            references.append(reference_index)
-            break
-        else:
-            raise ValueError(
-                f"Qwen codec sample {target.utterance_id!r} has no same-speaker "
-                "reference from a different text row with a different utterance id and text."
-            )
-    return tuple(references)
+def _is_reference(target: QwenCodecSample, reference: QwenCodecSample) -> bool:
+    return (
+        reference.speaker_id == target.speaker_id
+        and reference.text_index != target.text_index
+        and reference.utterance_id != target.utterance_id
+        and reference.text != target.text
+    )
 
 
 __all__ = [

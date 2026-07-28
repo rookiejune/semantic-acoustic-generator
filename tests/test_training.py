@@ -20,9 +20,11 @@ try:
         CHECKPOINT_METADATA_KEY,
         CHECKPOINT_SCHEMA_VERSION,
         build_module,
+        dataset_feature_stats,
         feature_stats,
     )
     from semantic_acoustic_codec.runtime import (
+        SamplingConfig,
         SemanticCodecRuntime,
         SemanticSupportConfig,
         load_artifact,
@@ -474,10 +476,20 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self.args = args
             self.kwargs = kwargs
+            self.setup_stages: list[str] = []
+
+        def setup(self, stage: str) -> None:
+            self.setup_stages.append(stage)
+
+        def sample_batch(self) -> SemanticCodecBatch:
+            return fixed_batch
+
+    trainer_configs: list[dict[str, Any]] = []
 
     class TrainerStub:
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
+            trainer_configs.append(kwargs)
 
         def fit(self, module: object, **kwargs: Any) -> None:
             fits.append({"module": module, **kwargs})
@@ -488,36 +500,47 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
     monkeypatch.setattr(train.pl, "seed_everything", lambda *args, **kwargs: None)
     monkeypatch.setattr(train.pl, "Trainer", TrainerStub)
     monkeypatch.setattr(train, "load_semantic_acoustic", lambda *args, **kwargs: FakeCodec())
-    monkeypatch.setattr(train, "load_batch", lambda *args, **kwargs: fixed_batch)
+    monkeypatch.setattr(train, "load_batch", fail_single_batch)
     monkeypatch.setattr(train, "build_module", lambda *args, **kwargs: object())
     monkeypatch.setattr(train, "DataModule", DataModuleStub)
     monkeypatch.setattr(train, "single_batch_loader", fail_single_batch)
 
     config = omegaconf.OmegaConf.create(
         {
-            "codec": "longcat",
-            "route": "fm",
-            "condition_dim": 10,
-            "initialization": "codec",
-            "normalize_features": False,
-            "device": "cpu",
+            "seed": 0,
             "output_dir": str(tmp_path),
             "output_subdir": "unused",
-            "decoder": {
-                "hidden_dim": None,
-                "layers": 1,
-                "heads": 2,
-                "ffn_ratio": 2,
-                "rvq_predictor": "mtp",
-                "mtp_layers": 1,
-                "mtp_heads": 2,
+            "backend": {"name": "longcat"},
+            "model": {
+                "route": "fm",
+                "condition_dim": 10,
+                "decoder": {
+                    "hidden_dim": None,
+                    "layers": 1,
+                    "heads": 2,
+                    "ffn_ratio": 2,
+                    "rvq_predictor": "mtp",
+                    "mtp_layers": 1,
+                    "mtp_heads": 2,
+                },
+            },
+            "loss": {
                 "repa_feature_dim": None,
                 "repa_student_layer": None,
                 "repa_loss_weight": 0.0,
             },
-            "sampling": {"flow_steps": 2, "temperature": 1.0, "top_p": 1.0},
-            "optimizer": {"learning_rate": 1e-3, "weight_decay": 0.0},
-            "data": {
+            "pl_module": {
+                "normalize_features": False,
+                "learning_rate": 1e-3,
+                "weight_decay": 0.0,
+                "reference_dropout": 0.5,
+            },
+            "runtime": {
+                "device": "cpu",
+                "initialization": "codec",
+                "sampling": {"flow_steps": 2, "temperature": 1.0, "top_p": 1.0},
+            },
+            "datamodule": {
                 "source": "qwen_fixed_speaker",
                 "root": None,
                 "split": "train",
@@ -529,6 +552,7 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
                 "num_workers": 0,
                 "pin_memory": False,
                 "persistent_workers": False,
+                "fixed_batch": False,
                 "lba": {
                     "enabled": False,
                     "max_batch_seconds": 8.0,
@@ -538,30 +562,35 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
                     "drop_last_flush": True,
                 },
             },
-            "train": {
-                "seed": 0,
-                "fixed_batch": False,
-                "reference_dropout": 0.5,
-                "max_steps": 4,
+            "callback": {
+                "sample": {"enabled": False, "every_n_train_steps": 2, "seed": 0},
+                "performance": {
+                    "enabled": False,
+                    "model_flops_per_step": None,
+                    "hardware_peak_flops": None,
+                    "log_every_n_steps": 1,
+                    "warmup_steps": 0,
+                    "measure_window_steps": 1,
+                },
+                "checkpoint": {
+                    "enabled": False,
+                    "filename": "step-{step:08d}",
+                    "save_last": True,
+                    "save_top_k": -1,
+                    "every_n_train_steps": 2,
+                },
             },
-            "sample": {"enabled": False, "every_n_train_steps": 2, "seed": 0},
             "trainer": {
                 "accelerator": "cpu",
                 "devices": 1,
                 "strategy": "auto",
                 "use_distributed_sampler": False,
                 "precision": "32-true",
+                "max_steps": 4,
                 "max_epochs": -1,
                 "log_every_n_steps": 1,
-                "enable_checkpointing": False,
                 "gradient_clip_val": 0.0,
-            },
-            "checkpoint": {
-                "resume_from": str(tmp_path / "last.ckpt"),
-                "filename": "step-{step:08d}",
-                "save_last": True,
-                "save_top_k": -1,
-                "every_n_train_steps": 2,
+                "ckpt_path": str(tmp_path / "last.ckpt"),
             },
         }
     )
@@ -569,7 +598,9 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
     train.run(config)
 
     assert len(fits) == 1
+    assert trainer_configs[0]["max_steps"] == 4
     assert isinstance(fits[0]["datamodule"], DataModuleStub)
+    assert fits[0]["datamodule"].setup_stages == ["fit"]
     assert "train_dataloaders" not in fits[0]
     assert fits[0]["ckpt_path"] == str(tmp_path / "last.ckpt")
 
@@ -648,3 +679,73 @@ def test_feature_stats_use_only_valid_frames() -> None:
     assert len(mean) == backend.acoustic_feature_dim
     assert len(std) == backend.acoustic_feature_dim
     assert all(value > 0 for value in std)
+
+
+def test_dataset_feature_stats_combine_multiple_batches() -> None:
+    backend = FakeCodec()
+    batches = [
+        collate_codes(
+            [torch.tensor([[1, 0, 0]], dtype=torch.long)],
+            semantic_pad_id=backend.semantic_codebook.size(0),
+            acoustic_pad_ids=backend.acoustic_codebook_sizes,
+        ),
+        collate_codes(
+            [torch.tensor([[2, 4, 6]], dtype=torch.long)],
+            semantic_pad_id=backend.semantic_codebook.size(0),
+            acoustic_pad_ids=backend.acoustic_codebook_sizes,
+        ),
+    ]
+
+    mean, std = dataset_feature_stats(backend, batches)
+
+    assert mean == pytest.approx((2.0, 3.0, 0.0, 0.0))
+    assert std == pytest.approx((2.0, 3.0, 1e-5, 1e-5))
+
+
+def test_validation_metrics_are_paired_and_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeCodec()
+    batch = _paired_batch(backend)
+    module = build_module(
+        backend,
+        SemanticSupportConfig(
+            route=Route.FM,
+            condition_dim=10,
+            decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+            sampling=SamplingConfig(flow_steps=1),
+        ),
+        batch,
+        normalize_features=True,
+        validation_seed=7,
+    )
+    states: list[Tensor] = []
+    logged: list[str] = []
+    original = module.support.sample_features
+
+    def sample_features(*args: Any, generator: torch.Generator | None = None, **kwargs: Any):
+        assert generator is not None
+        states.append(generator.get_state().clone())
+        return original(*args, generator=generator, **kwargs)
+
+    monkeypatch.setattr(module.support, "sample_features", sample_features)
+    monkeypatch.setattr(module, "log", lambda name, *_args, **_kwargs: logged.append(name))
+
+    first = module.validation_step(batch, 3)
+    second = module.validation_step(batch, 3)
+
+    assert set(first) == {
+        "val/without_reference_feature_mse",
+        "val/with_reference_feature_mse",
+        "val/reference_gain_feature_mse",
+    }
+    for name in first:
+        torch.testing.assert_close(first[name], second[name])
+    torch.testing.assert_close(
+        first["val/reference_gain_feature_mse"],
+        first["val/without_reference_feature_mse"]
+        - first["val/with_reference_feature_mse"],
+    )
+    assert len(states) == 4
+    assert all(torch.equal(state, states[0]) for state in states[1:])
+    assert logged == list(first) + list(second)

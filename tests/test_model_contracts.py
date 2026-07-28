@@ -26,6 +26,7 @@ from semantic_acoustic_codec.runtime import (
     SemanticSupportConfig,
     build_support,
     load_artifact,
+    load_generator_artifact,
     save_artifact,
 )
 from semantic_acoustic_codec.types import SemanticCodecBatch
@@ -259,8 +260,9 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     )
     runtime = SemanticCodecRuntime(support, backend)
     waveform = runtime.decode(semantic, mask=mask, generator=torch.Generator().manual_seed(1))
-    save_artifact(tmp_path, support, config)
+    save_artifact(tmp_path, support, config, backend=backend)
     loaded = load_artifact(tmp_path)
+    acoustic = load_generator_artifact(tmp_path)
     loaded_features = loaded.sample_features(
         semantic,
         mask=mask,
@@ -269,10 +271,130 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
 
     assert features.shape == (1, 3, 4)
     assert condition.shape == (1, 3, 10)
-    assert waveform.shape == (1, 1, 3 * 320)
+    assert waveform.shape == (1, 1, 2 * 320)
     assert not hasattr(support, "backend")
+    assert acoustic.spec.route is Route.FM
+    assert acoustic.spec.condition_dim == 10
+    assert acoustic.spec.backend_name == backend.name
+    assert acoustic.spec.sample_rate == backend.sample_rate
+    assert acoustic.spec.frame_rate == backend.frame_rate
+    assert acoustic.spec.semantic_frame_rate == backend.semantic_frame_rate
+    assert acoustic.spec.semantic_vocab_size == 8
+    assert acoustic.spec.semantic_embedding_dim == 6
+    assert acoustic.spec.acoustic_feature_dim == 4
+    assert acoustic.spec.acoustic_codebook_sizes == (5, 7)
+    assert acoustic.spec.acoustic_layout is AcousticLayout.FRAME_ALIGNED
+    assert acoustic.spec.acoustic_unit_length is None
+    acoustic.spec.validate_backend(backend)
+    acoustic.spec.validate_acoustic_backend(backend)
+    other_semantic = FakeCodec()
+    other_semantic.semantic_codebook = torch.randn(11, 9)
+    acoustic.spec.validate_acoustic_backend(other_semantic)
+    with pytest.raises(ValueError, match="semantic_vocab_size"):
+        acoustic.spec.validate_backend(other_semantic)
+    other_identity = FakeCodec()
+    other_identity.name = "other"
+    with pytest.raises(ValueError, match="name"):
+        acoustic.spec.validate_backend(other_identity)
+    other_rate = FakeCodec()
+    other_rate.sample_rate = 24_000
+    with pytest.raises(ValueError, match="sample_rate"):
+        acoustic.spec.validate_backend(other_rate)
+    assert acoustic.generator.state_dict().keys() == support.generator.state_dict().keys()
+    for key, value in support.generator.state_dict().items():
+        assert torch.equal(acoustic.generator.state_dict()[key], value)
     assert torch.equal(features[:, 2], torch.zeros_like(features[:, 2]))
     assert torch.allclose(features, loaded_features)
+
+
+def test_generator_artifact_ignores_unrelated_state_but_remains_strict(tmp_path) -> None:
+    backend = FakeCodec()
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=10,
+        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    ).eval()
+    save_artifact(tmp_path, support, config, backend=backend)
+    checkpoint = tmp_path / "model.ckpt"
+    original = torch.load(checkpoint, weights_only=True)
+    incompatible = dict(original)
+    del incompatible["reference_conditioner.null_condition"]
+    incompatible["conditioner.legacy.weight"] = torch.zeros(1)
+    torch.save(incompatible, checkpoint)
+
+    with pytest.raises(RuntimeError, match="state_dict"):
+        load_artifact(tmp_path)
+    acoustic = load_generator_artifact(tmp_path)
+    for key, value in support.generator.state_dict().items():
+        assert torch.equal(acoustic.generator.state_dict()[key], value)
+
+    generator_keys = [key for key in original if key.startswith("generator.")]
+    missing = dict(incompatible)
+    del missing[generator_keys[0]]
+    torch.save(missing, checkpoint)
+    with pytest.raises(RuntimeError, match="state_dict"):
+        load_generator_artifact(tmp_path)
+
+    unexpected = dict(incompatible)
+    unexpected["generator.unexpected"] = torch.zeros(1)
+    torch.save(unexpected, checkpoint)
+    with pytest.raises(RuntimeError, match="state_dict"):
+        load_generator_artifact(tmp_path)
+
+
+def test_frame_aligned_decode_trims_right_padding() -> None:
+    backend = FakeCodec()
+    support = build_support(
+        SemanticSupportConfig(
+            route=Route.FM,
+            condition_dim=10,
+            decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        ),
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    ).eval()
+    runtime = SemanticCodecRuntime(support, backend)
+    semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
+    features = torch.randn(1, 3, backend.acoustic_feature_dim)
+    mask = torch.tensor([[True, True, False]])
+
+    waveform = runtime.decode_features(semantic, features, mask=mask)
+
+    assert waveform.shape == (1, 1, 2 * 320)
+
+
+def test_decode_rejects_mixed_lengths_and_non_prefix_masks() -> None:
+    backend = FakeCodec()
+    support = build_support(
+        SemanticSupportConfig(
+            route=Route.FM,
+            condition_dim=10,
+            decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        ),
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    ).eval()
+    runtime = SemanticCodecRuntime(support, backend)
+    semantic = torch.tensor([[[1], [2], [8]], [[3], [8], [8]]], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="equal valid semantic lengths"):
+        runtime.decode(
+            semantic,
+            mask=torch.tensor([[True, True, False], [True, False, False]]),
+        )
+    with pytest.raises(ValueError, match="contiguous right padding"):
+        runtime.decode(
+            torch.tensor([[[1], [8], [2]]], dtype=torch.long),
+            mask=torch.tensor([[True, False, True]]),
+        )
 
 
 def test_fm_route_trains_one_step() -> None:

@@ -25,7 +25,7 @@ from semantic_acoustic_codec.datamodule import (
     load_batch,
     single_batch_loader,
 )
-from semantic_acoustic_codec.pl_module import build_module
+from semantic_acoustic_codec.pl_module import build_module, dataset_feature_stats
 from semantic_acoustic_codec.runtime import SamplingConfig, SemanticSupportConfig
 
 if TYPE_CHECKING:
@@ -38,43 +38,71 @@ def main(config: DictConfig) -> None:
 
 
 def run(config: DictConfig) -> None:
-    seed = int(config.train.seed)
+    seed = int(config.seed)
     pl.seed_everything(seed, workers=True)
-    device = _device(cast(Optional[str], config.get("device")))
+    device = _device(cast(Optional[str], config.runtime.get("device")))
     output_dir = _output_dir(config)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    codec = str(config.get("codec", "longcat"))
-    data = _data_config(config.data)
+    codec = str(config.backend.name)
+    data = _data_config(config.datamodule)
     _validate_data_backend(data, codec=codec)
     backend = load_semantic_acoustic(codec, device=device)
     semantic_pad_id = int(backend.semantic_codebook.size(0))
     acoustic_pad_ids = backend.acoustic_codebook_sizes
-    fixed_batch = load_batch(
+    data_module = DataModule(
         data,
         codec=codec,
-        frame_rate=backend.frame_rate,
         acoustic_layout=backend.acoustic_layout,
+        frame_rate=backend.frame_rate,
+        output_dir=output_dir,
         semantic_pad_id=semantic_pad_id,
         acoustic_pad_ids=acoustic_pad_ids,
     )
+    if bool(config.datamodule.fixed_batch):
+        fixed_batch = load_batch(
+            data,
+            codec=codec,
+            frame_rate=backend.frame_rate,
+            acoustic_layout=backend.acoustic_layout,
+            semantic_pad_id=semantic_pad_id,
+            acoustic_pad_ids=acoustic_pad_ids,
+        )
+    else:
+        data_module.setup("fit")
+        fixed_batch = data_module.sample_batch()
     support_config = _support_config(config, seed=seed)
+    normalize_features = bool(config.pl_module.normalize_features)
+    feature_mean: tuple[float, ...] | None = None
+    feature_std: tuple[float, ...] | None = None
+    if normalize_features and support_config.route is Route.FM:
+        if bool(config.datamodule.fixed_batch):
+            feature_mean, feature_std = dataset_feature_stats(backend, (fixed_batch,))
+        else:
+            feature_mean, feature_std = dataset_feature_stats(
+                backend,
+                data_module.feature_stats_dataloader(),
+            )
     module = build_module(
         backend,
         support_config,
         fixed_batch,
-        normalize_features=bool(config.get("normalize_features", True)),
-        learning_rate=float(config.optimizer.learning_rate),
-        weight_decay=float(config.optimizer.weight_decay),
-        reference_dropout=float(config.train.reference_dropout),
+        normalize_features=normalize_features,
+        feature_mean=feature_mean,
+        feature_std=feature_std,
+        learning_rate=float(config.pl_module.learning_rate),
+        weight_decay=float(config.pl_module.weight_decay),
+        reference_dropout=float(config.pl_module.reference_dropout),
+        validation_seed=int(config.pl_module.get("validation_seed", seed)),
     )
 
     callbacks: list[Callback] = [ArtifactExport(output_dir)]
-    performance = config.get("performance", {})
+    performance = config.callback.performance
     if bool(performance.get("enabled", True)):
         callbacks.append(
             PerformanceCallback(
                 model_flops_per_step=_optional_float(performance.get("model_flops_per_step")),
+                profile_flops=bool(performance.get("profile_flops", False)),
                 hardware_peak_flops=_optional_float(performance.get("hardware_peak_flops")),
                 log_every_n_steps=int(
                     performance.get("log_every_n_steps", config.trainer.log_every_n_steps)
@@ -83,25 +111,27 @@ def run(config: DictConfig) -> None:
                 measure_window_steps=int(performance.get("measure_window_steps", 100)),
             )
         )
-    if bool(config.sample.enabled):
+    sample = config.callback.sample
+    if bool(sample.enabled):
         callbacks.append(
             SampleLogger(
                 output_dir,
                 fixed_batch,
                 SampleLogConfig(
-                    every_n_train_steps=int(config.sample.every_n_train_steps),
-                    seed=int(config.sample.seed),
+                    every_n_train_steps=int(sample.every_n_train_steps),
+                    seed=int(sample.seed),
                 ),
             )
         )
-    if bool(config.trainer.enable_checkpointing):
+    checkpoint = config.callback.checkpoint
+    if bool(checkpoint.enabled):
         callbacks.append(
             ModelCheckpoint(
                 dirpath=output_dir / "checkpoints",
-                filename=str(config.checkpoint.filename),
-                save_last=bool(config.checkpoint.save_last),
-                save_top_k=int(config.checkpoint.save_top_k),
-                every_n_train_steps=int(config.checkpoint.every_n_train_steps),
+                filename=str(checkpoint.filename),
+                save_last=bool(checkpoint.save_last),
+                save_top_k=int(checkpoint.save_top_k),
+                every_n_train_steps=int(checkpoint.every_n_train_steps),
                 auto_insert_metric_name=False,
             )
         )
@@ -112,43 +142,49 @@ def run(config: DictConfig) -> None:
         devices=cast(Union[str, int], config.trainer.devices),
         strategy=str(config.trainer.strategy),
         precision=cast(Any, config.trainer.precision),
-        max_steps=int(config.train.max_steps),
+        max_steps=int(config.trainer.max_steps),
         max_epochs=int(config.trainer.max_epochs),
         log_every_n_steps=int(config.trainer.log_every_n_steps),
-        enable_checkpointing=bool(config.trainer.enable_checkpointing),
+        enable_checkpointing=bool(checkpoint.enabled),
         gradient_clip_val=float(config.trainer.gradient_clip_val),
         default_root_dir=str(output_dir),
         callbacks=callbacks,
         use_distributed_sampler=bool(config.trainer.use_distributed_sampler),
+        val_check_interval=cast(
+            Union[int, float],
+            config.trainer.get("val_check_interval", 1.0),
+        ),
+        check_val_every_n_epoch=cast(
+            Optional[int],
+            config.trainer.get("check_val_every_n_epoch"),
+        ),
     )
-    if not bool(config.train.fixed_batch):
+    if not bool(config.datamodule.fixed_batch):
         trainer.fit(
             module,
-            datamodule=DataModule(
-                data,
-                codec=codec,
-                acoustic_layout=backend.acoustic_layout,
-                frame_rate=backend.frame_rate,
-                output_dir=output_dir,
-                semantic_pad_id=semantic_pad_id,
-                acoustic_pad_ids=acoustic_pad_ids,
-            ),
+            datamodule=data_module,
             ckpt_path=ckpt_path,
         )
     else:
+        val_dataloaders = None
+        if data.validation_split is not None:
+            data_module.setup("fit")
+            val_dataloaders = data_module.val_dataloader()
         trainer.fit(
             module,
             train_dataloaders=single_batch_loader(fixed_batch),
+            val_dataloaders=val_dataloaders,
             ckpt_path=ckpt_path,
         )
 
 
 def _support_config(config: DictConfig, *, seed: int) -> SemanticSupportConfig:
-    decoder = config.decoder
-    sampling = config.sampling
+    decoder = config.model.decoder
+    loss = config.loss
+    sampling = config.runtime.sampling
     return SemanticSupportConfig(
-        route=_route(config.route),
-        condition_dim=int(config.condition_dim),
+        route=_route(config.model.route),
+        condition_dim=int(config.model.condition_dim),
         decoder=DecoderConfig(
             hidden_dim=cast(Optional[int], decoder.get("hidden_dim")),
             layers=int(decoder.layers),
@@ -157,11 +193,11 @@ def _support_config(config: DictConfig, *, seed: int) -> SemanticSupportConfig:
             rvq_predictor=_rvq_predictor(decoder.get("rvq_predictor", "mtp")),
             mtp_layers=int(decoder.get("mtp_layers", 2)),
             mtp_heads=int(decoder.get("mtp_heads", 4)),
-            repa_feature_dim=cast(Optional[int], decoder.get("repa_feature_dim")),
-            repa_student_layer=cast(Optional[int], decoder.get("repa_student_layer")),
-            repa_loss_weight=float(decoder.get("repa_loss_weight", 0.0)),
+            repa_feature_dim=cast(Optional[int], loss.get("repa_feature_dim")),
+            repa_student_layer=cast(Optional[int], loss.get("repa_student_layer")),
+            repa_loss_weight=float(loss.repa_loss_weight),
         ),
-        initialization=_initialization(config.initialization),
+        initialization=_initialization(config.runtime.initialization),
         seed=seed,
         sampling=SamplingConfig(
             flow_steps=int(sampling.flow_steps),
@@ -177,6 +213,8 @@ def _data_config(config: DictConfig) -> DataConfig:
         source=str(config.get("source", "qwen_cross_text")),
         root=cast(Optional[str], config.get("root")),
         split=str(config.split),
+        validation_split=cast(Optional[str], config.get("validation_split")),
+        validation_sample_limit=cast(Optional[int], config.get("validation_sample_limit")),
         role=str(config.get("role", "target")),
         speaker_id=str(config.get("speaker_id", "vivian")),
         sample_index=int(config.sample_index),
@@ -218,7 +256,7 @@ def _output_dir(config: DictConfig) -> Path:
 
 
 def _ckpt_path(config: DictConfig) -> str | None:
-    value = config.checkpoint.get("resume_from")
+    value = config.trainer.get("ckpt_path")
     return None if value is None else str(value)
 
 

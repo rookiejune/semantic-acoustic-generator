@@ -7,12 +7,12 @@ name = "semantic-acoustic-codec"
 version = "0.1.0"
 description = "Reference-optional semantic-to-acoustic codec generation."
 requires-python = ">=3.9"
-dependencies = ["torch>=2.0", "anytrain", "anydataset"]
+dependencies = ["torch>=2.0", "anytrain"]
 
 [project.optional-dependencies]
 rvq = ["transformers>=4.50"]
-train = ["lightning>=2.0", "hydra-core>=1.3", "lba>=2.0", "anytrain[flow]"]
-test = ["pytest>=8.0"]
+train = ["lightning>=2.0", "hydra-core>=1.3", "lba>=2.0", "anytrain[flow]", "anydataset"]
+test = ["pytest>=8.0", "anydataset"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -33,3 +33,17 @@ pythonpath = [
     "../third_party/anydataset/src",
     "../third_party/length-based-batching-adapter/src",
 ]
+
+[tool.basedpyright]
+include = ["src", "scripts"]
+extraPaths = [
+    "src",
+    "../workspace/src",
+    "../third_party/anytrain/src",
+    "../third_party/anydataset/src",
+    "../third_party/length-based-batching-adapter/src",
+]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+venvPath = "/Users/zhuyin/miniconda3/envs"
+venv = "py312"

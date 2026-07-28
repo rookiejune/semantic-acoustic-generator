@@ -1,14 +1,22 @@
 # @package _global_
+defaults:
+  - override /backend: longcat
+  - override /datamodule: qwen_cross_text
+  - override /model: default
+  - override /model/route: fm
+  - override /loss: default
+  - override /pl_module: default
+  - override /runtime: default
+  - override /callback: default
+  - override /trainer: default
+  - _self_
 
 # Representative 32-sample fixed-speaker smoke. This is intentionally small,
 # but it exercises the real DataModule, checkpointing, resume, metrics, and
 # sample audio logging paths.
-codec: longcat
-route: fm
-output_subdir: smoke32/${codec}/${route}
+output_subdir: smoke32/${backend.name}/${model.route}
 
-data:
-  source: qwen_cross_text
+datamodule:
   root: ${oc.env:DYNAMIC_HOME}/debug/semantic-acoustic-codec/qwen-fixed-speaker-codec-32
   split: train
   sample_index: 0
@@ -21,27 +29,25 @@ data:
   persistent_workers: false
   lba:
     enabled: false
-
-train:
   fixed_batch: false
-  max_steps: 4
-
-sample:
-  enabled: true
-  every_n_train_steps: 2
-  seed: 0
 
 trainer:
   accelerator: gpu
   devices: 1
   strategy: auto
   precision: bf16-mixed
+  max_steps: 4
   max_epochs: -1
   log_every_n_steps: 1
-  enable_checkpointing: true
   gradient_clip_val: 1.0
 
-checkpoint:
-  save_last: true
-  save_top_k: -1
-  every_n_train_steps: 2
+callback:
+  sample:
+    enabled: true
+    every_n_train_steps: 2
+    seed: 0
+  checkpoint:
+    enabled: true
+    save_last: true
+    save_top_k: -1
+    every_n_train_steps: 2

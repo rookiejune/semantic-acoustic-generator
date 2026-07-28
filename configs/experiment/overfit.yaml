@@ -1,8 +1,20 @@
 # @package _global_
+defaults:
+  - override /backend: longcat
+  - override /datamodule: qwen_cross_text
+  - override /model: default
+  - override /model/route: fm
+  - override /loss: default
+  - override /pl_module: default
+  - override /runtime: default
+  - override /callback: default
+  - override /trainer: default
+  - _self_
 
 # Fixed-sample contract check for the generator, not a production preset.
-data:
-  source: qwen_cross_text
+output_subdir: overfit/${backend.name}/${model.route}-${model.decoder.layers}l
+
+datamodule:
   sample_index: 0
   sample_limit: 1
   batch_size: 1
@@ -11,26 +23,25 @@ data:
   persistent_workers: false
   lba:
     enabled: false
+  fixed_batch: true
 
-optimizer:
+pl_module:
   learning_rate: 1e-3
   weight_decay: 0.0
-
-train:
-  fixed_batch: true
-  max_steps: 20
 
 trainer:
   accelerator: gpu
   devices: 1
   strategy: auto
   precision: bf16-mixed
+  max_steps: 20
   max_epochs: -1
   log_every_n_steps: 1
-  enable_checkpointing: false
   gradient_clip_val: 1.0
 
-checkpoint:
-  save_last: true
-  save_top_k: -1
-  every_n_train_steps: 10
+callback:
+  checkpoint:
+    enabled: false
+    save_last: true
+    save_top_k: -1
+    every_n_train_steps: 10

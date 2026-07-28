@@ -108,8 +108,10 @@ class ReferenceConditioner(nn.Module):
         validate: bool = True,
     ) -> Tensor:
         if features is None:
-            if validate and (batch_size is None or batch_size < 1):
+            if batch_size is None:
                 raise ValueError("batch_size is required for the null reference.")
+            if validate and batch_size < 1:
+                raise ValueError("batch_size must be positive for the null reference.")
             if validate and (mask is not None or use_reference is not None):
                 raise ValueError("reference mask/presence require explicit reference features.")
             return self.null_condition.view(1, 1, -1).expand(batch_size, 1, -1)

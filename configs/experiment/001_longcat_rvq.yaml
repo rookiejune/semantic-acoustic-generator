@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - override /backend: longcat
+  - override /datamodule: qwen_cross_text
+  - override /model: default
+  - override /model/route: rvq
+  - override /loss: default
+  - override /pl_module: default
+  - override /runtime: default
+  - override /callback: default
+  - override /trainer: default
+  - _self_
+
+output_subdir: longcat/rvq-8l/fixed-speaker

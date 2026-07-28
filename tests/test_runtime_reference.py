@@ -210,7 +210,7 @@ def test_support_acoustic_sampling_accepts_optional_reference() -> None:
     assert not torch.allclose(without_condition, with_condition)
 
 
-def test_schema_six_artifact_roundtrip_defaults_missing_predictor_to_mtp(
+def test_schema_seven_artifact_roundtrip_defaults_missing_predictor_to_mtp(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -227,11 +227,15 @@ def test_schema_six_artifact_roundtrip_defaults_missing_predictor_to_mtp(
         acoustic_feature_dim=backend.acoustic_feature_dim,
         acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
     )
-    save_artifact(tmp_path, support, config)
+    save_artifact(tmp_path, support, config, backend=backend)
 
     config_path = tmp_path / "codec.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    assert data["schema_version"] == 6
+    assert data["schema_version"] == 7
+    assert data["backend"]["name"] == backend.name
+    assert data["backend"]["sample_rate"] == backend.sample_rate
+    assert data["backend"]["frame_rate"] == backend.frame_rate
+    assert data["backend"]["semantic_frame_rate"] == backend.semantic_frame_rate
     del data["config"]["decoder"]["rvq_predictor"]
     config_path.write_text(json.dumps(data), encoding="utf-8")
 

@@ -1,0 +1,37 @@
+# @package _global_
+defaults:
+  - override /backend: longcat
+  - override /datamodule: qwen_cross_text
+  - override /model: default
+  - override /model/route: fm
+  - override /loss: default
+  - override /pl_module: default
+  - override /runtime: default
+  - override /callback: default
+  - override /trainer: default
+  - _self_
+
+# One-epoch cross-text screening over source indices 0..983.
+output_subdir: screening/${backend.name}/${model.route}-${model.decoder.layers}l
+
+datamodule:
+  sample_limit: 984
+  overlong: filter
+  lba:
+    # Retains 980/984 pairs; the remaining four exceed 32 seconds.
+    max_batch_seconds: 32.0
+
+trainer:
+  max_steps: -1
+  max_epochs: 1
+  log_every_n_steps: 1
+
+callback:
+  sample:
+    every_n_train_steps: 50
+  performance:
+    log_every_n_steps: 10
+    warmup_steps: 10
+    measure_window_steps: 20
+  checkpoint:
+    every_n_train_steps: 50

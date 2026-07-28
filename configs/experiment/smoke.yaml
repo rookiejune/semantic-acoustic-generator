@@ -1,6 +1,19 @@
 # @package _global_
+defaults:
+  - override /backend: longcat
+  - override /datamodule: qwen_cross_text
+  - override /model: default
+  - override /model/route: fm
+  - override /loss: default
+  - override /pl_module: default
+  - override /runtime: default
+  - override /callback: default
+  - override /trainer: default
+  - _self_
 
-data:
+output_subdir: smoke/${backend.name}/${model.route}
+
+datamodule:
   sample_limit: 1
   max_seconds: 4.0
   overlong: truncate
@@ -11,16 +24,15 @@ data:
   lba:
     enabled: false
 
-train:
-  max_steps: 2
-
 trainer:
   accelerator: auto
   devices: 1
   strategy: auto
   precision: 32-true
+  max_steps: 2
   log_every_n_steps: 1
-  enable_checkpointing: false
 
-checkpoint:
-  every_n_train_steps: 1
+callback:
+  checkpoint:
+    enabled: false
+    every_n_train_steps: 1

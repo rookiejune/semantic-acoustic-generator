@@ -14,16 +14,23 @@ from semantic_acoustic_codec.model import (
     build_route,
 )
 from semantic_acoustic_codec.runtime import (
+    AcousticGeneratorArtifact,
+    AcousticGeneratorBackend,
+    AcousticGeneratorSpec,
     SamplingConfig,
     SemanticCodecRuntime,
     SemanticCodecSupport,
     SemanticSupportConfig,
     build_support,
     load_artifact,
+    load_generator_artifact,
     save_artifact,
 )
 
 __all__ = [
+    "AcousticGeneratorArtifact",
+    "AcousticGeneratorBackend",
+    "AcousticGeneratorSpec",
     "AcousticRVQDecoder",
     "CodecUnitGenerator",
     "DecoderLoss",
@@ -42,5 +49,6 @@ __all__ = [
     "build_support",
     "build_route",
     "load_artifact",
+    "load_generator_artifact",
     "save_artifact",
 ]

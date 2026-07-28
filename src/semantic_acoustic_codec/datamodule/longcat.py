@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Mapping, Sequence, Sized
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -65,6 +65,8 @@ class DataConfig:
     source: str = "qwen_cross_text"
     root: str | None = None
     split: str = "train"
+    validation_split: str | None = None
+    validation_sample_limit: int | None = None
     role: str = "target"
     speaker_id: str = "vivian"
     sample_index: int = 0
@@ -85,6 +87,13 @@ class DataConfig:
             )
         if not isinstance(self.split, str) or not self.split:
             raise ValueError("split must be a non-empty string.")
+        if self.validation_split is not None:
+            if not isinstance(self.validation_split, str) or not self.validation_split:
+                raise ValueError("validation_split must be a non-empty string or None.")
+            if self.validation_split == self.split:
+                raise ValueError("validation_split must differ from the training split.")
+        elif self.validation_sample_limit is not None:
+            raise ValueError("validation_sample_limit requires validation_split.")
         try:
             role = Role(self.role)
         except ValueError as error:
@@ -118,11 +127,15 @@ class DataConfig:
             if value < minimum:
                 qualifier = "positive" if minimum == 1 else "non-negative"
                 raise ValueError(f"{name} must be {qualifier}.")
-        if self.sample_limit is not None:
-            if isinstance(self.sample_limit, bool) or not isinstance(self.sample_limit, int):
-                raise TypeError("sample_limit must be an integer or None.")
-            if self.sample_limit <= 0:
-                raise ValueError("sample_limit must be positive.")
+        for name, value in (
+            ("sample_limit", self.sample_limit),
+            ("validation_sample_limit", self.validation_sample_limit),
+        ):
+            if value is not None:
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise TypeError(f"{name} must be an integer or None.")
+                if value <= 0:
+                    raise ValueError(f"{name} must be positive.")
         for name, value in (
             ("pin_memory", self.pin_memory),
             ("persistent_workers", self.persistent_workers),
@@ -152,41 +165,62 @@ class DataModule(pl.LightningDataModule):
         self.semantic_pad_id = semantic_pad_id
         self.acoustic_pad_ids = tuple(acoustic_pad_ids)
         self.dataset: Dataset[Any] | None = None
+        self.val_dataset: Dataset[Any] | None = None
+        self.validation_data: DataConfig | None = None
         self.filtered_samples = 0
+        self.validation_filtered_samples = 0
 
     def setup(self, stage: str | None = None) -> None:
         del stage
-        if self.dataset is not None:
-            return
-        data = self.data
+        if self.dataset is None:
+            self.dataset, self.filtered_samples = self._prepare_dataset(
+                self.data,
+                label="training",
+            )
+        if self.data.validation_split is not None and self.val_dataset is None:
+            self.validation_data = replace(
+                self.data,
+                split=self.data.validation_split,
+                validation_split=None,
+                sample_limit=self.data.validation_sample_limit,
+                validation_sample_limit=None,
+            )
+            self.val_dataset, self.validation_filtered_samples = self._prepare_dataset(
+                self.validation_data,
+                label="validation",
+            )
+
+    def _prepare_dataset(
+        self,
+        data: DataConfig,
+        *,
+        label: str,
+    ) -> tuple[Dataset[Any], int]:
         dataset = _dataset(data, codec=self.codec)
         sample_limit = data.sample_limit
         if sample_limit is not None:
             size = len(cast(Sized, cast(object, dataset)))
             dataset = Subset(dataset, range(min(sample_limit, size)))
+        filtered = 0
         if data.overlong == "filter":
-            dataset, self.filtered_samples = _filter(
+            dataset, filtered = _filter(
                 dataset,
                 data=data,
                 frame_rate=self.frame_rate,
             )
-            if self.filtered_samples:
+            if filtered:
                 max_seconds = _max_seconds(data)
                 if max_seconds is None:
                     raise RuntimeError("duration filtering requires a hard limit.")
                 warnings.warn(
-                    f"filtered {self.filtered_samples} semantic codec samples longer "
+                    f"filtered {filtered} {label} semantic codec samples longer "
                     f"than {max_seconds:g} seconds.",
                     stacklevel=2,
                 )
-        self.dataset = dataset
+        return dataset, filtered
 
-    def train_dataloader(self):
-        if self.dataset is None:
-            raise RuntimeError("semantic codec DataModule.setup() must run first.")
-        data = self.data
-        lba = data.lba
-        collate_fn = partial(
+    def _collate(self, data: DataConfig):
+        return partial(
             collate_samples,
             data=data,
             acoustic_layout=self.acoustic_layout,
@@ -194,6 +228,13 @@ class DataModule(pl.LightningDataModule):
             semantic_pad_id=self.semantic_pad_id,
             acoustic_pad_ids=self.acoustic_pad_ids,
         )
+
+    def train_dataloader(self):
+        if self.dataset is None:
+            raise RuntimeError("semantic codec DataModule.setup() must run first.")
+        data = self.data
+        lba = data.lba
+        collate_fn = self._collate(data)
         persistent_workers = data.persistent_workers and data.num_workers > 0
         if not lba.enabled:
             return DataLoader(
@@ -229,6 +270,49 @@ class DataModule(pl.LightningDataModule):
             drop_last_flush=lba.drop_last_flush,
             log_dir=self.output_dir / "lba",
         )
+
+    def val_dataloader(self) -> DataLoader[SemanticCodecBatch] | list[DataLoader[SemanticCodecBatch]]:
+        if self.data.validation_split is None:
+            return []
+        if self.val_dataset is None or self.validation_data is None:
+            raise RuntimeError("semantic codec DataModule.setup() must run first.")
+        data = self.validation_data
+        return DataLoader(
+            self.val_dataset,
+            batch_size=data.batch_size,
+            shuffle=False,
+            num_workers=data.num_workers,
+            pin_memory=data.pin_memory,
+            persistent_workers=data.persistent_workers and data.num_workers > 0,
+            collate_fn=self._collate(data),
+        )
+
+    def feature_stats_dataloader(self) -> DataLoader[SemanticCodecBatch]:
+        """Iterate the effective training subset once without shuffle or LBA dropping."""
+        if self.dataset is None:
+            raise RuntimeError("semantic codec DataModule.setup() must run first.")
+        data = self.data
+        return DataLoader(
+            self.dataset,
+            batch_size=data.batch_size,
+            shuffle=False,
+            num_workers=data.num_workers,
+            pin_memory=data.pin_memory,
+            persistent_workers=data.persistent_workers and data.num_workers > 0,
+            collate_fn=self._collate(data),
+        )
+
+    def sample_batch(self) -> SemanticCodecBatch:
+        """Load one fixed sample from the effective training subset."""
+        if self.dataset is None:
+            raise RuntimeError("semantic codec DataModule.setup() must run first.")
+        size = len(cast(Sized, cast(object, self.dataset)))
+        index = self.data.sample_index
+        if index >= size:
+            raise IndexError(
+                f"sample_index {index} is outside the effective training subset of {size} samples."
+            )
+        return self._collate(self.data)([self.dataset[index]])
 
 
 def load_codes(

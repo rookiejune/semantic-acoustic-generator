@@ -263,17 +263,17 @@ def _artifact_smoke(backend: FakeCodec, decoder: DecoderConfig) -> None:
         generator=_generator(0),
     )
     without_waveform = runtime.decode(
-        semantic,
-        mask=mask,
+        semantic[:1],
+        mask=mask[:1],
         reference_features=None,
         reference_mask=None,
         generator=_generator(1),
     )
     with_waveform = runtime.decode(
-        semantic,
-        mask=mask,
-        reference_features=reference_features,
-        reference_mask=reference_mask,
+        semantic[:1],
+        mask=mask[:1],
+        reference_features=reference_features[:1],
+        reference_mask=reference_mask[:1],
         generator=_generator(1),
     )
     expected_shape = (*semantic.shape[:2], backend.acoustic_feature_dim)
@@ -286,7 +286,7 @@ def _artifact_smoke(backend: FakeCodec, decoder: DecoderConfig) -> None:
         if waveform.dim() != 3 or not bool(torch.isfinite(waveform).all()):
             raise RuntimeError(f"artifact {name} smoke produced an invalid waveform.")
     with tempfile.TemporaryDirectory(prefix="semantic-acoustic-codec-") as tmp:
-        save_artifact(tmp, support, config)
+        save_artifact(tmp, support, config, backend=backend)
         loaded = load_artifact(tmp)
         loaded_without = loaded.sample_features(
             semantic,

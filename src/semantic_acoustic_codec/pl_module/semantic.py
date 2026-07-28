@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Generic, TypeVar
 
@@ -51,6 +51,7 @@ class SemanticCodecModule(LightningModule):
         learning_rate: float = 3e-4,
         weight_decay: float = 0.01,
         reference_dropout: float = 0.5,
+        validation_seed: int = 0,
         repa_teacher: Teacher | None = None,
     ) -> None:
         super().__init__()
@@ -62,6 +63,10 @@ class SemanticCodecModule(LightningModule):
             raise TypeError("reference_dropout must be a number.")
         if not math.isfinite(reference_dropout) or not 0 <= reference_dropout <= 1:
             raise ValueError("reference_dropout must be between 0 and 1.")
+        if isinstance(validation_seed, bool) or not isinstance(validation_seed, int):
+            raise TypeError("validation_seed must be an integer.")
+        if validation_seed < 0:
+            raise ValueError("validation_seed must be non-negative.")
         if support.route is not config.route:
             raise ValueError("module config route must match support route.")
         repa_weight = config.decoder.repa_loss_weight
@@ -85,6 +90,7 @@ class SemanticCodecModule(LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.reference_dropout = float(reference_dropout)
+        self.validation_seed = validation_seed
 
     @property
     def backend(self) -> SemanticAcousticCodec:
@@ -151,6 +157,38 @@ class SemanticCodecModule(LightningModule):
         result.update(output.extras)
         return result
 
+    @torch.no_grad()
+    def validation_step(self, batch: SemanticCodecBatch, batch_idx: int) -> dict[str, Tensor]:
+        reference_features = self._reference_features(batch)
+        reference_mask = None if reference_features is None else _reference_acoustic_mask(batch)
+        without = self._validation_error(
+            batch,
+            reference_features=None,
+            reference_mask=None,
+            generator=self._validation_generator(batch_idx),
+        )
+        suffix = "feature_mse" if self.support.route is Route.FM else "code_error"
+        metrics = {f"val/without_reference_{suffix}": without}
+        if reference_features is not None:
+            with_reference = self._validation_error(
+                batch,
+                reference_features=reference_features,
+                reference_mask=reference_mask,
+                generator=self._validation_generator(batch_idx),
+            )
+            metrics[f"val/with_reference_{suffix}"] = with_reference
+            metrics[f"val/reference_gain_{suffix}"] = without - with_reference
+        for name, value in metrics.items():
+            self.log(
+                name,
+                value,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch.semantic_codes.size(0),
+            )
+        return metrics
+
     def configure_optimizers(self):
         return torch.optim.AdamW(
             [parameter for parameter in self.support.parameters() if parameter.requires_grad],
@@ -194,7 +232,7 @@ class SemanticCodecModule(LightningModule):
             )
 
     def export_artifact(self, path: str | Path) -> None:
-        save_artifact(path, self.support, self.config)
+        save_artifact(path, self.support, self.config, backend=self.backend)
 
     def _normalized_features(self, batch: SemanticCodecBatch) -> Tensor:
         features = self._target_features(batch)
@@ -232,6 +270,46 @@ class SemanticCodecModule(LightningModule):
             return torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         return torch.rand(batch_size, device=self.device) >= self.reference_dropout
 
+    def _validation_generator(self, batch_idx: int) -> torch.Generator:
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(self.validation_seed + batch_idx)
+        return generator
+
+    def _validation_error(
+        self,
+        batch: SemanticCodecBatch,
+        *,
+        reference_features: Tensor | None,
+        reference_mask: Tensor | None,
+        generator: torch.Generator,
+    ) -> Tensor:
+        output_length = self.backend.acoustic_unit_length
+        if self.support.route is Route.FM:
+            prediction = self.support.sample_features(
+                batch.semantic_codes,
+                mask=batch.mask,
+                reference_features=reference_features,
+                reference_mask=reference_mask,
+                output_length=output_length,
+                generator=generator,
+            )
+            target = self._target_features(batch).to(
+                device=prediction.device,
+                dtype=prediction.dtype,
+            )
+            return _masked_mean((prediction - target).square().mean(dim=-1), _acoustic_mask(batch))
+        prediction = self.support.sample_acoustic_codes(
+            batch.semantic_codes,
+            mask=batch.mask,
+            reference_features=reference_features,
+            reference_mask=reference_mask,
+            output_length=output_length,
+            generator=generator,
+        )
+        target_codes = batch.acoustic_codes.to(device=prediction.device)
+        error = (prediction != target_codes).float().mean(dim=-1)
+        return _masked_mean(error, _acoustic_mask(batch))
+
     @torch.no_grad()
     def _target_features(self, batch: SemanticCodecBatch) -> Tensor:
         return masked_acoustic_features(
@@ -257,15 +335,22 @@ def build_module(
     sample: SemanticCodecBatch | None = None,
     *,
     normalize_features: bool = True,
+    feature_mean: tuple[float, ...] | None = None,
+    feature_std: tuple[float, ...] | None = None,
     learning_rate: float = 3e-4,
     weight_decay: float = 0.01,
     reference_dropout: float = 0.5,
+    validation_seed: int = 0,
     repa_teacher: Teacher | None = None,
 ) -> SemanticCodecModule:
     if normalize_features and config.route is not Route.RVQ:
-        if sample is None:
-            raise ValueError("feature normalization requires a representative sample batch.")
-        mean, std = feature_stats(backend, sample)
+        if (feature_mean is None) != (feature_std is None):
+            raise ValueError("feature_mean and feature_std must be provided together.")
+        if feature_mean is None or feature_std is None:
+            if sample is None:
+                raise ValueError("feature normalization requires dataset feature statistics.")
+            feature_mean, feature_std = feature_stats(backend, sample)
+        mean, std = feature_mean, feature_std
         config = replace(config, feature_mean=mean, feature_std=std)
     support = build_support(
         config,
@@ -282,6 +367,7 @@ def build_module(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         reference_dropout=reference_dropout,
+        validation_seed=validation_seed,
         repa_teacher=repa_teacher,
     )
 
@@ -302,6 +388,31 @@ def feature_stats(
     return _tuple(mean), _tuple(std)
 
 
+@torch.no_grad()
+def dataset_feature_stats(
+    backend: SemanticAcousticCodec,
+    batches: Iterable[SemanticCodecBatch],
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    total = torch.zeros(backend.acoustic_feature_dim, dtype=torch.float64)
+    squares = torch.zeros_like(total)
+    count = 0
+    for batch in batches:
+        mask = _acoustic_mask(batch)
+        target = masked_acoustic_features(backend, batch.acoustic_codes, mask).double()
+        valid = target[mask.to(device=target.device)]
+        if valid.numel() == 0:
+            continue
+        total += valid.sum(dim=0).cpu()
+        squares += valid.square().sum(dim=0).cpu()
+        count += valid.size(0)
+    if count == 0:
+        raise ValueError("feature stats require at least one valid acoustic unit.")
+    mean = total / count
+    variance = (squares / count - mean.square()).clamp_min(0)
+    std = variance.sqrt().clamp_min(1e-5)
+    return _tuple(mean), _tuple(std)
+
+
 def _acoustic_mask(batch: SemanticCodecBatch) -> Tensor:
     mask = batch.acoustic_mask
     if mask is None:
@@ -318,6 +429,11 @@ def _reference_acoustic_mask(batch: SemanticCodecBatch) -> Tensor:
 
 def _tuple(value: Tensor) -> tuple[float, ...]:
     return tuple(float(item) for item in value.detach().cpu())
+
+
+def _masked_mean(value: Tensor, mask: Tensor) -> Tensor:
+    aligned = mask.to(device=value.device)
+    return value[aligned].mean()
 
 
 def _freeze_backend(backend: SemanticAcousticCodec) -> None:
@@ -352,5 +468,6 @@ __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "SemanticCodecModule",
     "build_module",
+    "dataset_feature_stats",
     "feature_stats",
 ]

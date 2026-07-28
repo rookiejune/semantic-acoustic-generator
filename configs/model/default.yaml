@@ -1,0 +1,9 @@
+condition_dim: 1024
+decoder:
+  hidden_dim: null
+  layers: 8
+  heads: 8
+  ffn_ratio: 4
+  rvq_predictor: mtp
+  mtp_layers: 2
+  mtp_heads: 4

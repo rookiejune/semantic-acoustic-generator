@@ -52,22 +52,28 @@ python scripts/smoke.py \
 ```bash
 pytest
 ruff check .
+basedpyright
 ```
 
 ## 训练
 
-`scripts/train.py` 是 Hydra 训练入口。生产默认配置位于 `configs/train.yaml`，smoke/overfit 配置位于
-`configs/experiment/`：
+`scripts/train.py` 是 Hydra 训练入口。`configs/backend`、`datamodule`、`model`、`loss`、
+`pl_module`、`runtime` 和 `callback` 对应 `src/semantic_acoustic_codec` 的模块边界；
+`configs/experiment/` 显式组合这些 preset 并持有数据范围与训练预算：
 
 ```bash
 # 最小真实 DataModule smoke
 python scripts/train.py experiment=smoke
 
 # 固定 pair overfit
-python scripts/train.py experiment=overfit codec=longcat route=fm
+python scripts/train.py experiment=overfit backend=longcat model/route=fm
+
+# 984-pair screening；FLOPs calibration 时显式追加 callback.performance.profile_flops=true
+python scripts/train.py experiment=screening backend=longcat model/route=fm
 ```
 
-四条常用路线也有 job wrapper：
+四条正式路线分别由 `experiment=001_longcat_fm|001_longcat_rvq|001_bicodec_fm|001_bicodec_rvq`
+完整组合，也有对应的 job wrapper：
 
 ```text
 jobs/001/01_longcat_dit.sh
@@ -79,6 +85,11 @@ jobs/001/04_bicodec_rvq.sh
 训练输出目录默认由 `SEMANTIC_ACOUSTIC_CODEC_TRAIN_ROOT` 和 `output_subdir` 决定，也可以用
 `output_dir=/path/to/output` 覆盖。启用 checkpoint 时，周期 checkpoint 位于
 `<output>/checkpoints/`，训练结束导出的 runtime artifact 位于 `<output>/artifact/`。
+
+FM 正式训练的 feature normalization 会遍历有效训练 subset 计算；不会只使用固定示例或首个 batch。
+需要 held-out 验证时设置 `datamodule.validation_split=<split>`，并可用
+`datamodule.validation_sample_limit=<count>` 限制固定评估集。验证以固定顺序分别记录有/无 reference 的
+FM feature MSE 或 RVQ code error。
 
 ## Artifact 评估
 
@@ -94,9 +105,16 @@ python scripts/eval_artifact.py \
   --with-reference-wav /tmp/with-reference.wav
 ```
 
-artifact 目录只包含 `codec.json` 和 `model.ckpt`；`codec.json` 内保存 schema、generator 配置、backend
+artifact 目录只包含 `codec.json` 和 `model.ckpt`；当前 schema 为 `7`，`codec.json` 内保存 generator 配置、backend
 兼容性 metadata、sampling 和 feature normalization。`SemanticCodecRuntime` 负责加载 artifact、生成缺失
 acoustic units 并调用 backend 解码 waveform。
+
+`callback.performance.profile_flops=true` 会通过 anytrain 对真实 train batch 统计动态 FLOPs，用于短
+calibration。该模式有 profiler 开销；生产 timing run 保持关闭，并显式传入 calibration 得到的
+`callback.performance.model_flops_per_step`，不能把 profiled step time 当作生产吞吐。
+
+frame-aligned waveform decode 会裁掉连续的右侧 padding；一个 batch 内的有效 semantic 长度必须相同，
+不同长度的请求需要先分组或逐行 decode。
 
 ## 当前状态
 

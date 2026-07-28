@@ -12,7 +12,7 @@ from anydataset.types import (
     TextMeta,
     TextView,
 )
-from anytrain.codec import AcousticLayout
+from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
 from semantic_acoustic_codec.datamodule import DataConfig, DataModule, LBAConfig
 from semantic_acoustic_codec.datamodule import qwen as qwen_data
@@ -24,6 +24,9 @@ def test_data_config_defaults_to_cross_text_grid_column() -> None:
     assert data.source == "qwen_cross_text"
     assert data.role == "target"
     assert data.speaker_id == "vivian"
+    assert data.validation_split is None
+    with pytest.raises(ValueError, match="requires validation_split"):
+        DataConfig(validation_sample_limit=2)
 
 
 def test_qwen_fixed_speaker_source_batches_fixed_length_units(
@@ -99,6 +102,94 @@ def test_qwen_cross_text_source_batches_explicit_pair_and_metadata(
     }
 
 
+def test_qwen_pair_dataset_construction_does_not_load_codec_samples() -> None:
+    codes = SemanticAcousticCodes(
+        semantic=torch.ones(2, 1, dtype=torch.long),
+        acoustic=torch.ones(2, 1, dtype=torch.long),
+    )
+    samples = [
+        qwen_data.QwenCodecSample(
+            index=index,
+            text_index=index,
+            source_index=index,
+            role=Role.TARGET,
+            utterance_id=f"utterance-{index}",
+            speaker_id="vivian",
+            text=f"text {index}",
+            codes=codes,
+        )
+        for index in range(2)
+    ]
+
+    class CountingSource:
+        def __init__(self) -> None:
+            self.loads: list[int] = []
+
+        def __len__(self) -> int:
+            return len(samples)
+
+        def __getitem__(self, index: int) -> qwen_data.QwenCodecSample:
+            self.loads.append(index)
+            return samples[index]
+
+    source = CountingSource()
+    pairs = qwen_data.QwenCodecPairDataset(source)  # type: ignore[arg-type]
+
+    assert source.loads == []
+    pair = pairs[0]
+    assert source.loads == [0, 1]
+    assert pair.target.text != pair.reference.text
+
+
+def test_datamodule_exposes_deterministic_held_out_split(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grids = {
+        "train": _grid(
+            [
+                ("train zero", torch.ones(2, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
+                ("train one", torch.ones(2, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
+            ]
+        ),
+        "heldout": _grid(
+            [
+                ("heldout zero", torch.ones(2, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
+                ("heldout one", torch.ones(2, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
+            ]
+        ),
+    }
+    monkeypatch.setattr(
+        qwen_data,
+        "qwen_tts_speaker_codec_grid",
+        lambda **kwargs: grids[kwargs["split"]],
+    )
+    data = DataConfig(
+        source="qwen_cross_text",
+        root=str(tmp_path / "prepared"),
+        validation_split="heldout",
+        validation_sample_limit=2,
+        batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        lba=LBAConfig(enabled=False),
+    )
+    module = _module(data, tmp_path)
+
+    module.setup("fit")
+    first = next(iter(module.val_dataloader()))
+    second = next(iter(module.val_dataloader()))
+
+    assert module.validation_data is not None
+    assert module.validation_data.split == "heldout"
+    assert [item.target_text for item in first.metadata] == [
+        "heldout zero",
+        "heldout one",
+    ]
+    assert first.metadata == second.metadata
+
+
 def test_qwen_cross_text_filter_checks_target_and_reference_raw_lengths(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -128,11 +219,13 @@ def test_qwen_cross_text_filter_checks_target_and_reference_raw_lengths(
     with pytest.warns(UserWarning, match="filtered 3"):
         module.setup()
     batch = next(iter(module.train_dataloader()))
+    fixed = module.sample_batch()
 
     assert module.filtered_samples == 3
     assert len(batch.metadata) == 1
     assert batch.metadata[0].target_text == "text zero"
     assert batch.metadata[0].reference_text == "text one"
+    assert fixed.metadata == batch.metadata
 
 
 def _module(data: DataConfig, tmp_path, *, frame_rate: float = 50.0) -> DataModule:

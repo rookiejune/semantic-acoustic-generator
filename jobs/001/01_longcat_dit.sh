@@ -10,8 +10,5 @@ export PYTHONUNBUFFERED=1
 
 echo '{"event":"job.launch","project":"semantic-acoustic-codec","experiment":"001","codec":"longcat","route":"dit"}'
 "${SEMANTIC_ACOUSTIC_CODEC_PYTHON}" scripts/train.py \
-    codec=longcat \
-    route=fm \
-    data.source=qwen_cross_text \
-    output_subdir=longcat/dit-8l/fixed-speaker \
+    experiment=001_longcat_fm \
     "$@"

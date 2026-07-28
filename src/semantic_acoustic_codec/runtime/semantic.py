@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional, Protocol, cast, runtime_checkable
 
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodec
@@ -17,9 +18,14 @@ from semantic_acoustic_codec.config import (
     Route,
     RVQPredictor,
 )
+from semantic_acoustic_codec.model.decoder import (
+    CodecUnitGenerator,
+    FMFeatureGenerator,
+    RVQCodeGenerator,
+)
 from semantic_acoustic_codec.model.routes import RouteModules, build_route
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 CONFIG_NAME = "codec.json"
 CHECKPOINT_NAME = "model.ckpt"
 
@@ -65,6 +71,78 @@ class SemanticSupportConfig:
             raise ValueError("feature_std values must be positive.")
 
 
+@runtime_checkable
+class AcousticGeneratorBackend(Protocol):
+    """Backend metadata required when reusing only an acoustic generator."""
+
+    @property
+    def acoustic_feature_dim(self) -> int: ...
+
+    @property
+    def acoustic_codebook_sizes(self) -> tuple[int, ...]: ...
+
+    @property
+    def acoustic_layout(self) -> AcousticLayout: ...
+
+    @property
+    def acoustic_unit_length(self) -> int | None: ...
+
+
+@dataclass(frozen=True)
+class AcousticGeneratorSpec:
+    """Portable decoder contract consumed by external condition producers."""
+
+    route: Route
+    condition_dim: int
+    decoder: DecoderConfig
+    backend_name: str
+    sample_rate: int
+    frame_rate: float
+    semantic_frame_rate: float
+    semantic_vocab_size: int
+    semantic_embedding_dim: int
+    acoustic_feature_dim: int
+    acoustic_codebook_sizes: tuple[int, ...]
+    acoustic_layout: AcousticLayout
+    acoustic_unit_length: int | None
+    feature_mean: tuple[float, ...]
+    feature_std: tuple[float, ...]
+    sampling: SamplingConfig
+
+    def validate_backend(self, backend: SemanticAcousticCodec) -> None:
+        _validate_backend_metadata(self.backend_metadata(), backend)
+
+    def validate_acoustic_backend(self, backend: AcousticGeneratorBackend) -> None:
+        _validate_acoustic_backend_metadata(self.acoustic_backend_metadata(), backend)
+
+    def backend_metadata(self) -> dict[str, object]:
+        return {
+            "name": self.backend_name,
+            "sample_rate": self.sample_rate,
+            "frame_rate": self.frame_rate,
+            "semantic_frame_rate": self.semantic_frame_rate,
+            "semantic_vocab_size": self.semantic_vocab_size,
+            "semantic_embedding_dim": self.semantic_embedding_dim,
+            **self.acoustic_backend_metadata(),
+        }
+
+    def acoustic_backend_metadata(self) -> dict[str, object]:
+        return {
+            "acoustic_feature_dim": self.acoustic_feature_dim,
+            "acoustic_codebook_sizes": list(self.acoustic_codebook_sizes),
+            "acoustic_layout": self.acoustic_layout.value,
+            "acoustic_unit_length": self.acoustic_unit_length,
+        }
+
+
+@dataclass(frozen=True)
+class AcousticGeneratorArtifact:
+    """Loaded generator plus the condition and backend contract of its weights."""
+
+    generator: CodecUnitGenerator
+    spec: AcousticGeneratorSpec
+
+
 class SemanticCodecSupport(nn.Module):
     """Trainable semantic-to-acoustic unit generator with no codec ownership."""
 
@@ -78,6 +156,7 @@ class SemanticCodecSupport(nn.Module):
         sampling: SamplingConfig | None = None,
         feature_mean: Tensor | None = None,
         feature_std: Tensor | None = None,
+        artifact_backend_metadata: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
         if acoustic_feature_dim <= 0:
@@ -98,6 +177,9 @@ class SemanticCodecSupport(nn.Module):
         self.acoustic_layout = acoustic_layout
         self.acoustic_unit_length = acoustic_unit_length
         self.sampling = SamplingConfig() if sampling is None else sampling
+        self.artifact_backend_metadata = (
+            None if artifact_backend_metadata is None else dict(artifact_backend_metadata)
+        )
         self.feature_mean = nn.Buffer(_feature_stat(acoustic_feature_dim, feature_mean, fill=0.0))
         self.feature_std = nn.Buffer(_feature_stat(acoustic_feature_dim, feature_std, fill=1.0))
 
@@ -291,7 +373,11 @@ class SemanticCodecRuntime:
     ) -> None:
         self.support = support
         self.backend = backend
-        _validate_backend_metadata(_support_metadata(support), backend)
+        metadata = support.artifact_backend_metadata
+        if metadata is None:
+            _validate_support_metadata(_support_metadata(support), backend)
+        else:
+            _validate_backend_metadata(metadata, backend)
 
     @property
     def sample_rate(self) -> int:
@@ -355,6 +441,7 @@ class SemanticCodecRuntime:
         generator: torch.Generator | None = None,
     ) -> Tensor:
         prepared, frame_mask = self.support._semantic_input(semantic_codes, mask)
+        prepared, frame_mask = _trim_decode_input(prepared, frame_mask)
         features = self.sample_features(
             prepared,
             mask=frame_mask,
@@ -362,28 +449,37 @@ class SemanticCodecRuntime:
             reference_mask=reference_mask,
             generator=generator,
         )
-        # The support uses its private pad id for masked positions; codec backends
-        # only accept real semantic ids, so make padding safe at this boundary.
-        backend_semantic = prepared.masked_fill(~frame_mask[..., None], 0)
-        return self.backend.decode_features(backend_semantic, features)
+        return self.backend.decode_features(prepared, features)
 
     @torch.no_grad()
-    def decode_features(self, semantic_codes: Tensor, features: Tensor) -> Tensor:
-        prepared, _ = self.support._semantic_input(semantic_codes, None)
+    def decode_features(
+        self,
+        semantic_codes: Tensor,
+        features: Tensor,
+        *,
+        mask: Tensor | None = None,
+    ) -> Tensor:
+        prepared, frame_mask = self.support._semantic_input(semantic_codes, mask)
+        if features.dim() != 3 or features.size(0) != prepared.size(0):
+            raise ValueError("features must have shape [B, acoustic_unit, D].")
+        if features.size(-1) != self.support.acoustic_feature_dim:
+            raise ValueError("features must match support acoustic_feature_dim.")
+        original_length = prepared.size(1)
+        prepared, frame_mask = _trim_decode_input(prepared, frame_mask)
+        if self.support.acoustic_layout is AcousticLayout.FRAME_ALIGNED:
+            if features.size(1) != original_length:
+                raise ValueError("frame-aligned features must match the padded semantic length.")
+            features = features[:, : prepared.size(1)]
         expected_length = (
             prepared.size(1)
             if self.support.acoustic_layout is AcousticLayout.FRAME_ALIGNED
             else self.support.acoustic_unit_length
         )
-        if features.dim() != 3 or features.size(0) != prepared.size(0):
-            raise ValueError("features must have shape [B, acoustic_unit, D].")
         if expected_length is None or features.size(1) != expected_length:
             raise ValueError(
                 "features must align with the backend acoustic unit length "
                 f"{expected_length}, got {features.size(1)}."
             )
-        if features.size(-1) != self.support.acoustic_feature_dim:
-            raise ValueError("features must match support acoustic_feature_dim.")
         return self.backend.decode_features(prepared, features)
 
 
@@ -395,6 +491,7 @@ def build_support(
     acoustic_codebook_sizes: tuple[int, ...],
     acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
     acoustic_unit_length: int | None = None,
+    artifact_backend_metadata: Mapping[str, object] | None = None,
 ) -> SemanticCodecSupport:
     modules = build_route(
         config.route,
@@ -418,21 +515,28 @@ def build_support(
         sampling=config.sampling,
         feature_mean=mean,
         feature_std=std,
+        artifact_backend_metadata=artifact_backend_metadata,
     )
 
 
-def save_artifact(path: str | Path, support: SemanticCodecSupport, config: SemanticSupportConfig) -> None:
+def save_artifact(
+    path: str | Path,
+    support: SemanticCodecSupport,
+    config: SemanticSupportConfig,
+    *,
+    backend: SemanticAcousticCodec,
+) -> None:
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     if config.route is not support.route:
         raise ValueError("artifact config route must match support route.")
+    metadata = _backend_metadata(support, backend)
+    _validate_backend_metadata(metadata, backend)
     torch.save(support.state_dict(), root / CHECKPOINT_NAME)
     data = {
         "schema_version": SCHEMA_VERSION,
         "config": _config_dict(config),
-        "backend": {
-            **_support_metadata(support),
-        },
+        "backend": metadata,
         "checkpoint": CHECKPOINT_NAME,
     }
     (root / CONFIG_NAME).write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
@@ -443,12 +547,51 @@ def load_artifact(
     *,
     device: str | torch.device | None = None,
 ) -> SemanticCodecSupport:
-    root = Path(path)
-    data = json.loads((root / CONFIG_NAME).read_text(encoding="utf-8"))
-    if data.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"unsupported semantic codec schema: {data.get('schema_version')!r}")
-    backend_data = cast(Mapping[str, object], data["backend"])
-    config = _config(data["config"])
+    support, _ = _load_artifact(path, device=device)
+    return support
+
+
+def load_generator_artifact(
+    path: str | Path,
+    *,
+    device: str | torch.device | None = None,
+) -> AcousticGeneratorArtifact:
+    """Load the reusable acoustic generator and its strict input contract."""
+    checkpoint, metadata, config = _artifact(path)
+    generator = _generator(config, metadata)
+    if device is not None:
+        generator.to(device=device)
+    state = _load_state(checkpoint, device=device)
+    generator.load_state_dict(_generator_state(state))
+    generator.eval()
+    acoustic_feature_dim = _metadata_int(metadata, "acoustic_feature_dim")
+    spec = AcousticGeneratorSpec(
+        route=config.route,
+        condition_dim=config.condition_dim,
+        decoder=config.decoder,
+        backend_name=_metadata_string(metadata, "name"),
+        sample_rate=_metadata_int(metadata, "sample_rate"),
+        frame_rate=_metadata_float(metadata, "frame_rate"),
+        semantic_frame_rate=_metadata_float(metadata, "semantic_frame_rate"),
+        semantic_vocab_size=_metadata_int(metadata, "semantic_vocab_size"),
+        semantic_embedding_dim=_metadata_int(metadata, "semantic_embedding_dim"),
+        acoustic_feature_dim=acoustic_feature_dim,
+        acoustic_codebook_sizes=_metadata_sizes(metadata),
+        acoustic_layout=AcousticLayout(str(metadata["acoustic_layout"])),
+        acoustic_unit_length=_metadata_optional_int(metadata, "acoustic_unit_length"),
+        feature_mean=_feature_values(config.feature_mean, acoustic_feature_dim, fill=0.0),
+        feature_std=_feature_values(config.feature_std, acoustic_feature_dim, fill=1.0),
+        sampling=config.sampling,
+    )
+    return AcousticGeneratorArtifact(generator=generator, spec=spec)
+
+
+def _load_artifact(
+    path: str | Path,
+    *,
+    device: str | torch.device | None,
+) -> tuple[SemanticCodecSupport, SemanticSupportConfig]:
+    checkpoint, backend_data, config = _artifact(path)
     support = build_support(
         config,
         semantic_codebook=torch.zeros(
@@ -459,13 +602,76 @@ def load_artifact(
         acoustic_codebook_sizes=_metadata_sizes(backend_data),
         acoustic_layout=AcousticLayout(str(backend_data["acoustic_layout"])),
         acoustic_unit_length=_metadata_optional_int(backend_data, "acoustic_unit_length"),
+        artifact_backend_metadata=backend_data,
     )
-    state = _load_state(root / str(data.get("checkpoint", CHECKPOINT_NAME)), device=device)
+    state = _load_state(checkpoint, device=device)
     support.load_state_dict(state)
     if device is not None:
         support.to(device=device)
     support.eval()
-    return support
+    return support, config
+
+
+def _artifact(
+    path: str | Path,
+) -> tuple[Path, Mapping[str, object], SemanticSupportConfig]:
+    root = Path(path)
+    data = json.loads((root / CONFIG_NAME).read_text(encoding="utf-8"))
+    if not isinstance(data, Mapping):
+        raise TypeError("semantic codec config must contain a mapping.")
+    if data.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"unsupported semantic codec schema: {data.get('schema_version')!r}")
+    backend = data.get("backend")
+    if not isinstance(backend, Mapping):
+        raise TypeError("semantic codec backend metadata must be a mapping.")
+    raw_config = data.get("config")
+    if not isinstance(raw_config, Mapping):
+        raise TypeError("semantic codec config metadata must be a mapping.")
+    checkpoint = data.get("checkpoint", CHECKPOINT_NAME)
+    if not isinstance(checkpoint, str) or not checkpoint:
+        raise TypeError("semantic codec checkpoint must be a non-empty string.")
+    return root / checkpoint, cast(Mapping[str, object], backend), _config(raw_config)
+
+
+def _generator(
+    config: SemanticSupportConfig,
+    metadata: Mapping[str, object],
+) -> CodecUnitGenerator:
+    acoustic_feature_dim = _metadata_int(metadata, "acoustic_feature_dim")
+    acoustic_codebook_sizes = _metadata_sizes(metadata)
+    layout = AcousticLayout(str(metadata["acoustic_layout"]))
+    fixed_length = (
+        _metadata_optional_int(metadata, "acoustic_unit_length")
+        if layout is AcousticLayout.FIXED_LENGTH
+        else None
+    )
+    if config.route is Route.FM:
+        return FMFeatureGenerator(
+            config.condition_dim,
+            acoustic_feature_dim,
+            config.decoder,
+            fixed_length=fixed_length,
+        )
+    if config.route is Route.RVQ:
+        return RVQCodeGenerator(
+            config.condition_dim,
+            acoustic_codebook_sizes,
+            config.decoder,
+            fixed_length=fixed_length,
+        )
+    raise AssertionError(f"unsupported route: {config.route}")
+
+
+def _generator_state(state: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    prefix = "generator."
+    result = {
+        key[len(prefix) :]: value
+        for key, value in state.items()
+        if key.startswith(prefix)
+    }
+    if not result:
+        raise RuntimeError("semantic codec checkpoint is missing generator state.")
+    return result
 
 
 def _load_state(path: Path, *, device: str | torch.device | None) -> Mapping[str, Tensor]:
@@ -534,6 +740,20 @@ def _feature_stat(acoustic_feature_dim: int, value: Tensor | None, *, fill: floa
     return value.detach().clone()
 
 
+def _feature_values(
+    value: tuple[float, ...] | None,
+    acoustic_feature_dim: int,
+    *,
+    fill: float,
+) -> tuple[float, ...]:
+    values = (fill,) * acoustic_feature_dim if value is None else value
+    if len(values) != acoustic_feature_dim:
+        raise ValueError("feature normalization must match backend acoustic_feature_dim.")
+    if any(not math.isfinite(item) for item in values):
+        raise ValueError("feature normalization values must be finite.")
+    return values
+
+
 def _float_tuple(value: object) -> tuple[float, ...] | None:
     if value is None:
         return None
@@ -557,13 +777,65 @@ def _support_metadata(support: SemanticCodecSupport) -> dict[str, object]:
     }
 
 
+def _backend_metadata(
+    support: SemanticCodecSupport,
+    backend: SemanticAcousticCodec,
+) -> dict[str, object]:
+    return {
+        "name": backend.name,
+        "sample_rate": backend.sample_rate,
+        "frame_rate": float(backend.frame_rate),
+        "semantic_frame_rate": float(backend.semantic_frame_rate),
+        **_support_metadata(support),
+    }
+
+
 def _validate_backend_metadata(
     data: Mapping[str, object],
     backend: SemanticAcousticCodec,
 ) -> None:
     expected = {
+        "name": backend.name,
+        "sample_rate": backend.sample_rate,
+        "frame_rate": float(backend.frame_rate),
+        "semantic_frame_rate": float(backend.semantic_frame_rate),
+        **_expected_support_metadata(backend),
+    }
+    _validate_metadata(data, expected)
+
+
+def _validate_support_metadata(
+    data: Mapping[str, object],
+    backend: SemanticAcousticCodec,
+) -> None:
+    _validate_metadata(data, _expected_support_metadata(backend))
+
+
+def _expected_support_metadata(backend: SemanticAcousticCodec) -> dict[str, object]:
+    return {
         "semantic_vocab_size": int(backend.semantic_codebook.size(0)),
         "semantic_embedding_dim": int(backend.semantic_codebook.size(1)),
+        "acoustic_feature_dim": backend.acoustic_feature_dim,
+        "acoustic_codebook_sizes": list(backend.acoustic_codebook_sizes),
+        "acoustic_layout": backend.acoustic_layout.value,
+        "acoustic_unit_length": backend.acoustic_unit_length,
+    }
+
+
+def _validate_metadata(
+    data: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> None:
+    for key, value in expected.items():
+        if data.get(key) != value:
+            raise ValueError(f"backend metadata mismatch for {key}: {data.get(key)!r} != {value!r}")
+
+
+def _validate_acoustic_backend_metadata(
+    data: Mapping[str, object],
+    backend: AcousticGeneratorBackend,
+) -> None:
+    expected = {
         "acoustic_feature_dim": backend.acoustic_feature_dim,
         "acoustic_codebook_sizes": list(backend.acoustic_codebook_sizes),
         "acoustic_layout": backend.acoustic_layout.value,
@@ -578,6 +850,22 @@ def _metadata_int(data: Mapping[str, object], key: str) -> int:
     value = data.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"artifact backend metadata {key!r} must be an integer.")
+    return value
+
+
+def _metadata_float(data: Mapping[str, object], key: str) -> float:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"artifact backend metadata {key!r} must be a number.")
+    if value <= 0:
+        raise ValueError(f"artifact backend metadata {key!r} must be positive.")
+    return float(value)
+
+
+def _metadata_string(data: Mapping[str, object], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"artifact backend metadata {key!r} must be a non-empty string.")
     return value
 
 
@@ -599,3 +887,16 @@ def _metadata_optional_int(data: Mapping[str, object], key: str) -> int | None:
     if value <= 0:
         raise ValueError(f"artifact backend metadata {key!r} must be positive.")
     return value
+
+
+def _trim_decode_input(semantic: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+    lengths = mask.sum(dim=1)
+    if not bool((lengths == lengths[0]).all()):
+        raise ValueError(
+            "waveform decode requires equal valid semantic lengths; group or decode rows separately."
+        )
+    length = int(lengths[0])
+    expected = torch.arange(mask.size(1), device=mask.device)[None] < lengths[:, None]
+    if not torch.equal(mask, expected):
+        raise ValueError("waveform decode mask must describe contiguous right padding.")
+    return semantic[:, :length].contiguous(), mask[:, :length].contiguous()

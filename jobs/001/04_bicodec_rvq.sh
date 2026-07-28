@@ -10,9 +10,5 @@ export PYTHONUNBUFFERED=1
 
 echo '{"event":"job.launch","project":"semantic-acoustic-codec","experiment":"001","codec":"bicodec","route":"rvq"}'
 "${SEMANTIC_ACOUSTIC_CODEC_PYTHON}" scripts/train.py \
-    codec=bicodec \
-    route=rvq \
-    data.source=qwen_cross_text \
-    decoder.rvq_predictor=mtp \
-    output_subdir=bicodec/rvq-8l/fixed-speaker \
+    experiment=001_bicodec_rvq \
     "$@"
