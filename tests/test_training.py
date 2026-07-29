@@ -246,7 +246,7 @@ def test_lightning_runs_anydataset_dynamic_loader_across_epochs() -> None:
 
     dataset = Dataset()
     loader = dataset.dataloader(
-        cost_fn=lambda _index: 1,
+        costs=1,
         max_batch_memory=2,
         max_batch_samples=2,
         shuffle=True,

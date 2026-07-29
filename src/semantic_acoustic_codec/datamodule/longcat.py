@@ -162,9 +162,6 @@ class _PreparedDataset(MapStyleABC):
     def __getitem__(self, index: int) -> Any:
         return self.source[self.indexes[index]]
 
-    def cost(self, index: int) -> int:
-        return self.costs[index]
-
 
 class DataModule(pl.LightningDataModule):
     def __init__(
@@ -281,7 +278,7 @@ class DataModule(pl.LightningDataModule):
                 collate_fn=collate_fn,
             )
         return self.dataset.dataloader(
-            cost_fn=self.dataset.cost,
+            costs=self.dataset.costs,
             max_batch_memory=_frames(batching.max_batch_seconds, self.frame_rate),
             max_batch_samples=data.batch_size,
             planning_window=batching.planning_window,
