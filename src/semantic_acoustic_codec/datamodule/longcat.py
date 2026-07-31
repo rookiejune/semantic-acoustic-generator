@@ -14,11 +14,8 @@ from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 from lightning import pytorch as pl
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
-from zhuyin.datasets.wmt19_tts import wmt19_tts_codec
 
 from semantic_acoustic_codec.backend.longcat import batch_codes
-from semantic_acoustic_codec.backend.longcat import codes as longcat_codes
-from semantic_acoustic_codec.backend.longcat import split_codes as split_longcat_codes
 from semantic_acoustic_codec.datamodule.qwen import (
     QwenCodecColumnDataset,
     QwenCodecPairDataset,
@@ -76,10 +73,10 @@ class DataConfig:
     batching: BatchingConfig = field(default_factory=BatchingConfig)
 
     def __post_init__(self) -> None:
-        if self.source not in {"wmt19_tts_codec", "qwen_fixed_speaker", "qwen_cross_text"}:
+        if self.source not in {"qwen_fixed_speaker", "qwen_cross_text"}:
             raise NotImplementedError(
                 f"data.source={self.source!r} is not wired yet; supported sources are "
-                "'wmt19_tts_codec', 'qwen_fixed_speaker', and 'qwen_cross_text'."
+                "'qwen_fixed_speaker' and 'qwen_cross_text'."
             )
         if not isinstance(self.split, str) or not self.split:
             raise ValueError("split must be a non-empty string.")
@@ -567,15 +564,6 @@ def _path(value: str | None) -> Path | None:
 
 
 def _dataset(data: DataConfig, *, codec: str) -> Dataset[Any]:
-    if data.source == "wmt19_tts_codec":
-        return cast(
-            Dataset[Any],
-            wmt19_tts_codec(
-                codec="longcat",
-                root=_path(data.root),
-                split=data.split,
-            ),
-        )
     column = QwenCodecColumnDataset(
         codec=codec,
         root=_path(data.root),
@@ -598,9 +586,6 @@ def _sample_codes(
     *,
     source: str,
 ) -> SemanticAcousticCodes:
-    if source == "wmt19_tts_codec":
-        semantic, acoustic = split_longcat_codes(longcat_codes(cast(Mapping[Any, Any], sample)))
-        return SemanticAcousticCodes(semantic=semantic, acoustic=acoustic)
     if source == "qwen_fixed_speaker":
         if not isinstance(sample, QwenCodecSample):
             raise TypeError("qwen_fixed_speaker samples must use QwenCodecSample.")

@@ -9,10 +9,7 @@ from anydataset.types import AudioView, Role
 from anytrain.codec import SemanticAcousticCodes
 from torch import Tensor
 from torch.utils.data import Dataset
-from zhuyin.datasets.qwen_tts_speech import (
-    QwenCodec,
-    qwen_tts_speaker_codec_grid,
-)
+from zhuyin.datasets.wmt19 import qwen_tts
 
 from semantic_acoustic_codec.backend.longcat import split_codes as split_longcat_codes
 
@@ -43,24 +40,24 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
     def __init__(
         self,
         *,
-        codec: QwenCodec | str,
+        codec: qwen_tts.Codec | str,
         root: str | PathLike[str] | None,
         split: str,
         role: Role,
         speaker_id: str,
     ) -> None:
         super().__init__()
-        self.codec = QwenCodec(codec)
+        self.codec = qwen_tts.Codec(codec)
         self.view = (
             AudioView.BICODEC
-            if self.codec is QwenCodec.BICODEC
+            if self.codec is qwen_tts.Codec.BICODEC
             else AudioView.LONGCAT
         )
-        self.grid = qwen_tts_speaker_codec_grid(
+        self.grid = qwen_tts.speaker_grid(
             codec=self.codec,
             root=root,
             split=split,
-        )
+        ).load()
         self.split = split
         self.role = role
         if speaker_id not in self.grid.speaker_ids:
@@ -144,17 +141,17 @@ class QwenCodecPairDataset(Dataset[QwenCodecPairSample]):
 
 def _codes(
     value: object,
-    codec: QwenCodec,
+    codec: qwen_tts.Codec,
     lengths: Tensor,
 ) -> SemanticAcousticCodes:
     length = int(lengths[0, 0].item())
-    if codec is QwenCodec.LONGCAT:
+    if codec is qwen_tts.Codec.LONGCAT:
         if not isinstance(value, Tensor):
             raise TypeError("Qwen LongCat view must be a Tensor.")
         combined = value[0, 0, :length].contiguous()
         semantic, acoustic = split_longcat_codes(combined)
         return SemanticAcousticCodes(semantic=semantic, acoustic=acoustic)
-    if codec is QwenCodec.BICODEC:
+    if codec is qwen_tts.Codec.BICODEC:
         if not isinstance(value, Mapping):
             raise TypeError("Qwen BiCodec view must be a semantic/acoustic mapping.")
         fields = cast(Mapping[str, Any], value)

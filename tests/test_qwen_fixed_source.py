@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from anydataset.dataset import SpeakerAudioGrid, SpeakerAudioRow
+from anydataset.dataset.speaker import SpeakerAudioGrid, SpeakerAudioRow
 from anydataset.types import (
     AudioItem,
     AudioView,
@@ -40,7 +40,11 @@ def test_qwen_fixed_speaker_source_batches_fixed_length_units(
             ("hello", torch.tensor([[1], [2], [3]]), torch.tensor([[4], [5], [6], [7]])),
         ]
     )
-    monkeypatch.setattr(qwen_data, "qwen_tts_speaker_codec_grid", lambda **_: grid)
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
     data = DataConfig(
         source="qwen_fixed_speaker",
         root=str(tmp_path / "prepared"),
@@ -71,7 +75,11 @@ def test_qwen_cross_text_source_batches_explicit_pair_and_metadata(
             ("reference text", torch.tensor([[2], [3], [4]]), torch.tensor([[8], [9], [10]])),
         ]
     )
-    monkeypatch.setattr(qwen_data, "qwen_tts_speaker_codec_grid", lambda **_: grid)
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
     data = DataConfig(
         source="qwen_cross_text",
         root=str(tmp_path / "prepared"),
@@ -118,7 +126,11 @@ def test_qwen_cross_text_uses_anydataset_cost_batching(
             for index in range(4)
         ]
     )
-    monkeypatch.setattr(qwen_data, "qwen_tts_speaker_codec_grid", lambda **_: grid)
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
     data = DataConfig(
         source="qwen_cross_text",
         root=str(tmp_path / "prepared"),
@@ -206,9 +218,9 @@ def test_datamodule_exposes_deterministic_held_out_split(
         ),
     }
     monkeypatch.setattr(
-        qwen_data,
-        "qwen_tts_speaker_codec_grid",
-        lambda **kwargs: grids[kwargs["split"]],
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **kwargs: SimpleNamespace(load=lambda: grids[kwargs["split"]]),
     )
     data = DataConfig(
         source="qwen_cross_text",
@@ -248,7 +260,11 @@ def test_qwen_cross_text_filter_checks_target_and_reference_raw_lengths(
             ("text three", torch.ones(4, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
         ]
     )
-    monkeypatch.setattr(qwen_data, "qwen_tts_speaker_codec_grid", lambda **_: grid)
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
     data = DataConfig(
         source="qwen_cross_text",
         root=str(tmp_path / "prepared"),

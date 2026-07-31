@@ -236,11 +236,7 @@ def _data_config(config: DictConfig) -> DataConfig:
 
 
 def _validate_data_backend(data: DataConfig, *, codec: str) -> None:
-    if data.source == "wmt19_tts_codec" and codec != "longcat":
-        raise NotImplementedError(
-            "wmt19_tts_codec training currently parses the prepared LongCat [frame, codebook] "
-            "view only. Use codec='longcat' or add a backend-native structured data source."
-        )
+    del data, codec
 
 
 def _output_dir(config: DictConfig) -> Path:

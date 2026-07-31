@@ -252,9 +252,10 @@ codec 语义、condition、head、loss 和 runtime 组合。
    reference condition，不能把 target features 回流到 condition。
 5. 训练逐样本以 `reference_dropout=0.5` 在显式 reference 与 learned null condition 之间切换。
 
-`wmt19_tts_codec(longcat)` 与单侧 `qwen_fixed_speaker` 仍作为显式 smoke source 保留；后者只是从统一
-Qwen codec grid 选择一个 role/speaker 列，codec view 与网格的行、列、整网格访问契约保持一致，不再依赖
-独立的固定 speaker prepared dataset。默认训练数据契约仍是 `qwen_cross_text`。
+单侧 `qwen_fixed_speaker` 仍作为显式 smoke source 保留：它通过
+`zhuyin.datasets.wmt19.qwen_tts` 从统一 Qwen codec grid 选择一个 role/speaker 列，codec view
+与网格的行、列、整网格访问契约保持一致，不再依赖 `zhuyin.datasets.wmt19_tts` 或独立的固定 speaker
+prepared dataset。默认训练数据契约仍是 `qwen_cross_text`。
 
 ## 两条 generator 路线
 
