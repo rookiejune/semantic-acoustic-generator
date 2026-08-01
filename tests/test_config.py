@@ -51,6 +51,7 @@ def test_root_has_no_legacy_flat_training_groups() -> None:
     assert config.pl_module.reference_dropout == 0.5
     assert config.callback.checkpoint.enabled is True
     assert config.callback.performance.profile_flops is False
+    assert config.callback.data_throughput.enabled is True
 
 
 def test_experiment_composition_can_be_overridden_explicitly() -> None:

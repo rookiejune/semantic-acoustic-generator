@@ -10,6 +10,11 @@ performance:
   log_every_n_steps: 100
   warmup_steps: 20
   measure_window_steps: 100
+data_throughput:
+  enabled: true
+  log_every_n_steps: 100
+  warmup_steps: 20
+  measure_window_steps: 100
 checkpoint:
   enabled: true
   filename: step-{step:08d}

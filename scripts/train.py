@@ -8,11 +8,21 @@ from typing import TYPE_CHECKING, Any, Optional, Union, cast
 import hydra
 import torch
 from anytrain.codec import AcousticLayout, load_semantic_acoustic
-from anytrain.lightning import EMACallback, ModelCheckpoint, PerformanceCallback
+from anytrain.lightning import (
+    DataThroughputCallback,
+    EMACallback,
+    ModelCheckpoint,
+    PerformanceCallback,
+)
 from lightning import pytorch as pl
 from lightning.pytorch.callbacks import Callback
 
-from semantic_acoustic_codec.callback import ArtifactExport, SampleLogConfig, SampleLogger
+from semantic_acoustic_codec.callback import (
+    ArtifactExport,
+    SampleLogConfig,
+    SampleLogger,
+    SemanticFrameUnits,
+)
 from semantic_acoustic_codec.config import (
     DecoderConfig,
     Initialization,
@@ -115,6 +125,29 @@ def run(config: DictConfig) -> None:
                 ),
                 warmup_steps=int(performance.get("warmup_steps", 20)),
                 measure_window_steps=int(performance.get("measure_window_steps", 100)),
+            )
+        )
+    data_throughput = config.callback.get("data_throughput")
+    if data_throughput is None or bool(data_throughput.get("enabled", True)):
+        throughput_cfg = {} if data_throughput is None else data_throughput
+        callbacks.append(
+            DataThroughputCallback(
+                data_units=SemanticFrameUnits(),
+                log_every_n_steps=int(
+                    throughput_cfg.get(
+                        "log_every_n_steps",
+                        performance.get("log_every_n_steps", config.trainer.log_every_n_steps),
+                    )
+                ),
+                warmup_steps=int(
+                    throughput_cfg.get("warmup_steps", performance.get("warmup_steps", 20))
+                ),
+                measure_window_steps=int(
+                    throughput_cfg.get(
+                        "measure_window_steps",
+                        performance.get("measure_window_steps", 100),
+                    )
+                ),
             )
         )
     ema_decay = config.pl_module.get("ema_decay")
