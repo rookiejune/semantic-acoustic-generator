@@ -70,7 +70,15 @@ python scripts/train.py experiment=overfit backend=longcat model/route=fm
 
 # 984-pair screening；FLOPs calibration 时显式追加 callback.performance.profile_flops=true
 python scripts/train.py experiment=screening backend=longcat model/route=fm
+
+# LongCat-FM REPA / EMA ablation（screening 预算）
+python scripts/train.py experiment=ablation_fm_baseline
+python scripts/train.py experiment=ablation_fm_repa
+python scripts/train.py experiment=ablation_fm_ema
 ```
+
+`pl_module.ema_decay` 非空时启用 `anytrain.lightning.EMACallback`；sample / artifact 导出使用 EMA
+权重。`loss.repa_loss_weight>0` 时 train 入口构造 `WavLMTeacher`（当前仅 LongCat frame-aligned FM）。
 
 四条正式路线分别由 `experiment=001_longcat_fm|001_longcat_rvq|001_bicodec_fm|001_bicodec_rvq`
 完整组合，也有对应的 job wrapper：

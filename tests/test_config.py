@@ -74,3 +74,23 @@ def test_screening_uses_disjoint_training_partition() -> None:
     assert config.trainer.max_steps == -1
     assert config.trainer.max_epochs == 1
     assert config.callback.performance.profile_flops is False
+
+
+def test_fm_ablation_experiments_compose_repa_and_ema_cells() -> None:
+    baseline = _compose("experiment=ablation_fm_baseline")
+    repa = _compose("experiment=ablation_fm_repa")
+    ema = _compose("experiment=ablation_fm_ema")
+
+    assert baseline.model.route == "fm"
+    assert baseline.backend.name == "longcat"
+    assert baseline.loss.repa_loss_weight == 0.0
+    assert baseline.pl_module.ema_decay is None
+
+    assert repa.loss.repa_loss_weight == 0.25
+    assert repa.loss.repa_feature_dim == 768
+    assert repa.pl_module.ema_decay is None
+    assert repa.output_subdir == "ablation/longcat-fm/repa"
+
+    assert ema.pl_module.ema_decay == 0.999
+    assert ema.loss.repa_loss_weight == 0.0
+    assert ema.output_subdir == "ablation/longcat-fm/ema"

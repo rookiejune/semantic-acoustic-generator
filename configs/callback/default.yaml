@@ -16,3 +16,5 @@ checkpoint:
   save_last: true
   save_top_k: -1
   every_n_train_steps: 10000
+ema:
+  use_ema_weights: true

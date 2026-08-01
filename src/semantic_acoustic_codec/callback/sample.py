@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes, masked_acoustic_features
+from anytrain.lightning import find_ema_callback
 from anytrain.lightning.experiment import audio as experiment_audio
 from anytrain.lightning.experiment import scalar as experiment_scalar
 from lightning.pytorch.callbacks import Callback
@@ -90,13 +91,23 @@ class SampleLogger(Callback):
         sample = _to(self.fixed_sample, module.device)
         was_training = module.training
         module.eval()
+        ema = find_ema_callback(trainer)
         try:
-            event, audio, scalars = _sample(
-                module,
-                sample,
-                step=step,
-                seed=self.config.seed,
-            )
+            if ema is None:
+                event, audio, scalars = _sample(
+                    module,
+                    sample,
+                    step=step,
+                    seed=self.config.seed,
+                )
+            else:
+                with ema.average_parameters(module):
+                    event, audio, scalars = _sample(
+                        module,
+                        sample,
+                        step=step,
+                        seed=self.config.seed,
+                    )
         finally:
             module.train(was_training)
 

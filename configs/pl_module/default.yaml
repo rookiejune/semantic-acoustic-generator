@@ -3,3 +3,5 @@ learning_rate: 3e-4
 weight_decay: 0.01
 reference_dropout: 0.5
 validation_seed: 0
+ema_decay: null
+ema_update_after_step: 0

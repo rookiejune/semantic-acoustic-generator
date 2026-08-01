@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import hydra
 import torch
-from anytrain.codec import load_semantic_acoustic
-from anytrain.lightning import ModelCheckpoint, PerformanceCallback
+from anytrain.codec import AcousticLayout, load_semantic_acoustic
+from anytrain.lightning import EMACallback, ModelCheckpoint, PerformanceCallback
 from lightning import pytorch as pl
 from lightning.pytorch.callbacks import Callback
 
@@ -26,11 +26,15 @@ from semantic_acoustic_codec.datamodule import (
     load_batch,
     single_batch_loader,
 )
+from semantic_acoustic_codec.loss import WavLMTeacher
 from semantic_acoustic_codec.pl_module import build_module, dataset_feature_stats
 from semantic_acoustic_codec.runtime import SamplingConfig, SemanticSupportConfig
 
 if TYPE_CHECKING:
+    from anytrain.codec import SemanticAcousticCodec
     from omegaconf import DictConfig
+
+    from semantic_acoustic_codec.loss.repa import Teacher
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
@@ -70,7 +74,9 @@ def run(config: DictConfig) -> None:
     else:
         data_module.setup("fit")
         fixed_batch = data_module.sample_batch()
-    support_config = _support_config(config, seed=seed)
+    route = _route(config.model.route)
+    repa_teacher = _repa_teacher(config, backend, device=device, route=route)
+    support_config = _support_config(config, seed=seed, repa_teacher=repa_teacher)
     normalize_features = bool(config.pl_module.normalize_features)
     feature_mean: tuple[float, ...] | None = None
     feature_std: tuple[float, ...] | None = None
@@ -93,6 +99,7 @@ def run(config: DictConfig) -> None:
         weight_decay=float(config.pl_module.weight_decay),
         reference_dropout=float(config.pl_module.reference_dropout),
         validation_seed=int(config.pl_module.get("validation_seed", seed)),
+        repa_teacher=repa_teacher,
     )
 
     callbacks: list[Callback] = [ArtifactExport(output_dir)]
@@ -108,6 +115,16 @@ def run(config: DictConfig) -> None:
                 ),
                 warmup_steps=int(performance.get("warmup_steps", 20)),
                 measure_window_steps=int(performance.get("measure_window_steps", 100)),
+            )
+        )
+    ema_decay = config.pl_module.get("ema_decay")
+    if ema_decay is not None:
+        ema = config.callback.get("ema")
+        callbacks.append(
+            EMACallback(
+                decay=float(ema_decay),
+                update_after_step=int(config.pl_module.get("ema_update_after_step", 0)),
+                use_ema_weights=bool(True if ema is None else ema.get("use_ema_weights", True)),
             )
         )
     sample = config.callback.sample
@@ -182,10 +199,24 @@ def run(config: DictConfig) -> None:
         )
 
 
-def _support_config(config: DictConfig, *, seed: int) -> SemanticSupportConfig:
+def _support_config(
+    config: DictConfig,
+    *,
+    seed: int,
+    repa_teacher: Teacher | None,
+) -> SemanticSupportConfig:
     decoder = config.model.decoder
     loss = config.loss
     sampling = config.runtime.sampling
+    repa_feature_dim = cast(Optional[int], loss.get("repa_feature_dim"))
+    if repa_teacher is not None:
+        if repa_feature_dim is None:
+            repa_feature_dim = int(repa_teacher.feature_dim)
+        elif int(repa_feature_dim) != int(repa_teacher.feature_dim):
+            raise ValueError(
+                "loss.repa_feature_dim must match the REPA teacher feature_dim: "
+                f"{repa_feature_dim} != {repa_teacher.feature_dim}."
+            )
     return SemanticSupportConfig(
         route=_route(config.model.route),
         condition_dim=int(config.model.condition_dim),
@@ -197,7 +228,7 @@ def _support_config(config: DictConfig, *, seed: int) -> SemanticSupportConfig:
             rvq_predictor=_rvq_predictor(decoder.get("rvq_predictor", "mtp")),
             mtp_layers=int(decoder.get("mtp_layers", 2)),
             mtp_heads=int(decoder.get("mtp_heads", 4)),
-            repa_feature_dim=cast(Optional[int], loss.get("repa_feature_dim")),
+            repa_feature_dim=repa_feature_dim,
             repa_student_layer=cast(Optional[int], loss.get("repa_student_layer")),
             repa_loss_weight=float(loss.repa_loss_weight),
         ),
@@ -208,6 +239,38 @@ def _support_config(config: DictConfig, *, seed: int) -> SemanticSupportConfig:
             temperature=float(sampling.temperature),
             top_p=float(sampling.top_p),
         ),
+    )
+
+
+def _repa_teacher(
+    config: DictConfig,
+    backend: SemanticAcousticCodec,
+    *,
+    device: torch.device,
+    route: Route,
+) -> Teacher | None:
+    weight = float(config.loss.repa_loss_weight)
+    if weight <= 0:
+        return None
+    if route is not Route.FM:
+        raise ValueError("REPA requires the FM route.")
+    if backend.acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
+        raise ValueError("REPA currently requires frame-aligned acoustic units.")
+    decode = getattr(backend, "decode", None)
+    if not callable(decode):
+        raise TypeError("REPA teacher requires a backend that implements decode(codes).")
+    teacher = config.loss.get("repa_teacher")
+    checkpoint = "microsoft/wavlm-base" if teacher is None else str(
+        teacher.get("checkpoint", "microsoft/wavlm-base")
+    )
+    layer = 9 if teacher is None else int(teacher.get("layer", 9))
+    sample_rate = None if teacher is None else teacher.get("sample_rate")
+    return WavLMTeacher(
+        cast(Any, backend),
+        checkpoint=checkpoint,
+        layer=layer,
+        sample_rate=int(backend.sample_rate if sample_rate is None else sample_rate),
+        device=device,
     )
 
 

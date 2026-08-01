@@ -1,3 +1,7 @@
 repa_feature_dim: null
 repa_student_layer: null
 repa_loss_weight: 0.0
+repa_teacher:
+  checkpoint: microsoft/wavlm-base
+  layer: 9
+  sample_rate: null
