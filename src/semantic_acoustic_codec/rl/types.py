@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Mapping
 
 import torch
 from torch import Tensor
@@ -36,6 +36,17 @@ class SACCandidate:
             raise ValueError("acoustic_codes must have shape [batch, unit, codebook].")
         if self.acoustic_mask is not None and self.acoustic_mask.dtype != torch.bool:
             raise TypeError("acoustic_mask must be boolean.")
+        if self.acoustic_mask is not None:
+            if self.acoustic_features is not None and self.acoustic_mask.shape != self.acoustic_features.shape[:2]:
+                raise ValueError("acoustic_mask must align with acoustic_features.")
+            if self.acoustic_codes is not None and self.acoustic_mask.shape != self.acoustic_codes.shape[:2]:
+                raise ValueError("acoustic_mask must align with acoustic_codes.")
+        if (
+            self.acoustic_features is not None
+            and self.acoustic_codes is not None
+            and self.acoustic_features.shape[:2] != self.acoustic_codes.shape[:2]
+        ):
+            raise ValueError("acoustic_features and acoustic_codes must align on [batch, unit].")
         if self.waveform is not None and self.waveform.dim() != 3:
             raise ValueError("waveform must have shape [batch, channels, time].")
 

@@ -160,6 +160,101 @@ def test_qwen_cross_text_uses_anydataset_cost_batching(
     ) == [0, 1, 2, 3]
 
 
+def test_dynamic_batch_planning_does_not_load_qwen_codec_samples(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grid = _grid(
+        [
+            (
+                f"text {index}",
+                torch.ones(index + 2, 1, dtype=torch.long),
+                torch.ones(4, 1, dtype=torch.long),
+            )
+            for index in range(4)
+        ]
+    )
+    loads: list[AudioView] = []
+    original_select = SpeakerAudioGrid.select
+
+    class TrackingSelection:
+        def __init__(self, selection) -> None:
+            self.selection = selection
+
+        def load(self, *, view=None):
+            loads.append(view)
+            return self.selection.load(view=view)
+
+    def select(self, *, text=None, speaker=None):
+        selection = original_select(self, text=text, speaker=speaker)
+        if self is grid:
+            return TrackingSelection(selection)
+        return selection
+
+    monkeypatch.setattr(SpeakerAudioGrid, "select", select)
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    data = DataConfig(
+        source="qwen_cross_text",
+        root=str(tmp_path / "prepared"),
+        batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        batching=BatchingConfig(max_batch_seconds=2.0, planning_window=4),
+    )
+    module = _module(data, tmp_path, frame_rate=2.0)
+
+    module.setup()
+
+    assert loads == []
+    next(iter(module.train_dataloader()))
+    assert loads
+
+
+def test_dynamic_batch_budget_does_not_create_hard_duration_limit(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grid = _grid(
+        [
+            (
+                "long text",
+                torch.ones(4, 1, dtype=torch.long),
+                torch.ones(4, 1, dtype=torch.long),
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    data = DataConfig(
+        source="qwen_fixed_speaker",
+        root=str(tmp_path / "prepared"),
+        max_seconds=None,
+        overlong="truncate",
+        batch_size=1,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        batching=BatchingConfig(max_batch_seconds=1.0, planning_window=1),
+    )
+    module = _module(data, tmp_path, frame_rate=1.0)
+
+    module.setup()
+    assert module.dataset is not None
+    assert module.dataset.costs == (1,)
+    batch = next(iter(module.train_dataloader()))
+
+    assert batch.semantic_codes.shape == (1, 4, 1)
+    assert batch.mask.tolist() == [[True, True, True, True]]
+
+
 def test_qwen_pair_dataset_construction_does_not_load_codec_samples() -> None:
     codes = SemanticAcousticCodes(
         semantic=torch.ones(2, 1, dtype=torch.long),
@@ -197,6 +292,47 @@ def test_qwen_pair_dataset_construction_does_not_load_codec_samples() -> None:
     pair = pairs[0]
     assert source.loads == [0, 1]
     assert pair.target.text != pair.reference.text
+
+
+def test_qwen_pair_sample_count_fences_reference_pool() -> None:
+    codes = SemanticAcousticCodes(
+        semantic=torch.ones(2, 1, dtype=torch.long),
+        acoustic=torch.ones(2, 1, dtype=torch.long),
+    )
+    samples = [
+        qwen_data.QwenCodecSample(
+            index=index,
+            text_index=index,
+            source_index=index,
+            role=Role.TARGET,
+            utterance_id=f"utterance-{index}",
+            speaker_id="vivian",
+            text=f"text {index}",
+            codes=codes,
+        )
+        for index in range(4)
+    ]
+
+    class CountingSource:
+        def __init__(self) -> None:
+            self.loads: list[int] = []
+
+        def __len__(self) -> int:
+            return len(samples)
+
+        def __getitem__(self, index: int) -> qwen_data.QwenCodecSample:
+            self.loads.append(index)
+            return samples[index]
+
+    source = CountingSource()
+    pairs = qwen_data.QwenCodecPairDataset(source, sample_count=2)  # type: ignore[arg-type]
+
+    pair = pairs[1]
+
+    assert len(pairs) == 2
+    assert pair.target_index == 1
+    assert pair.reference_index == 0
+    assert source.loads == [1, 0]
 
 
 def test_datamodule_exposes_deterministic_held_out_split(

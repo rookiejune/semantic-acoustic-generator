@@ -85,6 +85,11 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument(
+        "--include-private-metadata",
+        action="store_true",
+        help="Write raw text, speaker IDs, utterance IDs, and local paths to JSON output.",
+    )
+    parser.add_argument(
         "--without-reference-wav",
         "--output-wav",
         dest="without_reference_wav",
@@ -202,9 +207,13 @@ def _summary(
         for name, value in audio.items()
     }
     result = {
-        "artifact": str(args.artifact),
+        "artifact": _path_value(args.artifact, include_private=_include_private(args)),
         "codec": str(args.codec),
-        "data_root": None if args.data_root is None else str(args.data_root),
+        "data_root": (
+            None
+            if args.data_root is None
+            else _path_value(args.data_root, include_private=_include_private(args))
+        ),
         "data_source": str(args.data_source),
         "sample_index": int(args.sample_index),
         "sample_rate": sample_rate,
@@ -212,12 +221,38 @@ def _summary(
         "target_acoustic_shape": list(batch.acoustic_codes.shape),
         "reference_semantic_shape": list(reference_semantic.shape),
         "reference_acoustic_shape": list(reference_acoustic.shape),
-        "pair": asdict(batch.metadata[0]),
+        "pair": _pair_metadata(
+            asdict(batch.metadata[0]),
+            include_private=_include_private(args),
+        ),
         **metrics,
         **summaries,
     }
     result.setdefault("reference_token_passthrough", None)
     return result
+
+
+def _path_value(path: Path, *, include_private: bool) -> str:
+    return str(path) if include_private else path.name
+
+
+def _include_private(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "include_private_metadata", False))
+
+
+def _pair_metadata(data: dict[str, Any], *, include_private: bool) -> dict[str, Any]:
+    if include_private:
+        return data
+    for key in (
+        "target_text",
+        "reference_text",
+        "target_utterance_id",
+        "reference_utterance_id",
+        "target_speaker_id",
+        "reference_speaker_id",
+    ):
+        data.pop(key, None)
+    return data
 
 
 def _write_outputs(

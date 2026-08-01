@@ -14,7 +14,7 @@ defaults:
 output_subdir: smoke/${backend.name}/${model.route}
 
 datamodule:
-  sample_limit: 1
+  sample_limit: 2
   max_seconds: 4.0
   overlong: truncate
   batch_size: 1

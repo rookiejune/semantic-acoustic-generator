@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Mapping
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import torch
 from anytrain.codec import masked_acoustic_features
@@ -47,11 +48,7 @@ class SACRLAdapter:
                 reference_mask=batch.reference_acoustic_mask,
                 generator=generator,
             )
-            waveform = self.runtime.decode_features(
-                batch.semantic_codes,
-                features,
-                mask=batch.semantic_mask,
-            )
+            waveforms = _decode_rows(self.runtime, batch, features)
             for sample_id in range(batch.semantic_codes.size(0)):
                 metadata = _metadata(batch, sample_id)
                 acoustic_mask = batch.target_acoustic_mask[sample_id : sample_id + 1]
@@ -64,7 +61,7 @@ class SACRLAdapter:
                         semantic_mask=batch.semantic_mask[sample_id : sample_id + 1].detach(),
                         acoustic_features=features[sample_id : sample_id + 1].detach(),
                         acoustic_mask=acoustic_mask.detach(),
-                        waveform=waveform[sample_id : sample_id + 1].detach(),
+                        waveform=waveforms[sample_id].detach(),
                         metadata=metadata,
                     )
                 )
@@ -173,6 +170,21 @@ def _reference_features(runtime: SemanticCodecRuntime, batch: SemanticCodecBatch
         runtime.backend,
         batch.reference_acoustic_codes,
         batch.reference_acoustic_mask,
+    )
+
+
+def _decode_rows(
+    runtime: SemanticCodecRuntime,
+    batch: SemanticCodecBatch,
+    features: Tensor,
+) -> tuple[Tensor, ...]:
+    return tuple(
+        runtime.decode_features(
+            batch.semantic_codes[index : index + 1],
+            features[index : index + 1],
+            mask=batch.semantic_mask[index : index + 1],
+        )
+        for index in range(batch.semantic_codes.size(0))
     )
 
 

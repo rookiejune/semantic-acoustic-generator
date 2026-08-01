@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import pytest
 import torch
+from anytrain.codec import AcousticLayout
 
-from semantic_acoustic_codec.rl import SACCandidate, SACRLAdapter, SACRewardBatch, SACRollout
+from semantic_acoustic_codec.rl import SACCandidate, SACRewardBatch, SACRLAdapter, SACRollout
+from semantic_acoustic_codec.types import SemanticCodecBatch
 
 
 def test_sac_reward_batch_and_grpo_contract() -> None:
@@ -63,6 +65,60 @@ def test_sac_score_requires_external_rewards() -> None:
 
     with pytest.raises(ValueError, match="task-specific"):
         adapter.score(_rollout(batch_size=1, group_size=1))
+
+
+def test_sac_rollout_decodes_variable_length_rows_individually() -> None:
+    class Runtime:
+        def __init__(self) -> None:
+            self.decode_shapes: list[tuple[int, int]] = []
+
+        def sample_features(
+            self,
+            semantic_codes: torch.Tensor,
+            *,
+            mask: torch.Tensor | None = None,
+            reference_features: torch.Tensor | None = None,
+            reference_mask: torch.Tensor | None = None,
+            generator: torch.Generator | None = None,
+        ) -> torch.Tensor:
+            del mask, reference_features, reference_mask, generator
+            return torch.ones(
+                semantic_codes.size(0),
+                semantic_codes.size(1),
+                2,
+                dtype=torch.float32,
+            )
+
+        def decode_features(
+            self,
+            semantic_codes: torch.Tensor,
+            features: torch.Tensor,
+            *,
+            mask: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            if semantic_codes.size(0) != 1:
+                raise AssertionError("runtime must decode one row at a time")
+            if mask is None:
+                raise AssertionError("semantic mask is required")
+            self.decode_shapes.append((semantic_codes.size(0), int(mask.sum().item())))
+            return features.sum(dim=-1).unsqueeze(1)
+
+    batch = SemanticCodecBatch(
+        semantic_codes=torch.tensor([[[1], [2], [3]], [[4], [8], [8]]], dtype=torch.long),
+        acoustic_codes=torch.tensor([[[1], [1], [1]], [[2], [5], [5]]], dtype=torch.long),
+        mask=torch.tensor([[True, True, True], [True, False, False]]),
+        semantic_pad_id=8,
+        acoustic_pad_ids=(5,),
+        acoustic_mask=torch.tensor([[True, True, True], [True, False, False]]),
+        acoustic_layout=AcousticLayout.FRAME_ALIGNED,
+    )
+    runtime = Runtime()
+    adapter = SACRLAdapter(runtime)  # type: ignore[arg-type]
+
+    rollout = adapter.rollout(batch)
+
+    assert [candidate.sample_id for candidate in rollout.candidates] == [0, 1]
+    assert runtime.decode_shapes == [(1, 3), (1, 1)]
 
 
 def _rollout(*, batch_size: int, group_size: int) -> SACRollout:

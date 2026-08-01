@@ -210,6 +210,27 @@ def test_support_acoustic_sampling_accepts_optional_reference() -> None:
     assert not torch.allclose(without_condition, with_condition)
 
 
+def test_runtime_rvq_sample_features_zeroes_padding_frames() -> None:
+    class NonZeroPadBackend(FakeBackend):
+        def acoustic_codes_to_features(self, acoustic_codes: torch.Tensor) -> torch.Tensor:
+            return (acoustic_codes.float() + 1).expand(
+                -1,
+                -1,
+                self.acoustic_feature_dim,
+            ).contiguous()
+
+    support, _ = _support(Route.RVQ)
+    runtime = SemanticCodecRuntime(support, NonZeroPadBackend())
+    semantic = torch.tensor([[[1], [2], [0]]], dtype=torch.long)
+    mask = torch.tensor([[True, True, False]])
+
+    features = runtime.sample_features(semantic, mask=mask, generator=_generator())
+
+    assert features.shape == (1, 3, 4)
+    assert bool((features[0, :2] != 0).all())
+    assert torch.equal(features[0, 2], torch.zeros(4))
+
+
 def test_schema_seven_artifact_roundtrip_defaults_missing_predictor_to_mtp(
     tmp_path,
     monkeypatch,

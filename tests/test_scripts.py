@@ -203,6 +203,7 @@ def test_eval_artifact_main_loads_cross_text_pair(
         device="cpu",
         seed=5,
         output_json=None,
+        include_private_metadata=False,
         without_reference_wav=None,
         with_reference_wav=None,
         target_reconstruction_wav=None,
@@ -227,12 +228,67 @@ def test_eval_artifact_main_loads_cross_text_pair(
     assert loaded["data"].sample_index == 2
     assert loaded["kwargs"]["acoustic_layout"] is AcousticLayout.FRAME_ALIGNED
     result = json.loads(capsys.readouterr().out)
-    assert result["pair"]["target_utterance_id"] == "target"
+    assert result["artifact"] == "artifact"
+    assert result["data_root"] is None
+    assert result["pair"]["target_index"] == 0
+    assert "target_utterance_id" not in result["pair"]
+    assert "reference_utterance_id" not in result["pair"]
+    assert "target_speaker_id" not in result["pair"]
+    assert "reference_speaker_id" not in result["pair"]
+    assert "target_text" not in result["pair"]
+    assert "reference_text" not in result["pair"]
     assert result["generated_without_reference"]["finite"] is True
     assert result["generated_with_reference"]["finite"] is True
     assert result["reference_gain"] == pytest.approx(
         result["feature_mse_without_reference"] - result["feature_mse_with_reference"]
     )
+
+
+def test_eval_artifact_can_include_private_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = EvalBackend(AcousticLayout.FRAME_ALIGNED)
+    batch = _pair(AcousticLayout.FRAME_ALIGNED)
+    runtime = EvalRuntime(units=batch.acoustic_codes.size(1))
+    args = argparse.Namespace(
+        artifact=tmp_path / "artifact",
+        codec="longcat",
+        data_source="qwen_cross_text",
+        data_root=tmp_path / "data",
+        split="train",
+        sample_index=2,
+        max_seconds=None,
+        overlong="error",
+        device="cpu",
+        seed=5,
+        output_json=None,
+        include_private_metadata=True,
+        without_reference_wav=None,
+        with_reference_wav=None,
+        target_reconstruction_wav=None,
+        reference_reconstruction_wav=None,
+        passthrough_wav=None,
+    )
+
+    monkeypatch.setattr(eval_artifact, "_args", lambda: args)
+    monkeypatch.setattr(eval_artifact, "load_semantic_acoustic", lambda *args, **kwargs: backend)
+    monkeypatch.setattr(eval_artifact, "load_artifact", lambda *args, **kwargs: object())
+    monkeypatch.setattr(eval_artifact, "load_batch", lambda *args, **kwargs: batch)
+    monkeypatch.setattr(eval_artifact, "SemanticCodecRuntime", lambda *args: runtime)
+
+    eval_artifact.main()
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["artifact"] == str(tmp_path / "artifact")
+    assert result["data_root"] == str(tmp_path / "data")
+    assert result["pair"]["target_utterance_id"] == "target"
+    assert result["pair"]["reference_utterance_id"] == "reference"
+    assert result["pair"]["target_speaker_id"] == "speaker"
+    assert result["pair"]["reference_speaker_id"] == "speaker"
+    assert result["pair"]["target_text"] == "target text"
+    assert result["pair"]["reference_text"] == "reference text"
 
 
 def test_smoke_uses_independent_fake_reference_and_seeded_paths(

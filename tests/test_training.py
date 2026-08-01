@@ -246,7 +246,7 @@ def test_lightning_runs_anydataset_dynamic_loader_across_epochs() -> None:
 
     dataset = Dataset()
     loader = dataset.dataloader(
-        costs=1,
+        costs=[1] * len(dataset),
         max_batch_memory=2,
         max_batch_samples=2,
         shuffle=True,
@@ -474,8 +474,13 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
     assert len(events) == 1
     event = events[0]
     assert event["step"] == 2
-    assert event["metadata"]["target_utterance_id"] == "target-0"
-    assert event["metadata"]["reference_utterance_id"] == "reference-0"
+    assert event["metadata"]["target_index"] == 0
+    assert "target_utterance_id" not in event["metadata"]
+    assert "reference_utterance_id" not in event["metadata"]
+    assert "target_speaker_id" not in event["metadata"]
+    assert "reference_speaker_id" not in event["metadata"]
+    assert "target_text" not in event["metadata"]
+    assert "reference_text" not in event["metadata"]
     assert event["generated_with_reference"]["finite"] is True
     assert event["reference_full_reconstruction"]["finite"] is True
     assert event["reference_gain"] == pytest.approx(

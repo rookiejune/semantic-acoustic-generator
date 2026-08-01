@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
@@ -111,7 +112,7 @@ def run(config: DictConfig) -> None:
             )
         )
     sample = config.callback.sample
-    if bool(sample.enabled):
+    if bool(sample.enabled) and fixed_batch.has_reference:
         callbacks.append(
             SampleLogger(
                 output_dir,
@@ -121,6 +122,11 @@ def run(config: DictConfig) -> None:
                     seed=int(sample.seed),
                 ),
             )
+        )
+    elif bool(sample.enabled):
+        warnings.warn(
+            "sample callback disabled because the fixed sample has no reference pair.",
+            stacklevel=2,
         )
     checkpoint = config.callback.checkpoint
     if bool(checkpoint.enabled):

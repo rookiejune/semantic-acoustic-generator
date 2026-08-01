@@ -147,7 +147,7 @@ def _sample(
     target_stats = _audio_stats(target_audio)
     event: dict[str, Any] = {
         "step": step,
-        "metadata": asdict(sample.metadata[0]),
+        "metadata": _public_metadata(sample),
         "feature_mse_without_reference": without_mse,
         "feature_mse_with_reference": with_mse,
         "reference_gain": reference_gain,
@@ -372,6 +372,20 @@ def _append_json(path: Path, event: dict[str, Any]) -> None:
         events = []
     events.append(event)
     path.write_text(json.dumps(events, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _public_metadata(batch: SemanticCodecBatch) -> dict[str, Any]:
+    data = asdict(batch.metadata[0])
+    for key in (
+        "target_text",
+        "reference_text",
+        "target_utterance_id",
+        "reference_utterance_id",
+        "target_speaker_id",
+        "reference_speaker_id",
+    ):
+        data.pop(key, None)
+    return data
 
 
 def _acoustic_mask(batch: SemanticCodecBatch) -> Tensor:

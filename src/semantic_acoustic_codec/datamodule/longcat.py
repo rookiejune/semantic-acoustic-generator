@@ -103,14 +103,6 @@ class DataConfig:
             _positive_number(self.max_seconds, name="max_seconds")
         if self.overlong not in {"error", "filter", "truncate"}:
             raise ValueError("overlong must be 'error', 'filter', or 'truncate'.")
-        if (
-            self.max_seconds is not None
-            and self.batching.enabled
-            and self.max_seconds > self.batching.max_batch_seconds
-        ):
-            raise ValueError(
-                "max_seconds must not exceed batching.max_batch_seconds when batching is enabled."
-            )
         for name, value, minimum in (
             ("batch_size", self.batch_size, 1),
             ("num_workers", self.num_workers, 0),
@@ -224,15 +216,22 @@ class DataModule(pl.LightningDataModule):
             raise ValueError("duration filtering requires a hard limit.")
         max_frames = None if max_seconds is None else _frames(max_seconds, self.frame_rate)
         inspect_lengths = data.batching.enabled or data.overlong == "filter"
+        batch_frames = (
+            _frames(data.batching.max_batch_seconds, self.frame_rate)
+            if data.batching.enabled
+            else None
+        )
         for index in candidates:
             frames = 1
             if inspect_lengths:
-                frames = _raw_length(source[index], source=data.source)
+                frames = _raw_length_at(source, index, source_name=data.source)
                 if data.overlong == "filter" and max_frames is not None and frames > max_frames:
                     filtered += 1
                     continue
                 if data.overlong == "truncate" and max_frames is not None:
                     frames = min(frames, max_frames)
+                if batch_frames is not None:
+                    frames = min(frames, batch_frames)
             indexes.append(index)
             costs.append(frames)
         if not indexes:
@@ -536,12 +535,20 @@ def _raw_length(
     return max(target.semantic.size(0), reference)
 
 
+def _raw_length_at(source: Dataset[Any], index: int, *, source_name: str) -> int:
+    raw_length = getattr(source, "raw_length", None)
+    if callable(raw_length):
+        value = raw_length(index)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("dataset raw_length() must return an integer.")
+        if value < 1:
+            raise ValueError("dataset raw_length() must be positive.")
+        return value
+    return _raw_length(source[index], source=source_name)
+
+
 def _max_seconds(data: DataConfig) -> float | None:
-    if not data.batching.enabled:
-        return data.max_seconds
-    if data.max_seconds is None:
-        return data.batching.max_batch_seconds
-    return min(data.max_seconds, data.batching.max_batch_seconds)
+    return data.max_seconds
 
 
 def _frames(seconds: float, frame_rate: float) -> int:
@@ -576,7 +583,7 @@ def _dataset(data: DataConfig, *, codec: str) -> Dataset[Any]:
     if data.source == "qwen_cross_text":
         return cast(
             Dataset[Any],
-            QwenCodecPairDataset(column),
+            QwenCodecPairDataset(column, sample_count=data.sample_limit),
         )
     raise AssertionError(f"unsupported data source: {data.source}")
 

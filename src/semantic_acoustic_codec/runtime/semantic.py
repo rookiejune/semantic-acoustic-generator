@@ -428,7 +428,10 @@ class SemanticCodecRuntime:
             output_length=output_length,
             generator=generator,
         )
-        return self.backend.acoustic_codes_to_features(codes)
+        _, frame_mask = self.support._semantic_input(semantic_codes, mask)
+        target_mask = self.support._output_mask(frame_mask, output_length)
+        features = self.backend.acoustic_codes_to_features(codes)
+        return features.masked_fill(~target_mask.to(device=features.device)[..., None], 0)
 
     @torch.no_grad()
     def decode(
@@ -875,7 +878,10 @@ def _metadata_sizes(data: Mapping[str, object]) -> tuple[int, ...]:
         isinstance(item, bool) or not isinstance(item, int) for item in value
     ):
         raise TypeError("artifact acoustic_codebook_sizes must be a list of integers.")
-    return tuple(value)
+    sizes = tuple(value)
+    if not sizes or any(size <= 0 for size in sizes):
+        raise ValueError("artifact acoustic_codebook_sizes must contain positive integers.")
+    return sizes
 
 
 def _metadata_optional_int(data: Mapping[str, object], key: str) -> int | None:
