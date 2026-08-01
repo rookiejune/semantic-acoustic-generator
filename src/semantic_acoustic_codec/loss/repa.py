@@ -82,20 +82,7 @@ class WavLMTeacher(nn.Module):
         if mask.size(0) < 1 or not bool(mask.any(dim=1).all()):
             raise ValueError("each teacher mask row must contain a valid frame")
 
-        waveforms = [
-            self._waveform(
-                torch.cat(
-                    (semantic_codes[row, valid], acoustic_codes[row, valid]),
-                    dim=-1,
-                )
-            )
-            for row, valid in enumerate(mask)
-        ]
-        lengths = torch.tensor(
-            [waveform.numel() for waveform in waveforms],
-            device=self._device,
-        )
-        inputs = pad_sequence(waveforms, batch_first=True).to(self._device)
+        inputs, lengths = self._waveforms(semantic_codes, acoustic_codes, mask)
         sample_mask = (
             torch.arange(inputs.size(1), device=self._device)[None] < lengths[:, None]
         )
@@ -128,21 +115,41 @@ class WavLMTeacher(nn.Module):
     def _device(self) -> torch.device:
         return next(self.model.parameters()).device
 
-    def _waveform(self, codes: Tensor) -> Tensor:
-        waveform = self.codec.decode(codes[None]).float()
-        while waveform.dim() > 1 and waveform.size(0) == 1:
-            waveform = waveform.squeeze(0)
-        if waveform.dim() == 2:
-            waveform = waveform.mean(dim=0)
-        if waveform.dim() != 1:
-            raise ValueError("codec teacher decode must produce mono waveform")
-        if self.codec.sample_rate != self.sample_rate:
-            from torchaudio.functional import resample
+    def _waveforms(
+        self,
+        semantic_codes: Tensor,
+        acoustic_codes: Tensor,
+        mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Decode padded codec rows, batching equal frame lengths together.
 
-            waveform = resample(waveform, self.codec.sample_rate, self.sample_rate)
-        return (waveform - waveform.mean()) / torch.sqrt(
-            waveform.var(unbiased=False) + 1e-7
+        Training pad ids sit at codebook size and are out of range for embedding
+        lookup, so a mixed-length rectangle cannot be decoded as-is. Rows that
+        share a valid length are trimmed and decoded in one ``codec.decode`` call,
+        matching per-row decode while avoiding a Python loop over every sample.
+        """
+        _require_prefix_mask(mask)
+        codes = torch.cat((semantic_codes, acoustic_codes), dim=-1)
+        frame_lengths = mask.sum(dim=1)
+        waveforms: list[Tensor | None] = [None] * codes.size(0)
+        for length in frame_lengths.unique(sorted=True).tolist():
+            rows = (frame_lengths == length).nonzero(as_tuple=True)[0]
+            decoded = self.codec.decode(codes.index_select(0, rows)[:, : int(length)])
+            mono = _mono_batch(decoded)
+            if self.codec.sample_rate != self.sample_rate:
+                from torchaudio.functional import resample
+
+                mono = resample(mono, self.codec.sample_rate, self.sample_rate)
+            for local, row in enumerate(rows.tolist()):
+                waveforms[row] = _normalize(mono[local])
+        if any(waveform is None for waveform in waveforms):
+            raise RuntimeError("teacher decode missed at least one batch row")
+        resolved = cast(list[Tensor], waveforms)
+        lengths = torch.tensor(
+            [waveform.numel() for waveform in resolved],
+            device=self._device,
         )
+        return pad_sequence(resolved, batch_first=True).to(self._device), lengths
 
     def _feature_lengths(self, lengths: Tensor) -> Tensor:
         output = lengths
@@ -153,4 +160,42 @@ class WavLMTeacher(nn.Module):
         return output
 
 
-__all__ = ["Teacher", "WavLMTeacher"]
+def decode_group_metrics(mask: Tensor) -> dict[str, float]:
+    """Stats for length-grouped codec decode; singleton_fraction=1 means fully per-row."""
+    if mask.dtype != torch.bool:
+        raise TypeError("teacher mask must be boolean")
+    if mask.ndim != 2 or mask.size(0) < 1:
+        raise ValueError("teacher mask must have shape [batch, frame]")
+    _, counts = mask.sum(dim=1).unique(sorted=True, return_counts=True)
+    groups = int(counts.numel())
+    batch = int(mask.size(0))
+    singletons = int((counts == 1).sum().item())
+    return {
+        "decode_groups": float(groups),
+        "decode_group_mean": batch / groups,
+        "decode_group_max": float(counts.max().item()),
+        "decode_singleton_fraction": singletons / groups,
+    }
+
+
+def _require_prefix_mask(mask: Tensor) -> None:
+    lengths = mask.sum(dim=1)
+    expected = torch.arange(mask.size(1), device=mask.device)[None] < lengths[:, None]
+    if not torch.equal(mask, expected):
+        raise ValueError("teacher mask must describe contiguous right padding")
+
+
+def _mono_batch(waveform: Tensor) -> Tensor:
+    value = waveform.float()
+    if value.dim() == 3:
+        value = value.mean(dim=1)
+    if value.dim() != 2:
+        raise ValueError("codec teacher decode must produce [batch, time] or [batch, channel, time]")
+    return value
+
+
+def _normalize(waveform: Tensor) -> Tensor:
+    return (waveform - waveform.mean()) / torch.sqrt(waveform.var(unbiased=False) + 1e-7)
+
+
+__all__ = ["Teacher", "WavLMTeacher", "decode_group_metrics"]

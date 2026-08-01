@@ -10,6 +10,7 @@ from anytrain.codec import SemanticAcousticCodec, masked_acoustic_features
 from lightning import LightningModule
 
 from semantic_acoustic_codec.config import Route
+from semantic_acoustic_codec.loss.repa import decode_group_metrics
 from semantic_acoustic_codec.runtime.semantic import (
     SemanticCodecSupport,
     SemanticSupportConfig,
@@ -148,6 +149,9 @@ class SemanticCodecModule(LightningModule):
             on_step=True,
             sync_dist=False,
         )
+        if self.repa_teacher is not None:
+            for name, value in decode_group_metrics(mask).items():
+                self.log(f"train/repa/{name}", value, on_step=True, sync_dist=False)
         if output.item.details is not None:
             for name, value in output.item.details.items():
                 if name == "frames":
