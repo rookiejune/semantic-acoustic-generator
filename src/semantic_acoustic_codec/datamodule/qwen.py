@@ -91,7 +91,8 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
     def __getitem__(self, index: int) -> QwenCodecSample:
         info = self.info(index)
         block = self.grid.select(
-            text=info.text_index,
+            source=info.source_index,
+            text=info.role,
             speaker=self.speaker_id,
         ).load(view=self.view)
         return QwenCodecSample(

@@ -185,8 +185,8 @@ def test_dynamic_batch_planning_does_not_load_qwen_codec_samples(
             loads.append(view)
             return self.selection.load(view=view)
 
-    def select(self, *, text=None, speaker=None):
-        selection = original_select(self, text=text, speaker=speaker)
+    def select(self, *, source=None, text=None, speaker=None):
+        selection = original_select(self, source=source, text=text, speaker=speaker)
         if self is grid:
             return TrackingSelection(selection)
         return selection
