@@ -709,13 +709,21 @@ def _config(data: Mapping[str, Any]) -> SemanticSupportConfig:
             heads=int(decoder["heads"]),
             ffn_ratio=int(decoder["ffn_ratio"]),
             rvq_predictor=RVQPredictor(
-                cast(str, decoder.get("rvq_predictor", RVQPredictor.MTP.value))
+                cast(str, _schema_field(decoder, "rvq_predictor", owner="decoder"))
             ),
-            mtp_layers=int(decoder.get("mtp_layers", 2)),
-            mtp_heads=int(decoder.get("mtp_heads", 4)),
-            repa_feature_dim=cast(Optional[int], decoder.get("repa_feature_dim")),
-            repa_student_layer=cast(Optional[int], decoder.get("repa_student_layer")),
-            repa_loss_weight=float(decoder.get("repa_loss_weight", 0.0)),
+            mtp_layers=int(_schema_field(decoder, "mtp_layers", owner="decoder")),
+            mtp_heads=int(_schema_field(decoder, "mtp_heads", owner="decoder")),
+            repa_feature_dim=cast(
+                Optional[int],
+                _schema_field(decoder, "repa_feature_dim", owner="decoder"),
+            ),
+            repa_student_layer=cast(
+                Optional[int],
+                _schema_field(decoder, "repa_student_layer", owner="decoder"),
+            ),
+            repa_loss_weight=float(
+                _schema_field(decoder, "repa_loss_weight", owner="decoder")
+            ),
         ),
         initialization=Initialization(cast(str, data["initialization"])),
         seed=int(data["seed"]),
@@ -727,6 +735,14 @@ def _config(data: Mapping[str, Any]) -> SemanticSupportConfig:
         feature_mean=_float_tuple(data.get("feature_mean")),
         feature_std=_float_tuple(data.get("feature_std")),
     )
+
+
+def _schema_field(data: Mapping[str, Any], key: str, *, owner: str) -> Any:
+    if key not in data:
+        raise ValueError(
+            f"semantic codec schema {SCHEMA_VERSION} {owner} is missing {key!r}."
+        )
+    return data[key]
 
 
 def _feature_stat(acoustic_feature_dim: int, value: Tensor | None, *, fill: float) -> Tensor:

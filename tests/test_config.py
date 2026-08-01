@@ -66,6 +66,7 @@ def test_screening_uses_disjoint_training_partition() -> None:
     config = _compose("experiment=screening")
 
     assert config.datamodule.sample_limit == 984
+    assert config.datamodule.max_seconds == 32.0
     assert config.datamodule.overlong == "filter"
     assert "lba" not in config.datamodule
     assert config.datamodule.batching.max_batch_seconds == 32.0

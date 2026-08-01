@@ -47,7 +47,6 @@ def run(config: DictConfig) -> None:
 
     codec = str(config.backend.name)
     data = _data_config(config.datamodule)
-    _validate_data_backend(data, codec=codec)
     backend = load_semantic_acoustic(codec, device=device)
     semantic_pad_id = int(backend.semantic_codebook.size(0))
     acoustic_pad_ids = backend.acoustic_codebook_sizes
@@ -239,10 +238,6 @@ def _data_config(config: DictConfig) -> DataConfig:
             seed=int(batching.seed),
         ),
     )
-
-
-def _validate_data_backend(data: DataConfig, *, codec: str) -> None:
-    del data, codec
 
 
 def _output_dir(config: DictConfig) -> Path:

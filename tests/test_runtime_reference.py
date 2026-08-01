@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, cast
 
+import pytest
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 from torch import nn
@@ -231,7 +232,7 @@ def test_runtime_rvq_sample_features_zeroes_padding_frames() -> None:
     assert torch.equal(features[0, 2], torch.zeros(4))
 
 
-def test_schema_seven_artifact_roundtrip_defaults_missing_predictor_to_mtp(
+def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -257,8 +258,7 @@ def test_schema_seven_artifact_roundtrip_defaults_missing_predictor_to_mtp(
     assert data["backend"]["sample_rate"] == backend.sample_rate
     assert data["backend"]["frame_rate"] == backend.frame_rate
     assert data["backend"]["semantic_frame_rate"] == backend.semantic_frame_rate
-    del data["config"]["decoder"]["rvq_predictor"]
-    config_path.write_text(json.dumps(data), encoding="utf-8")
+    assert data["config"]["decoder"]["rvq_predictor"] == RVQPredictor.MTP.value
 
     captured: list[SemanticSupportConfig] = []
     original = runtime_semantic.build_support
@@ -277,6 +277,31 @@ def test_schema_seven_artifact_roundtrip_defaults_missing_predictor_to_mtp(
     assert loaded.state_dict().keys() == support.state_dict().keys()
     for key, value in support.state_dict().items():
         assert torch.equal(loaded.state_dict()[key], value)
+
+
+def test_schema_seven_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
+    backend = FakeBackend()
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=4,
+        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        sampling=SamplingConfig(flow_steps=1),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    )
+    save_artifact(tmp_path, support, config, backend=backend)
+
+    config_path = tmp_path / "codec.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    del data["config"]["decoder"]["rvq_predictor"]
+    config_path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing 'rvq_predictor'"):
+        runtime_semantic.load_artifact(tmp_path)
 
 
 def _support(route: Route) -> tuple[SemanticCodecSupport, SeededGenerator]:

@@ -16,9 +16,11 @@ output_subdir: screening/${backend.name}/${model.route}-${model.decoder.layers}l
 
 datamodule:
   sample_limit: 984
+  # Hard duration filter; batch budget alone no longer truncates or drops samples.
+  max_seconds: 32.0
   overlong: filter
   batching:
-    # Retains 980/984 pairs; the remaining four exceed 32 seconds.
+    # Additive semantic-frame packing budget for the filtered 980/984 pairs.
     max_batch_seconds: 32.0
 
 trainer:
