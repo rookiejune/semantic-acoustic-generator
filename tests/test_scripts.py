@@ -193,7 +193,7 @@ def test_eval_artifact_main_loads_cross_text_pair(
     loaded: dict[str, Any] = {}
     args = argparse.Namespace(
         artifact=tmp_path / "artifact",
-        codec="longcat",
+        codec="bicodec",
         data_source="qwen_cross_text",
         data_root=None,
         split="train",
@@ -216,16 +216,28 @@ def test_eval_artifact_main_loads_cross_text_pair(
         loaded["kwargs"] = kwargs
         return batch
 
+    def load_eval_backend(config, **kwargs):
+        loaded["backend_config"] = config
+        loaded["backend_kwargs"] = kwargs
+        return backend
+
     monkeypatch.setattr(eval_artifact, "_args", lambda: args)
-    monkeypatch.setattr(eval_artifact, "load_semantic_acoustic", lambda *args, **kwargs: backend)
+    monkeypatch.setattr(eval_artifact, "load_backend", load_eval_backend)
     monkeypatch.setattr(eval_artifact, "load_artifact", lambda *args, **kwargs: object())
     monkeypatch.setattr(eval_artifact, "load_batch", load_pair)
     monkeypatch.setattr(eval_artifact, "SemanticCodecRuntime", lambda *args: runtime)
 
     eval_artifact.main()
 
+    assert loaded["backend_config"].name == "bicodec"
+    assert loaded["backend_config"].get("model_dir") is None
+    assert loaded["backend_config"].get("revision") is None
+    assert loaded["backend_config"].get("local_files_only") is True
+    assert loaded["backend_config"].get("allow_unpinned_revision") is False
+    assert loaded["backend_kwargs"]["device"] == torch.device("cpu")
     assert loaded["data"].source == "qwen_cross_text"
     assert loaded["data"].sample_index == 2
+    assert loaded["kwargs"]["codec"] == "bicodec"
     assert loaded["kwargs"]["acoustic_layout"] is AcousticLayout.FRAME_ALIGNED
     result = json.loads(capsys.readouterr().out)
     assert result["artifact"] == "artifact"
@@ -272,8 +284,14 @@ def test_eval_artifact_can_include_private_metadata(
         passthrough_wav=None,
     )
 
+    def load_eval_backend(config, **kwargs):
+        assert config.name == "longcat"
+        assert list(config) == ["name"]
+        assert kwargs["device"] == torch.device("cpu")
+        return backend
+
     monkeypatch.setattr(eval_artifact, "_args", lambda: args)
-    monkeypatch.setattr(eval_artifact, "load_semantic_acoustic", lambda *args, **kwargs: backend)
+    monkeypatch.setattr(eval_artifact, "load_backend", load_eval_backend)
     monkeypatch.setattr(eval_artifact, "load_artifact", lambda *args, **kwargs: object())
     monkeypatch.setattr(eval_artifact, "load_batch", lambda *args, **kwargs: batch)
     monkeypatch.setattr(eval_artifact, "SemanticCodecRuntime", lambda *args: runtime)

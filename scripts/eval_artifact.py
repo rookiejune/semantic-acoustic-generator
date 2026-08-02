@@ -5,13 +5,15 @@ import json
 import sys
 import wave
 from array import array
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from anytrain.codec import AcousticLayout, SemanticAcousticCodes, load_semantic_acoustic
+from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
+from semantic_acoustic_codec.backend import load_backend
 from semantic_acoustic_codec.datamodule import (
     BatchingConfig,
     DataConfig,
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
 def main() -> None:
     args = _args()
     device = torch.device(args.device)
-    backend = load_semantic_acoustic(args.codec, device=device)
+    backend = load_backend(_backend_config(str(args.codec)), device=device)
     support = load_artifact(args.artifact, device=device)
     data = DataConfig(
         source=args.data_source,
@@ -70,6 +72,35 @@ def main() -> None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(serialized, encoding="utf-8")
     print(serialized)
+
+
+class _BackendConfig(Mapping[str, Any]):
+    def __init__(self, values: Mapping[str, Any]) -> None:
+        self._values = dict(values)
+        self.name = str(self._values["name"])
+
+    def __getitem__(self, key: str) -> Any:
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
+def _backend_config(codec: str) -> _BackendConfig:
+    if codec == "bicodec":
+        return _BackendConfig(
+            {
+                "name": "bicodec",
+                "model_dir": None,
+                "revision": None,
+                "local_files_only": True,
+                "allow_unpinned_revision": False,
+            }
+        )
+    return _BackendConfig({"name": codec})
 
 
 def _args() -> argparse.Namespace:
