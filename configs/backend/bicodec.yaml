@@ -1,1 +1,5 @@
 name: bicodec
+model_dir: null
+revision: null
+local_files_only: true
+allow_unpinned_revision: false

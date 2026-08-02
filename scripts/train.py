@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import hydra
 import torch
-from anytrain.codec import AcousticLayout, load_semantic_acoustic
+from anytrain.codec import AcousticLayout
 from anytrain.lightning import (
     EMACallback,
     LossSummaryCallback,
@@ -18,6 +18,7 @@ from anytrain.lightning import (
 from lightning import pytorch as pl
 from lightning.pytorch.callbacks import Callback
 
+from semantic_acoustic_codec.backend import load_backend
 from semantic_acoustic_codec.callback import (
     ArtifactExport,
     SampleLogConfig,
@@ -64,7 +65,7 @@ def run(config: DictConfig) -> None:
 
     codec = str(config.backend.name)
     data = _data_config(config.datamodule)
-    backend = load_semantic_acoustic(codec, device=device)
+    backend = load_backend(config.backend, device=device)
     semantic_pad_id = int(backend.semantic_codebook.size(0))
     acoustic_pad_ids = backend.acoustic_codebook_sizes
     data_module = DataModule(

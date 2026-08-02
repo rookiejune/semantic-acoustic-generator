@@ -581,7 +581,7 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
 
     monkeypatch.setattr(train.pl, "seed_everything", lambda *args, **kwargs: None)
     monkeypatch.setattr(train.pl, "Trainer", TrainerStub)
-    monkeypatch.setattr(train, "load_semantic_acoustic", lambda *args, **kwargs: FakeCodec())
+    monkeypatch.setattr(train, "load_backend", lambda *args, **kwargs: FakeCodec())
     monkeypatch.setattr(train, "load_batch", fail_single_batch)
     monkeypatch.setattr(train, "build_module", lambda *args, **kwargs: object())
     monkeypatch.setattr(train, "DataModule", DataModuleStub)

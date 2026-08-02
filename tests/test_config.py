@@ -58,6 +58,10 @@ def test_experiment_composition_can_be_overridden_explicitly() -> None:
     config = _compose("experiment=overfit", "backend=bicodec", "model/route=rvq")
 
     assert config.backend.name == "bicodec"
+    assert config.backend.model_dir is None
+    assert config.backend.revision is None
+    assert config.backend.local_files_only is True
+    assert config.backend.allow_unpinned_revision is False
     assert config.model.route == "rvq"
     assert config.datamodule.fixed_batch is True
     assert config.output_subdir == "overfit/bicodec/rvq-8l"
