@@ -5,7 +5,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Optional, Protocol, cast, runtime_checkable
 
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodec
@@ -328,7 +328,7 @@ def _config(data: Mapping[str, Any]) -> SemanticSupportConfig:
         route=Route(cast(str, data["route"])),
         condition_dim=int(data["condition_dim"]),
         decoder=DecoderConfig(
-            hidden_dim=cast(int | None, decoder["hidden_dim"]),
+            hidden_dim=cast(Optional[int], decoder["hidden_dim"]),
             layers=int(decoder["layers"]),
             heads=int(decoder["heads"]),
             ffn_ratio=int(decoder["ffn_ratio"]),
@@ -338,11 +338,11 @@ def _config(data: Mapping[str, Any]) -> SemanticSupportConfig:
             mtp_layers=int(_schema_field(decoder, "mtp_layers", owner="decoder")),
             mtp_heads=int(_schema_field(decoder, "mtp_heads", owner="decoder")),
             repa_feature_dim=cast(
-                int | None,
+                Optional[int],
                 _schema_field(decoder, "repa_feature_dim", owner="decoder"),
             ),
             repa_student_layer=cast(
-                int | None,
+                Optional[int],
                 _schema_field(decoder, "repa_student_layer", owner="decoder"),
             ),
             repa_loss_weight=float(
