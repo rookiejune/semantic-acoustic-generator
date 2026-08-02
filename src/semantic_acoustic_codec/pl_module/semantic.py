@@ -7,15 +7,16 @@ from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
 from anytrain.codec import SemanticAcousticCodec, masked_acoustic_features
+from anytrain.lightning import LightningLogMixin
 from lightning import LightningModule
 
 from semantic_acoustic_codec.config import Route
 from semantic_acoustic_codec.loss.repa import decode_group_metrics
+from semantic_acoustic_codec.runtime.artifact import save_artifact
 from semantic_acoustic_codec.runtime.semantic import (
     SemanticCodecSupport,
     SemanticSupportConfig,
     build_support,
-    save_artifact,
 )
 from semantic_acoustic_codec.types import SemanticCodecBatch
 
@@ -40,7 +41,7 @@ class _ExternalDependency(Generic[_DependencyT]):
         self.value = value
 
 
-class SemanticCodecModule(LightningModule):
+class SemanticCodecModule(LightningLogMixin, LightningModule):
     """Train the semantic-only unit generator owned by this package."""
 
     def __init__(
@@ -117,7 +118,7 @@ class SemanticCodecModule(LightningModule):
         target_features = None
         if self.support.route is Route.FM:
             target_features = self._target_features(batch)
-        acoustic_mask = _acoustic_mask(batch)
+        acoustic_mask = batch.target_acoustic_mask
         condition, reference_rows = self._condition(batch)
         output = self.support.generator.loss(
             batch,
@@ -128,43 +129,70 @@ class SemanticCodecModule(LightningModule):
             repa_teacher=self.repa_teacher,
         )
 
-        if output.logs:
-            for name, value in output.logs.items():
-                self.log(
-                    name, value, on_step=True, prog_bar=name == output.log_name, sync_dist=True
-                )
-        else:
-            self.log(output.log_name, output.loss, on_step=True, prog_bar=True, sync_dist=True)
-        self.log("train/batch_size", float(mask.size(0)), on_step=True, sync_dist=False)
-        self.log("train/valid_frames", mask.sum().float(), on_step=True, sync_dist=False)
-        self.log(
-            "train/reference_fraction",
-            reference_rows.float().mean(),
+        live: dict[str, Any] = {
+            f"{name}_loss": item.loss.mean() for name, item in output.items.items()
+        }
+        live.update({name: value for name, value in output.scalars.items()})
+        primary_key = f"{output.primary}_loss"
+        self.log_prefixed_dict(
+            "train",
+            {primary_key: live[primary_key]},
             on_step=True,
-            sync_dist=False,
+            prog_bar=True,
+            sync_dist=True,
         )
-        self.log(
-            "train/valid_acoustic_units",
-            acoustic_mask.sum().float(),
+        secondary = {name: value for name, value in live.items() if name != primary_key}
+        if secondary:
+            self.log_prefixed_dict(
+                "train",
+                secondary,
+                on_step=True,
+                prog_bar=False,
+                sync_dist=True,
+            )
+        self.log_prefixed_dict(
+            "train",
+            {
+                "batch_size": float(mask.size(0)),
+                "valid_frames": mask.sum().float(),
+                "reference_fraction": reference_rows.float().mean(),
+                "valid_acoustic_units": acoustic_mask.sum().float(),
+            },
             on_step=True,
             sync_dist=False,
         )
         if self.repa_teacher is not None:
-            for name, value in decode_group_metrics(mask).items():
-                self.log(f"train/repa/{name}", value, on_step=True, sync_dist=False)
-        if output.item.details is not None:
-            for name, value in output.item.details.items():
-                if name == "frames":
-                    continue
-                self.log(f"{output.log_name}/{name}", value.mean(), on_step=True, sync_dist=False)
-        result: dict[str, Any] = {"loss": output.loss, "item": output.item}
-        result.update(output.extras)
+            self.log_prefixed_dict(
+                "train/repa",
+                decode_group_metrics(mask),
+                on_step=True,
+                sync_dist=False,
+            )
+        primary_item = output.items[output.primary]
+        if primary_item.details is not None:
+            details = {
+                name: value.mean()
+                for name, value in primary_item.details.items()
+                if name != "frames"
+            }
+            if details:
+                self.log_prefixed_dict(
+                    f"train/{primary_key}",
+                    details,
+                    on_step=True,
+                    sync_dist=False,
+                )
+        result: dict[str, Any] = {"loss": output.loss, **output.items}
         return result
 
     @torch.no_grad()
     def validation_step(self, batch: SemanticCodecBatch, batch_idx: int) -> dict[str, Tensor]:
         reference_features = self._reference_features(batch)
-        reference_mask = None if reference_features is None else _reference_acoustic_mask(batch)
+        reference_mask = (
+            None
+            if reference_features is None
+            else batch.reference.acoustic_mask.to(device=batch.semantic_codes.device)
+        )
         without = self._validation_error(
             batch,
             reference_features=None,
@@ -255,7 +283,7 @@ class SemanticCodecModule(LightningModule):
             rows = torch.zeros(batch.semantic_codes.size(0), dtype=torch.bool, device=self.device)
             return condition, rows
 
-        reference_mask = _reference_acoustic_mask(batch)
+        reference_mask = batch.reference.acoustic_mask.to(device=batch.semantic_codes.device)
         rows = self._reference_rows(batch.semantic_codes.size(0))
         condition = self.support.condition(
             batch.semantic_codes,
@@ -301,7 +329,7 @@ class SemanticCodecModule(LightningModule):
                 device=prediction.device,
                 dtype=prediction.dtype,
             )
-            return _masked_mean((prediction - target).square().mean(dim=-1), _acoustic_mask(batch))
+            return _masked_mean((prediction - target).square().mean(dim=-1), batch.target_acoustic_mask)
         prediction = self.support.sample_acoustic_codes(
             batch.semantic_codes,
             mask=batch.mask,
@@ -312,24 +340,24 @@ class SemanticCodecModule(LightningModule):
         )
         target_codes = batch.acoustic_codes.to(device=prediction.device)
         error = (prediction != target_codes).float().mean(dim=-1)
-        return _masked_mean(error, _acoustic_mask(batch))
+        return _masked_mean(error, batch.target_acoustic_mask)
 
     @torch.no_grad()
     def _target_features(self, batch: SemanticCodecBatch) -> Tensor:
         return masked_acoustic_features(
             self.backend,
             batch.acoustic_codes,
-            _acoustic_mask(batch),
+            batch.target_acoustic_mask,
             validate=False,
         )
 
     @torch.no_grad()
     def _reference_features(self, batch: SemanticCodecBatch) -> Tensor | None:
-        codes = batch.reference_acoustic_codes
-        if codes is None:
+        if not batch.has_reference:
             return None
-        mask = _reference_acoustic_mask(batch)
-        return masked_acoustic_features(self.backend, codes, mask, validate=False)
+        reference = batch.reference
+        mask = reference.acoustic_mask.to(device=batch.semantic_codes.device)
+        return masked_acoustic_features(self.backend, reference.acoustic_codes, mask, validate=False)
 
 
 @torch.no_grad()
@@ -381,7 +409,7 @@ def feature_stats(
     backend: SemanticAcousticCodec,
     batch: SemanticCodecBatch,
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
-    acoustic_mask = _acoustic_mask(batch)
+    acoustic_mask = batch.target_acoustic_mask
     target = masked_acoustic_features(backend, batch.acoustic_codes, acoustic_mask).float()
     acoustic_mask = acoustic_mask.to(device=target.device)
     valid = target[acoustic_mask]
@@ -401,7 +429,7 @@ def dataset_feature_stats(
     squares = torch.zeros_like(total)
     count = 0
     for batch in batches:
-        mask = _acoustic_mask(batch)
+        mask = batch.target_acoustic_mask
         target = masked_acoustic_features(backend, batch.acoustic_codes, mask).double()
         valid = target[mask.to(device=target.device)]
         if valid.numel() == 0:
@@ -415,20 +443,6 @@ def dataset_feature_stats(
     variance = (squares / count - mean.square()).clamp_min(0)
     std = variance.sqrt().clamp_min(1e-5)
     return _tuple(mean), _tuple(std)
-
-
-def _acoustic_mask(batch: SemanticCodecBatch) -> Tensor:
-    mask = batch.acoustic_mask
-    if mask is None:
-        raise RuntimeError("SemanticCodecBatch must expose acoustic_mask after validation.")
-    return mask
-
-
-def _reference_acoustic_mask(batch: SemanticCodecBatch) -> Tensor:
-    mask = batch.reference_acoustic_mask
-    if mask is None:
-        raise RuntimeError("reference_acoustic_mask is required when reference codes are present.")
-    return mask.to(device=batch.semantic_codes.device)
 
 
 def _tuple(value: Tensor) -> tuple[float, ...]:

@@ -9,8 +9,9 @@ import hydra
 import torch
 from anytrain.codec import AcousticLayout, load_semantic_acoustic
 from anytrain.lightning import (
-    DataThroughputCallback,
     EMACallback,
+    LossSummaryCallback,
+    LossTimeBucketLoggerCallback,
     ModelCheckpoint,
     PerformanceCallback,
 )
@@ -22,6 +23,7 @@ from semantic_acoustic_codec.callback import (
     SampleLogConfig,
     SampleLogger,
     SemanticFrameUnits,
+    UnitThroughputCallback,
 )
 from semantic_acoustic_codec.config import (
     DecoderConfig,
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
     from omegaconf import DictConfig
 
     from semantic_acoustic_codec.loss.repa import Teacher
+    from semantic_acoustic_codec.types import SemanticCodecBatch
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
@@ -112,83 +115,8 @@ def run(config: DictConfig) -> None:
         repa_teacher=repa_teacher,
     )
 
-    callbacks: list[Callback] = [ArtifactExport(output_dir)]
-    performance = config.callback.performance
-    if bool(performance.get("enabled", True)):
-        callbacks.append(
-            PerformanceCallback(
-                model_flops_per_step=_optional_float(performance.get("model_flops_per_step")),
-                profile_flops=bool(performance.get("profile_flops", False)),
-                hardware_peak_flops=_optional_float(performance.get("hardware_peak_flops")),
-                log_every_n_steps=int(
-                    performance.get("log_every_n_steps", config.trainer.log_every_n_steps)
-                ),
-                warmup_steps=int(performance.get("warmup_steps", 20)),
-                measure_window_steps=int(performance.get("measure_window_steps", 100)),
-            )
-        )
-    data_throughput = config.callback.get("data_throughput")
-    if data_throughput is None or bool(data_throughput.get("enabled", True)):
-        throughput_cfg = {} if data_throughput is None else data_throughput
-        callbacks.append(
-            DataThroughputCallback(
-                data_units=SemanticFrameUnits(),
-                log_every_n_steps=int(
-                    throughput_cfg.get(
-                        "log_every_n_steps",
-                        performance.get("log_every_n_steps", config.trainer.log_every_n_steps),
-                    )
-                ),
-                warmup_steps=int(
-                    throughput_cfg.get("warmup_steps", performance.get("warmup_steps", 20))
-                ),
-                measure_window_steps=int(
-                    throughput_cfg.get(
-                        "measure_window_steps",
-                        performance.get("measure_window_steps", 100),
-                    )
-                ),
-            )
-        )
-    ema_decay = config.pl_module.get("ema_decay")
-    if ema_decay is not None:
-        ema = config.callback.get("ema")
-        callbacks.append(
-            EMACallback(
-                decay=float(ema_decay),
-                update_after_step=int(config.pl_module.get("ema_update_after_step", 0)),
-                use_ema_weights=bool(True if ema is None else ema.get("use_ema_weights", True)),
-            )
-        )
-    sample = config.callback.sample
-    if bool(sample.enabled) and fixed_batch.has_reference:
-        callbacks.append(
-            SampleLogger(
-                output_dir,
-                fixed_batch,
-                SampleLogConfig(
-                    every_n_train_steps=int(sample.every_n_train_steps),
-                    seed=int(sample.seed),
-                ),
-            )
-        )
-    elif bool(sample.enabled):
-        warnings.warn(
-            "sample callback disabled because the fixed sample has no reference pair.",
-            stacklevel=2,
-        )
     checkpoint = config.callback.checkpoint
-    if bool(checkpoint.enabled):
-        callbacks.append(
-            ModelCheckpoint(
-                dirpath=output_dir / "checkpoints",
-                filename=str(checkpoint.filename),
-                save_last=bool(checkpoint.save_last),
-                save_top_k=int(checkpoint.save_top_k),
-                every_n_train_steps=int(checkpoint.every_n_train_steps),
-                auto_insert_metric_name=False,
-            )
-        )
+    callbacks = _build_callbacks(config, output_dir=output_dir, fixed_batch=fixed_batch)
 
     ckpt_path = _ckpt_path(config)
     trainer = pl.Trainer(
@@ -304,6 +232,169 @@ def _repa_teacher(
         layer=layer,
         sample_rate=int(backend.sample_rate if sample_rate is None else sample_rate),
         device=device,
+    )
+
+
+def _build_callbacks(
+    config: DictConfig,
+    *,
+    output_dir: Path,
+    fixed_batch: SemanticCodecBatch,
+) -> list[Callback]:
+    callback_config = config.callback
+    performance = callback_config.performance
+    callbacks: list[Callback] = [ArtifactExport(output_dir)]
+    callbacks.extend(_loss_callbacks(callback_config))
+
+    performance_callback = _performance_callback(
+        performance,
+        trainer_log_every_n_steps=config.trainer.log_every_n_steps,
+    )
+    if performance_callback is not None:
+        callbacks.append(performance_callback)
+
+    throughput_callback = _data_throughput_callback(
+        callback_config.get("data_throughput"),
+        performance=performance,
+        trainer_log_every_n_steps=config.trainer.log_every_n_steps,
+    )
+    if throughput_callback is not None:
+        callbacks.append(throughput_callback)
+
+    ema_callback = _ema_callback(config.pl_module, callback_config.get("ema"))
+    if ema_callback is not None:
+        callbacks.append(ema_callback)
+
+    sample_callback = _sample_callback(callback_config.sample, output_dir, fixed_batch)
+    if sample_callback is not None:
+        callbacks.append(sample_callback)
+
+    checkpoint_callback = _checkpoint_callback(callback_config.checkpoint, output_dir)
+    if checkpoint_callback is not None:
+        callbacks.append(checkpoint_callback)
+    return callbacks
+
+
+def _loss_callbacks(config: Any) -> list[Callback]:
+    callbacks: list[Callback] = []
+    loss_summary = config.get("loss_summary")
+    if loss_summary is None or bool(loss_summary.get("enabled", True)):
+        summary = {} if loss_summary is None else loss_summary
+        callbacks.append(LossSummaryCallback(window_capacity=int(summary.get("window_capacity", 20))))
+
+    loss_time_bucket = config.get("loss_time_bucket")
+    if loss_time_bucket is None or bool(loss_time_bucket.get("enabled", True)):
+        bucket = {} if loss_time_bucket is None else loss_time_bucket
+        every_n_steps = bucket.get("every_n_steps", 100)
+        callbacks.append(
+            LossTimeBucketLoggerCallback(
+                item_name=str(bucket.get("item_name", "flow")),
+                detail_key=str(bucket.get("detail_key", "t")),
+                histogram_tag=cast(
+                    Optional[str],
+                    bucket.get("histogram_tag", "train/flow_loss/t_hist"),
+                ),
+                scalar_template=str(
+                    bucket.get(
+                        "scalar_template",
+                        "train/flow_loss/t/{lower:.1f}_{upper:.1f}",
+                    )
+                ),
+                every_n_steps=None if every_n_steps is None else int(every_n_steps),
+                bucket_count=int(bucket.get("bucket_count", 10)),
+            )
+        )
+    return callbacks
+
+
+def _performance_callback(
+    config: Any,
+    *,
+    trainer_log_every_n_steps: Any,
+) -> Callback | None:
+    if not bool(config.get("enabled", True)):
+        return None
+    return PerformanceCallback(
+        model_flops_per_step=_optional_float(config.get("model_flops_per_step")),
+        profile_flops=bool(config.get("profile_flops", False)),
+        hardware_peak_flops=_optional_float(config.get("hardware_peak_flops")),
+        log_every_n_steps=int(config.get("log_every_n_steps", trainer_log_every_n_steps)),
+        warmup_steps=int(config.get("warmup_steps", 20)),
+        measure_window_steps=int(config.get("measure_window_steps", 100)),
+    )
+
+
+def _data_throughput_callback(
+    config: Any,
+    *,
+    performance: Any,
+    trainer_log_every_n_steps: Any,
+) -> Callback | None:
+    if config is not None and not bool(config.get("enabled", True)):
+        return None
+    throughput = {} if config is None else config
+    return UnitThroughputCallback(
+        unit_provider=SemanticFrameUnits(),
+        log_every_n_steps=int(
+            throughput.get(
+                "log_every_n_steps",
+                performance.get("log_every_n_steps", trainer_log_every_n_steps),
+            )
+        ),
+        warmup_steps=int(throughput.get("warmup_steps", performance.get("warmup_steps", 20))),
+        measure_window_steps=int(
+            throughput.get(
+                "measure_window_steps",
+                performance.get("measure_window_steps", 100),
+            )
+        ),
+    )
+
+
+def _ema_callback(config: Any, ema_config: Any) -> Callback | None:
+    ema_decay = config.get("ema_decay")
+    if ema_decay is None:
+        return None
+    return EMACallback(
+        decay=float(ema_decay),
+        update_after_step=int(config.get("ema_update_after_step", 0)),
+        use_ema_weights=bool(True if ema_config is None else ema_config.get("use_ema_weights", True)),
+    )
+
+
+def _sample_callback(
+    config: Any,
+    output_dir: Path,
+    fixed_batch: SemanticCodecBatch,
+) -> Callback | None:
+    if not bool(config.enabled):
+        return None
+    if not fixed_batch.has_reference:
+        warnings.warn(
+            "sample callback disabled because the fixed sample has no reference pair.",
+            stacklevel=2,
+        )
+        return None
+    return SampleLogger(
+        output_dir,
+        fixed_batch,
+        SampleLogConfig(
+            every_n_train_steps=int(config.every_n_train_steps),
+            seed=int(config.seed),
+        ),
+    )
+
+
+def _checkpoint_callback(config: Any, output_dir: Path) -> Callback | None:
+    if not bool(config.enabled):
+        return None
+    return ModelCheckpoint(
+        dirpath=output_dir / "checkpoints",
+        filename=str(config.filename),
+        save_last=bool(config.save_last),
+        save_top_k=int(config.save_top_k),
+        every_n_train_steps=int(config.every_n_train_steps),
+        auto_insert_metric_name=False,
     )
 
 

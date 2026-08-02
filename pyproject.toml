@@ -41,7 +41,7 @@ extraPaths = [
     "../third_party/anytrain/src",
     "../third_party/anydataset/src",
 ]
-pythonVersion = "3.12"
+pythonVersion = "3.9"
 typeCheckingMode = "standard"
 venvPath = "/Users/zhuyin/miniconda3/envs"
 venv = "py312"

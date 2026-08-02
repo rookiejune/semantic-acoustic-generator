@@ -14,8 +14,8 @@ from semantic_acoustic_codec.pl_module import build_module
 from semantic_acoustic_codec.runtime import (
     SemanticCodecRuntime,
     SemanticSupportConfig,
-    load_artifact,
 )
+from semantic_acoustic_codec.runtime.artifact import load_artifact
 from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
 
 
@@ -238,10 +238,14 @@ def test_fixed_sample_logger_emits_reference_token_passthrough(tmp_path) -> None
     assert torch.equal(passthrough.acoustic, reference_acoustic)
 
     audio = {tag: value for tag, value, _, _ in experiment.audio}
+    assert "sample/target_codec_reconstruction" in audio
+    assert "sample/reference_codec_reconstruction" in audio
     assert "sample/reference_token_passthrough" in audio
     assert torch.equal(
         torch.unique(audio["sample/reference_token_passthrough"]),
         torch.tensor([605.0]),
     )
     events = json.loads((tmp_path / "sample_metrics.json").read_text(encoding="utf-8"))
+    assert events[0]["target_codec_reconstruction"]["finite"] is True
+    assert events[0]["reference_codec_reconstruction"]["finite"] is True
     assert events[0]["reference_token_passthrough"]["finite"] is True

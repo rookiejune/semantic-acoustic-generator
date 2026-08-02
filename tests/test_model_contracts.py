@@ -6,11 +6,14 @@ import pytest
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes, masked_acoustic_features
 from anytrain.framework.flow_matching import ContinuousFlowRuntime
-from anytrain.loss import MaskedCodebookCrossEntropyLoss, MaskedCosineAlignmentLoss
+from anytrain.loss import (
+    MaskedCodebookCrossEntropyLoss,
+    MaskedCosineAlignmentLoss,
+    MaskedFrameMSELoss,
+)
 from anytrain.module.qwen import QwenMTPCodebookPredictor
 
 from semantic_acoustic_codec.config import DecoderConfig, Route, RVQPredictor
-from semantic_acoustic_codec.loss import FlowLoss
 from semantic_acoustic_codec.model import (
     AcousticRVQDecoder,
     DiTDecoder,
@@ -25,6 +28,8 @@ from semantic_acoustic_codec.runtime import (
     SemanticCodecRuntime,
     SemanticSupportConfig,
     build_support,
+)
+from semantic_acoustic_codec.runtime.artifact import (
     load_artifact,
     load_generator_artifact,
     save_artifact,
@@ -103,7 +108,21 @@ def test_fm_loss_and_sample_shapes() -> None:
     mask = torch.tensor([[True, True, True, True], [True, True, False, False]])
     decoder = DiTDecoder(10, 6, layers=1, heads=2, ffn_ratio=2)
 
-    loss = FlowLoss()(decoder, condition, target, mask, ContinuousFlowRuntime())
+    runtime = ContinuousFlowRuntime()
+    flow_sample = runtime.training_sample(target)
+    prediction = decoder(
+        flow_sample.x_t,
+        flow_sample.t,
+        condition=condition,
+        mask=mask,
+    )
+    loss = MaskedFrameMSELoss()(
+        prediction,
+        flow_sample.velocity,
+        mask,
+        details={"t": flow_sample.t},
+        detail_dtype=target.dtype,
+    )
     sample = decoder.sample(condition, mask=mask, steps=2)
 
     assert loss.loss.shape == (2,)
@@ -177,12 +196,20 @@ def test_fm_loss_returns_repa_features_when_configured() -> None:
         repa_student_layer=1,
     )
 
-    item, representation = FlowLoss().forward_with_features(
-        decoder,
-        condition,
-        target,
+    runtime = ContinuousFlowRuntime()
+    flow_sample = runtime.training_sample(target)
+    prediction, representation = decoder.forward_with_features(
+        flow_sample.x_t,
+        flow_sample.t,
+        condition=condition,
+        mask=mask,
+    )
+    item = MaskedFrameMSELoss()(
+        prediction,
+        flow_sample.velocity,
         mask,
-        ContinuousFlowRuntime(),
+        details={"t": flow_sample.t},
+        detail_dtype=target.dtype,
     )
 
     assert item.loss.shape == (2,)

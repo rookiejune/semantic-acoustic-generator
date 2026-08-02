@@ -19,8 +19,8 @@ from semantic_acoustic_codec.runtime import (
     SemanticCodecSupport,
     SemanticSupportConfig,
     build_support,
-    save_artifact,
 )
+from semantic_acoustic_codec.runtime.artifact import load_artifact, save_artifact
 
 
 class FakeBackend:
@@ -268,7 +268,7 @@ def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
         return original(options, **kwargs)
 
     monkeypatch.setattr(runtime_semantic, "build_support", capture)
-    loaded = runtime_semantic.load_artifact(tmp_path)
+    loaded = load_artifact(tmp_path)
 
     assert len(captured) == 1
     assert captured[0].decoder.rvq_predictor is RVQPredictor.MTP
@@ -301,7 +301,7 @@ def test_schema_seven_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
     config_path.write_text(json.dumps(data), encoding="utf-8")
 
     with pytest.raises(ValueError, match="missing 'rvq_predictor'"):
-        runtime_semantic.load_artifact(tmp_path)
+        load_artifact(tmp_path)
 
 
 def _support(route: Route) -> tuple[SemanticCodecSupport, SeededGenerator]:

@@ -14,19 +14,16 @@ from anytrain.codec import (
     masked_acoustic_features,
 )
 from anytrain.framework.flow_matching import ContinuousFlowRuntime
-from anytrain.loss import MaskedCodebookCrossEntropyLoss
 
 from semantic_acoustic_codec.config import DecoderConfig, Route
 from semantic_acoustic_codec.datamodule import BatchingConfig, DataConfig, load_batch
-from semantic_acoustic_codec.loss import FlowLoss
-from semantic_acoustic_codec.model import RVQCodeGenerator, build_route
+from semantic_acoustic_codec.model import build_route
 from semantic_acoustic_codec.runtime import (
     SemanticCodecRuntime,
     SemanticSupportConfig,
     build_support,
-    load_artifact,
-    save_artifact,
 )
+from semantic_acoustic_codec.runtime.artifact import load_artifact, save_artifact
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -213,22 +210,23 @@ def _route_smoke(
         )
         condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
         if route is Route.FM:
-            item = FlowLoss()(
-                modules.generator.core,
+            output = modules.generator.loss_from_condition(
                 condition,
-                target,
                 mask,
-                ContinuousFlowRuntime(),
+                target_features=target,
+                feature_mean=target.new_zeros((1, 1, target.size(-1))),
+                feature_std=target.new_ones((1, 1, target.size(-1))),
+                flow_runtime=ContinuousFlowRuntime(),
             )
         elif route is Route.RVQ:
-            generator = modules.generator
-            if not isinstance(generator, RVQCodeGenerator):
-                raise RuntimeError("RVQ route built a non-RVQ generator.")
-            logits = generator.core(condition, acoustic, mask=mask)
-            item = MaskedCodebookCrossEntropyLoss()(logits, acoustic, mask)
+            output = modules.generator.loss_from_condition(
+                condition,
+                mask,
+                target_codes=acoustic,
+            )
         else:
             raise AssertionError(f"unsupported route: {route}")
-        loss = item.loss.mean()
+        loss = output.loss
         loss.backward()
         optimizer.step()
         if not bool(torch.isfinite(loss)):
@@ -350,12 +348,13 @@ def _data_smoke(
         raise RuntimeError("real target acoustic features must be finite.")
     reference_shape: tuple[int, ...] | None = None
     if batch.has_reference:
-        reference_acoustic = _reference_acoustic(batch).to(device)
-        reference_mask = _reference_acoustic_mask(batch).to(device)
-        reference = masked_acoustic_features(backend, reference_acoustic, reference_mask)
-        if not bool(torch.isfinite(reference).all()):
+        reference = batch.reference
+        reference_acoustic = reference.acoustic_codes.to(device)
+        reference_mask = reference.acoustic_mask.to(device)
+        reference_features = masked_acoustic_features(backend, reference_acoustic, reference_mask)
+        if not bool(torch.isfinite(reference_features).all()):
             raise RuntimeError("real reference acoustic features must be finite.")
-        reference_shape = tuple(reference.shape)
+        reference_shape = tuple(reference_features.shape)
     print(
         "data smoke ok: "
         f"source={source} codec={codec} split={split} index={index} "
@@ -377,46 +376,15 @@ def _validate_batch(batch: SemanticCodecBatch) -> None:
     if not bool((batch.acoustic_codes[batch.target_acoustic_mask] >= 0).all()):
         raise RuntimeError("valid acoustic codes must be non-negative.")
     if batch.has_reference:
-        reference_semantic = _reference_semantic(batch)
-        reference_acoustic = _reference_acoustic(batch)
-        reference_mask = _reference_mask(batch)
-        reference_acoustic_mask = _reference_acoustic_mask(batch)
-        if not bool((reference_semantic[reference_mask] >= 0).all()):
+        reference = batch.reference
+        if not bool((reference.semantic_codes[reference.mask] >= 0).all()):
             raise RuntimeError("valid reference semantic codes must be non-negative.")
-        if not bool((reference_acoustic[reference_acoustic_mask] >= 0).all()):
+        if not bool((reference.acoustic_codes[reference.acoustic_mask] >= 0).all()):
             raise RuntimeError("valid reference acoustic codes must be non-negative.")
 
 
 def _generator(seed: int) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
-
-
-def _reference_semantic(batch: SemanticCodecBatch) -> Tensor:
-    value = batch.reference_semantic_codes
-    if value is None:
-        raise RuntimeError("reference_semantic_codes are required for paired smoke data.")
-    return value
-
-
-def _reference_acoustic(batch: SemanticCodecBatch) -> Tensor:
-    value = batch.reference_acoustic_codes
-    if value is None:
-        raise RuntimeError("reference_acoustic_codes are required for paired smoke data.")
-    return value
-
-
-def _reference_mask(batch: SemanticCodecBatch) -> Tensor:
-    value = batch.reference_mask
-    if value is None:
-        raise RuntimeError("reference_mask is required for paired smoke data.")
-    return value
-
-
-def _reference_acoustic_mask(batch: SemanticCodecBatch) -> Tensor:
-    value = batch.reference_acoustic_mask
-    if value is None:
-        raise RuntimeError("reference_acoustic_mask is required for paired smoke data.")
-    return value
 
 
 if __name__ == "__main__":

@@ -17,7 +17,8 @@ from semantic_acoustic_codec.datamodule import (
     DataConfig,
     load_batch,
 )
-from semantic_acoustic_codec.runtime import SemanticCodecRuntime, load_artifact
+from semantic_acoustic_codec.runtime import SemanticCodecRuntime
+from semantic_acoustic_codec.runtime.artifact import load_artifact
 
 if TYPE_CHECKING:
     from anytrain.codec import SemanticAcousticCodec

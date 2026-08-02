@@ -29,8 +29,8 @@ try:
         SamplingConfig,
         SemanticCodecRuntime,
         SemanticSupportConfig,
-        load_artifact,
     )
+    from semantic_acoustic_codec.runtime.artifact import load_artifact
     from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
 except TypeError as exc:
     if "SPEAKER_ID" not in str(exc):
@@ -378,11 +378,11 @@ def test_paired_reference_dropout_is_sampled_per_row(monkeypatch: pytest.MonkeyP
 
     logs: dict[str, Any] = {}
 
-    def log(name: str, value: Any, **_: Any) -> None:
-        logs[name] = value
+    def log_dict(metrics: dict[str, Any], **_: Any) -> None:
+        logs.update(metrics)
 
     monkeypatch.setattr(torch, "rand", rand)
-    monkeypatch.setattr(module, "log", log)
+    monkeypatch.setattr(module, "log_dict", log_dict)
     handle = module.support.reference_conditioner.register_forward_pre_hook(
         capture,
         with_kwargs=True,
@@ -482,7 +482,8 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
     assert "target_text" not in event["metadata"]
     assert "reference_text" not in event["metadata"]
     assert event["generated_with_reference"]["finite"] is True
-    assert event["reference_full_reconstruction"]["finite"] is True
+    assert event["target_codec_reconstruction"]["finite"] is True
+    assert event["reference_codec_reconstruction"]["finite"] is True
     assert event["reference_gain"] == pytest.approx(
         event["feature_mse_without_reference"] - event["feature_mse_with_reference"]
     )
@@ -493,8 +494,8 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
     assert {item[0] for item in experiment.audio} == {
         "sample/generated_without_reference",
         "sample/generated_with_reference",
-        "sample/reconstruction_full_units",
-        "sample/reference_full_units",
+        "sample/target_codec_reconstruction",
+        "sample/reference_codec_reconstruction",
     }
     assert {item[0] for item in experiment.scalars} == {
         "sample/feature_mse_without_reference",
@@ -503,7 +504,7 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
     }
     assert all(item[2] == 2 and item[3] == backend.sample_rate for item in experiment.audio)
     state = callback.state_dict()
-    assert state == {"last_logged_step": 2}
+    assert state == {"last_logged_step": 2, "logged_static_audio": True}
 
     restored = SampleLogger(
         tmp_path,
@@ -522,12 +523,18 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
     events = json.loads((tmp_path / "sample_metrics.json").read_text(encoding="utf-8"))
     assert len(events) == 2
     assert events[1]["metadata"] == event["metadata"]
+    assert events[1]["target_codec_reconstruction"] is None
+    assert events[1]["reference_codec_reconstruction"] is None
     assert events[1]["feature_mse_without_reference"] == pytest.approx(
         event["feature_mse_without_reference"]
     )
     assert events[1]["feature_mse_with_reference"] == pytest.approx(
         event["feature_mse_with_reference"]
     )
+    assert {item[0] for item in experiment.audio if item[2] == 4} == {
+        "sample/generated_without_reference",
+        "sample/generated_with_reference",
+    }
     assert len(generators) == 4
     assert generators[2] is not generators[3]
     assert all(torch.equal(state, generator_states[0]) for state in generator_states[1:])
@@ -680,6 +687,50 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
     assert fits[0]["ckpt_path"] == str(tmp_path / "last.ckpt")
 
 
+def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
+    omegaconf = pytest.importorskip("omegaconf")
+    from scripts import train
+
+    config = omegaconf.OmegaConf.create(
+        {
+            "callback": {
+                "sample": {"enabled": True, "every_n_train_steps": 2, "seed": 7},
+                "performance": {
+                    "enabled": False,
+                    "log_every_n_steps": 5,
+                    "warmup_steps": 1,
+                    "measure_window_steps": 3,
+                },
+                "data_throughput": {"enabled": False},
+                "loss_summary": {"enabled": False},
+                "loss_time_bucket": {"enabled": False},
+                "checkpoint": {
+                    "enabled": True,
+                    "filename": "step-{step:08d}",
+                    "save_last": True,
+                    "save_top_k": -1,
+                    "every_n_train_steps": 2,
+                },
+            },
+            "pl_module": {"ema_decay": 0.999, "ema_update_after_step": 4},
+            "trainer": {"log_every_n_steps": 11},
+        }
+    )
+
+    callbacks = train._build_callbacks(
+        config,
+        output_dir=tmp_path,
+        fixed_batch=_paired_batch(FakeCodec()),
+    )
+
+    assert [type(callback).__name__ for callback in callbacks] == [
+        "ArtifactExport",
+        "EMACallback",
+        "SampleLogger",
+        "ModelCheckpoint",
+    ]
+
+
 def test_training_module_adds_repa_loss_with_teacher() -> None:
     backend = FakeCodec()
     batch = collate_codes(
@@ -712,6 +763,7 @@ def test_training_module_adds_repa_loss_with_teacher() -> None:
     loss.backward()
 
     assert torch.isfinite(loss)
+    assert "flow" in output
     assert "repa" in output
 
 
