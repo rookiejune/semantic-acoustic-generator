@@ -11,4 +11,4 @@ defaults:
   - override /trainer: default
   - _self_
 
-output_subdir: bicodec/dit-8l/fixed-speaker
+output_subdir: bicodec/dit-8l/cross-text

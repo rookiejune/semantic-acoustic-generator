@@ -10,14 +10,14 @@ max_seconds: null
 overlong: error
 sample_limit: null
 batch_size: 8
-num_workers: 8
+num_workers: 12
 pin_memory: true
 persistent_workers: true
 fixed_batch: false
 batching:
   enabled: true
-  max_batch_seconds: 8.0
-  planning_window: 256
+  max_batch_seconds: 32.0
+  planning_window: 512
   prefetch_factor: 4
   drop_distributed_tail: true
   seed: 0

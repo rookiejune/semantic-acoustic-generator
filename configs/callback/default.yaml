@@ -4,6 +4,9 @@ sample:
   seed: 0
 performance:
   enabled: true
+  # Production default: no per-step FLOPs counter. Short screening/ablation/smoke
+  # experiments opt into profile_flops=true; longruns pass a calibrated
+  # model_flops_per_step or model_flops_per_batch instead.
   model_flops_per_step: null
   profile_flops: false
   hardware_peak_flops: null
@@ -15,6 +18,17 @@ data_throughput:
   log_every_n_steps: 100
   warmup_steps: 20
   measure_window_steps: 100
+loss_summary:
+  enabled: true
+  window_capacity: 20
+loss_time_bucket:
+  enabled: true
+  item_name: flow
+  detail_key: t
+  histogram_tag: train/flow_loss/t_hist
+  scalar_template: "train/flow_loss/t/{lower:.1f}_{upper:.1f}"
+  every_n_steps: 100
+  bucket_count: 10
 checkpoint:
   enabled: true
   filename: step-{step:08d}
