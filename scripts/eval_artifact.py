@@ -130,10 +130,11 @@ def _evaluate(
     semantic_mask = batch.mask.to(device=device)
     acoustic = batch.acoustic_codes.to(device=device)
     acoustic_mask = batch.target_acoustic_mask.to(device=device)
-    reference_semantic = _reference_semantic(batch).to(device=device)
-    reference_semantic_mask = _reference_mask(batch).to(device=device)
-    reference_acoustic = _reference_acoustic(batch).to(device=device)
-    reference_acoustic_mask = _reference_acoustic_mask(batch).to(device=device)
+    reference = batch.reference
+    reference_semantic = reference.semantic_codes.to(device=device)
+    reference_semantic_mask = reference.mask.to(device=device)
+    reference_acoustic = reference.acoustic_codes.to(device=device)
+    reference_acoustic_mask = reference.acoustic_mask.to(device=device)
 
     target_features = _codec_features(backend, acoustic, acoustic_mask)
     reference_features = _codec_features(
@@ -200,8 +201,9 @@ def _summary(
     args: argparse.Namespace,
     batch: SemanticCodecBatch,
 ) -> dict[str, Any]:
-    reference_semantic = _reference_semantic(batch)
-    reference_acoustic = _reference_acoustic(batch)
+    reference = batch.reference
+    reference_semantic = reference.semantic_codes
+    reference_acoustic = reference.acoustic_codes
     summaries = {
         name: _waveform_summary(value, sample_rate=sample_rate)
         for name, value in audio.items()
@@ -299,34 +301,6 @@ def _feature_mse(generated: Tensor, target: Tensor, mask: Tensor) -> float:
     if not bool(torch.isfinite(value).detach().cpu()):
         raise ValueError("artifact feature MSE must be finite.")
     return float(value.detach().cpu())
-
-
-def _reference_semantic(batch: SemanticCodecBatch) -> Tensor:
-    value = batch.reference_semantic_codes
-    if value is None:
-        raise RuntimeError("reference_semantic_codes are required for artifact evaluation.")
-    return value
-
-
-def _reference_acoustic(batch: SemanticCodecBatch) -> Tensor:
-    value = batch.reference_acoustic_codes
-    if value is None:
-        raise RuntimeError("reference_acoustic_codes are required for artifact evaluation.")
-    return value
-
-
-def _reference_mask(batch: SemanticCodecBatch) -> Tensor:
-    value = batch.reference_mask
-    if value is None:
-        raise RuntimeError("reference_mask is required for artifact evaluation.")
-    return value
-
-
-def _reference_acoustic_mask(batch: SemanticCodecBatch) -> Tensor:
-    value = batch.reference_acoustic_mask
-    if value is None:
-        raise RuntimeError("reference_acoustic_mask is required for artifact evaluation.")
-    return value
 
 
 def _waveform_summary(waveform: Tensor, *, sample_rate: int) -> dict[str, Any]:

@@ -63,6 +63,14 @@ class SemanticCodecPairMetadata:
             raise ValueError("target and reference text must differ.")
 
 
+@dataclass(frozen=True)
+class SemanticCodecSide:
+    semantic_codes: Tensor
+    acoustic_codes: Tensor
+    mask: Tensor
+    acoustic_mask: Tensor
+
+
 @dataclass(eq=False)
 class SemanticCodecBatch:
     semantic_codes: Tensor
@@ -159,6 +167,33 @@ class SemanticCodecBatch:
         if self.acoustic_mask is None:
             raise RuntimeError("SemanticCodecBatch must expose acoustic_mask after validation.")
         return self.acoustic_mask
+
+    @property
+    def target(self) -> SemanticCodecSide:
+        return SemanticCodecSide(
+            semantic_codes=self.semantic_codes,
+            acoustic_codes=self.acoustic_codes,
+            mask=self.mask,
+            acoustic_mask=self.target_acoustic_mask,
+        )
+
+    @property
+    def reference(self) -> SemanticCodecSide:
+        return SemanticCodecSide(
+            semantic_codes=_required_reference(
+                self.reference_semantic_codes,
+                name="reference_semantic_codes",
+            ),
+            acoustic_codes=_required_reference(
+                self.reference_acoustic_codes,
+                name="reference_acoustic_codes",
+            ),
+            mask=_required_reference(self.reference_mask, name="reference_mask"),
+            acoustic_mask=_required_reference(
+                self.reference_acoustic_mask,
+                name="reference_acoustic_mask",
+            ),
+        )
 
     @property
     def has_reference(self) -> bool:
@@ -259,6 +294,12 @@ def _tensor(value: Tensor | None) -> Tensor:
     return value
 
 
+def _required_reference(value: Tensor | None, *, name: str) -> Tensor:
+    if value is None:
+        raise RuntimeError(f"{name} is required for paired semantic codec batches.")
+    return value
+
+
 def _check_positive_int(value: object, *, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{name} must be an integer.")
@@ -266,4 +307,4 @@ def _check_positive_int(value: object, *, name: str) -> None:
         raise ValueError(f"{name} must be positive.")
 
 
-__all__ = ["SemanticCodecBatch", "SemanticCodecPairMetadata"]
+__all__ = ["SemanticCodecBatch", "SemanticCodecPairMetadata", "SemanticCodecSide"]
