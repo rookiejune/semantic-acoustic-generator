@@ -58,6 +58,7 @@ class FlowLoss(nn.Module):
         runtime: FlowRuntime,
         *,
         validate: bool = True,
+        include_details: bool = True,
     ) -> LossItem:
         if validate:
             self._validate_inputs(condition, target, mask)
@@ -72,7 +73,13 @@ class FlowLoss(nn.Module):
                 mask=mask,
                 validate=False,
             )
-        return self._loss(prediction, sample, target, mask)
+        return self._loss(
+            prediction,
+            sample,
+            target,
+            mask,
+            include_details=include_details,
+        )
 
     def forward_with_features(
         self,
@@ -83,6 +90,7 @@ class FlowLoss(nn.Module):
         runtime: FlowRuntime,
         *,
         validate: bool = True,
+        include_details: bool = True,
     ) -> tuple[LossItem, Tensor]:
         if validate:
             self._validate_inputs(condition, target, mask)
@@ -102,7 +110,16 @@ class FlowLoss(nn.Module):
                 mask=mask,
                 validate=False,
             )
-        return self._loss(prediction, sample, target, mask), representation
+        return (
+            self._loss(
+                prediction,
+                sample,
+                target,
+                mask,
+                include_details=include_details,
+            ),
+            representation,
+        )
 
     def _loss(
         self,
@@ -110,16 +127,21 @@ class FlowLoss(nn.Module):
         sample: TrainingSample,
         target: Tensor,
         mask: Tensor,
+        *,
+        include_details: bool,
     ) -> LossItem:
         if prediction.shape != sample.velocity.shape:
             raise ValueError("flow decoder output must match target latent shape.")
-        return self.frame_loss(
+        item = self.frame_loss(
             prediction,
             sample.velocity,
             mask,
             details={"t": sample.t},
             detail_dtype=target.dtype,
         )
+        if include_details:
+            return item
+        return LossItem(loss=item.loss, details=None)
 
     def _validate_inputs(self, condition: Tensor, target: Tensor, mask: Tensor) -> None:
         if condition.dim() != 3 or target.dim() != 3 or mask.dim() != 2:

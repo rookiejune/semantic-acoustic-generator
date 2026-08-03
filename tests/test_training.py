@@ -198,12 +198,12 @@ def _paired_batch(backend: FakeCodec) -> SemanticCodecBatch:
         mask=target.mask,
         semantic_pad_id=target.semantic_pad_id,
         acoustic_pad_ids=target.acoustic_pad_ids,
-        acoustic_mask=target.target_acoustic_mask,
+        acoustic_mask=target.acoustic_mask,
         acoustic_layout=target.acoustic_layout,
         reference_semantic_codes=reference.semantic_codes,
         reference_acoustic_codes=reference.acoustic_codes,
         reference_mask=reference.mask,
-        reference_acoustic_mask=reference.target_acoustic_mask,
+        reference_acoustic_mask=reference.acoustic_mask,
         metadata=metadata,
     )
 
@@ -330,6 +330,48 @@ def test_training_module_rejects_non_finite_loss(monkeypatch: pytest.MonkeyPatch
 
     with pytest.raises(FloatingPointError, match="flow training loss is non-finite"):
         module.training_step(batch, 0)
+
+
+def test_deferred_finite_loss_guard_is_sticky_and_checkpoint_safe() -> None:
+    backend = FakeCodec()
+    batch = collate_codes(
+        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
+        semantic_pad_id=backend.semantic_codebook.size(0),
+        acoustic_pad_ids=backend.acoustic_codebook_sizes,
+    )
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=10,
+        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+    )
+    module = build_module(backend, config, batch, normalize_features=True)
+    module._defer_finite_training_loss(torch.tensor(True), name="flow")
+    module._defer_finite_training_loss(torch.tensor(False), name="flow")
+    module._defer_finite_training_loss(torch.tensor(True), name="flow")
+
+    with pytest.raises(FloatingPointError, match="flow training loss is non-finite"):
+        module.on_save_checkpoint({"state_dict": {}})
+
+
+def test_deferred_finite_loss_guard_resets_after_successful_flush() -> None:
+    backend = FakeCodec()
+    batch = collate_codes(
+        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
+        semantic_pad_id=backend.semantic_codebook.size(0),
+        acoustic_pad_ids=backend.acoustic_codebook_sizes,
+    )
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=10,
+        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+    )
+    module = build_module(backend, config, batch, normalize_features=True)
+    module._defer_finite_training_loss(torch.tensor(True), name="flow")
+
+    module.on_train_end()
+
+    assert module._finite_training_loss_ok is None
+    assert module._finite_training_loss_name is None
 
 
 def test_training_resume_uses_configured_learning_rate(tmp_path: Path) -> None:
@@ -551,6 +593,7 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
         mask: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
+        cfg_scale: float | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
         assert generator is not None
@@ -562,6 +605,7 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
             mask=mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
+            cfg_scale=cfg_scale,
             generator=generator,
         )
 
@@ -652,6 +696,7 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
     from scripts import train
 
     fits: list[dict[str, Any]] = []
+    built: list[dict[str, Any]] = []
     fixed_batch = collate_codes(
         [torch.tensor([[1, 1, 2], [2, 3, 4]], dtype=torch.long)],
         semantic_pad_id=FakeCodec.semantic_codebook.size(0),
@@ -670,6 +715,9 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
         def sample_batch(self) -> SemanticCodecBatch:
             return fixed_batch
 
+        def feature_stats_dataloader(self) -> object:
+            raise AssertionError("resume must reuse feature stats from the checkpoint")
+
     trainer_configs: list[dict[str, Any]] = []
 
     class TrainerStub:
@@ -683,11 +731,27 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
     def fail_single_batch(*args: Any, **kwargs: Any) -> object:
         raise AssertionError("fixed_batch=false must not use single_batch_loader")
 
+    def build(*args: Any, **kwargs: Any) -> object:
+        del args
+        built.append(kwargs)
+        return object()
+
+    checkpoint_path = tmp_path / "last.ckpt"
+    torch.save(
+        {
+            "state_dict": {
+                "support.feature_mean": torch.tensor([[[1.0, 2.0, 3.0, 4.0]]]),
+                "support.feature_std": torch.tensor([[[0.5, 1.0, 1.5, 2.0]]]),
+            }
+        },
+        checkpoint_path,
+    )
+
     monkeypatch.setattr(train.pl, "seed_everything", lambda *args, **kwargs: None)
     monkeypatch.setattr(train.pl, "Trainer", TrainerStub)
     monkeypatch.setattr(train, "load_backend", lambda *args, **kwargs: FakeCodec())
     monkeypatch.setattr(train, "load_batch", fail_single_batch)
-    monkeypatch.setattr(train, "build_module", lambda *args, **kwargs: object())
+    monkeypatch.setattr(train, "build_module", build)
     monkeypatch.setattr(train, "DataModule", DataModuleStub)
     monkeypatch.setattr(train, "single_batch_loader", fail_single_batch)
 
@@ -716,7 +780,7 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
                 "repa_loss_weight": 0.0,
             },
             "pl_module": {
-                "normalize_features": False,
+                "normalize_features": True,
                 "learning_rate": 1e-3,
                 "weight_decay": 0.0,
                 "reference_dropout": 0.5,
@@ -776,7 +840,7 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
                 "max_epochs": -1,
                 "log_every_n_steps": 1,
                 "gradient_clip_val": 0.0,
-                "ckpt_path": str(tmp_path / "last.ckpt"),
+                "ckpt_path": str(checkpoint_path),
             },
         }
     )
@@ -788,7 +852,9 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
     assert isinstance(fits[0]["datamodule"], DataModuleStub)
     assert fits[0]["datamodule"].setup_stages == ["fit"]
     assert "train_dataloaders" not in fits[0]
-    assert fits[0]["ckpt_path"] == str(tmp_path / "last.ckpt")
+    assert fits[0]["ckpt_path"] == str(checkpoint_path)
+    assert built[0]["feature_mean"] == (1.0, 2.0, 3.0, 4.0)
+    assert built[0]["feature_std"] == (0.5, 1.0, 1.5, 2.0)
 
 
 def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
@@ -823,7 +889,7 @@ def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
     )
 
     callbacks = train._build_callbacks(
-        config,
+        train.parse_train_config(config),
         output_dir=tmp_path,
         fixed_batch=_paired_batch(FakeCodec()),
     )
@@ -1009,9 +1075,83 @@ def test_validation_metrics_are_paired_and_deterministic(
         torch.testing.assert_close(first[name], second[name])
     torch.testing.assert_close(
         first["val/reference_gain_feature_mse"],
-        first["val/without_reference_feature_mse"]
-        - first["val/with_reference_feature_mse"],
+        first["val/without_reference_feature_mse"] - first["val/with_reference_feature_mse"],
     )
     assert len(states) == 4
     assert all(torch.equal(state, states[0]) for state in states[1:])
     assert logged == list(first) + list(second)
+
+
+def test_validation_epoch_metric_is_invariant_to_batch_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeCodec()
+    values = [
+        torch.tensor([[1, 1, 1]], dtype=torch.long),
+        torch.tensor([[2, 3, 1], [3, 3, 1], [4, 3, 1]], dtype=torch.long),
+    ]
+    combined = collate_codes(
+        values,
+        semantic_pad_id=backend.semantic_codebook.size(0),
+        acoustic_pad_ids=backend.acoustic_codebook_sizes,
+    )
+    split = [
+        collate_codes(
+            [value],
+            semantic_pad_id=backend.semantic_codebook.size(0),
+            acoustic_pad_ids=backend.acoustic_codebook_sizes,
+        )
+        for value in values
+    ]
+
+    def validation_error(
+        batch: SemanticCodecBatch,
+        *,
+        reference_features: Tensor | None,
+        reference_mask: Tensor | None,
+        generator: torch.Generator,
+    ) -> Tensor:
+        del reference_features, reference_mask, generator
+        error = batch.acoustic_codes[..., 0].float()
+        mask = batch.acoustic_mask.to(device=error.device)
+        return error[mask].mean()
+
+    def collate_batch(batches: list[SemanticCodecBatch]) -> SemanticCodecBatch:
+        assert len(batches) == 1
+        return batches[0]
+
+    def validate(batches: list[SemanticCodecBatch]) -> float:
+        module = build_module(
+            backend,
+            SemanticSupportConfig(
+                route=Route.FM,
+                condition_dim=10,
+                decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+                sampling=SamplingConfig(flow_steps=1),
+            ),
+            combined,
+            normalize_features=True,
+        )
+        monkeypatch.setattr(module, "_validation_error", validation_error)
+        loader = torch.utils.data.DataLoader(
+            batches,
+            batch_size=1,
+            num_workers=0,
+            collate_fn=collate_batch,
+        )
+        trainer = pl.Trainer(
+            accelerator="cpu",
+            devices=1,
+            logger=False,
+            enable_checkpointing=False,
+            enable_model_summary=False,
+            enable_progress_bar=False,
+        )
+        result = trainer.validate(module, dataloaders=loader, verbose=False)
+        return float(result[0]["val/without_reference_feature_mse"])
+
+    combined_metric = validate([combined])
+    split_metric = validate(split)
+
+    assert combined_metric == pytest.approx(2.5)
+    assert split_metric == pytest.approx(combined_metric)

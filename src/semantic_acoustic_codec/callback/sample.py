@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -13,10 +13,7 @@ from anytrain.lightning.experiment import scalar as experiment_scalar
 from lightning.pytorch.callbacks import Callback
 
 from semantic_acoustic_codec.evaluation import (
-    masked_feature_mse,
-    reference_acoustic_condition,
-    seeded_generator,
-    target_acoustic_features,
+    evaluate_feature_pair,
 )
 from semantic_acoustic_codec.runtime import SemanticCodecRuntime
 from semantic_acoustic_codec.types import SemanticCodecBatch
@@ -148,43 +145,28 @@ def _sample(
     include_static_audio: bool,
 ) -> tuple[dict[str, Any], dict[str, Tensor], dict[str, float]]:
     runtime = SemanticCodecRuntime(module.support, module.backend)
-    without_features = _generated_features(
+    evaluation = evaluate_feature_pair(
         runtime,
-        module,
+        module.backend,
         sample,
-        with_reference=False,
-        generator=seeded_generator(module.device, seed),
-    )
-    without_audio = runtime.decode_features(sample.semantic_codes, without_features)
-    target_features = target_acoustic_features(module.backend, sample)
-    without_mse = masked_feature_mse(
-        without_features,
-        target_features,
-        sample.target_acoustic_mask,
+        seed=seed,
         name="sample",
     )
-    with_features = _generated_features(
-        runtime,
-        module,
-        sample,
-        with_reference=True,
-        generator=seeded_generator(module.device, seed),
+    without_audio = runtime.decode_features(
+        sample.semantic_codes,
+        evaluation.without_reference,
     )
-    with_audio = runtime.decode_features(sample.semantic_codes, with_features)
-    with_mse = masked_feature_mse(
-        with_features,
-        target_features,
-        sample.target_acoustic_mask,
-        name="sample",
+    with_audio = runtime.decode_features(
+        sample.semantic_codes,
+        evaluation.with_reference,
     )
-    reference_gain = without_mse - with_mse
     without_stats = _audio_stats(without_audio)
     event: dict[str, Any] = {
         "step": step,
         "metadata": _public_metadata(sample),
-        "feature_mse_without_reference": without_mse,
-        "feature_mse_with_reference": with_mse,
-        "reference_gain": reference_gain,
+        "feature_mse_without_reference": evaluation.mse_without_reference,
+        "feature_mse_with_reference": evaluation.mse_with_reference,
+        "reference_gain": evaluation.reference_gain,
         "generated_without_reference": without_stats,
         "generated_with_reference": _audio_stats(with_audio),
         "target_codec_reconstruction": None,
@@ -213,16 +195,16 @@ def _sample(
         if passthrough_audio is not None:
             audio["sample/reference_token_passthrough"] = _audio_tensor(passthrough_audio)
     scalars = {
-        "sample/feature_mse_without_reference": without_mse,
-        "sample/feature_mse_with_reference": with_mse,
-        "sample/reference_gain": reference_gain,
+        "sample/feature_mse_without_reference": evaluation.mse_without_reference,
+        "sample/feature_mse_with_reference": evaluation.mse_with_reference,
+        "sample/reference_gain": evaluation.reference_gain,
     }
     return event, audio, scalars
 
 
 def _first_valid_batch(batch: SemanticCodecBatch, *, device: torch.device) -> SemanticCodecBatch:
     semantic_mask = batch.mask[0]
-    acoustic_mask = batch.target_acoustic_mask[0]
+    acoustic_mask = batch.acoustic_mask[0]
     semantic = batch.semantic_codes[0:1, semantic_mask].to(device=device)
     acoustic = batch.acoustic_codes[0:1, acoustic_mask].to(device=device)
     reference_semantic: Tensor | None = None
@@ -269,27 +251,6 @@ def _first_valid_batch(batch: SemanticCodecBatch, *, device: torch.device) -> Se
 
 def _to(batch: SemanticCodecBatch, device: torch.device) -> SemanticCodecBatch:
     return batch.to(device)
-
-
-def _generated_features(
-    runtime: SemanticCodecRuntime,
-    module: SemanticCodecModule,
-    batch: SemanticCodecBatch,
-    *,
-    with_reference: bool,
-    generator: torch.Generator,
-) -> Tensor:
-    reference_features: Tensor | None = None
-    reference_mask: Tensor | None = None
-    if with_reference:
-        reference_features, reference_mask = reference_acoustic_condition(module.backend, batch)
-    return runtime.sample_features(
-        batch.semantic_codes,
-        mask=batch.mask,
-        reference_features=reference_features,
-        reference_mask=reference_mask,
-        generator=generator,
-    )
 
 
 def _reconstruct_target(module: SemanticCodecModule, batch: SemanticCodecBatch) -> Tensor:
@@ -376,17 +337,7 @@ def _append_json(path: Path, event: dict[str, Any]) -> None:
 
 
 def _public_metadata(batch: SemanticCodecBatch) -> dict[str, Any]:
-    data = asdict(batch.metadata[0])
-    for key in (
-        "target_text",
-        "reference_text",
-        "target_utterance_id",
-        "reference_utterance_id",
-        "target_speaker_id",
-        "reference_speaker_id",
-    ):
-        data.pop(key, None)
-    return data
+    return batch.metadata[0].as_dict()
 
 
 def _module(module: LightningModule) -> SemanticCodecModule:

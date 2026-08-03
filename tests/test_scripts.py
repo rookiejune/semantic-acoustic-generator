@@ -11,7 +11,9 @@ import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
 from scripts import eval_artifact, smoke
+from semantic_acoustic_codec.backend import BackendConfig
 from semantic_acoustic_codec.config import DecoderConfig
+from semantic_acoustic_codec.evaluation import seeded_generator
 from semantic_acoustic_codec.runtime import SemanticCodecRuntime
 from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
 
@@ -105,6 +107,11 @@ class EvalRuntime:
     ) -> torch.Tensor:
         del semantic_codes
         return features.transpose(1, 2).contiguous()
+
+
+def test_seeded_generator_rejects_invalid_device() -> None:
+    with pytest.raises(RuntimeError, match="device type"):
+        seeded_generator("invalid", 0)
 
 
 def test_eval_artifact_generates_seeded_pair_metrics() -> None:
@@ -236,10 +243,10 @@ def test_eval_artifact_main_loads_cross_text_pair(
     eval_artifact.main()
 
     assert loaded["backend_config"].name == "bicodec"
-    assert loaded["backend_config"].get("model_dir") is None
-    assert loaded["backend_config"].get("revision") is None
-    assert loaded["backend_config"].get("local_files_only") is True
-    assert loaded["backend_config"].get("allow_unpinned_revision") is False
+    assert loaded["backend_config"].model_dir is None
+    assert loaded["backend_config"].revision is None
+    assert loaded["backend_config"].local_files_only is True
+    assert loaded["backend_config"].allow_unpinned_revision is False
     assert loaded["backend_kwargs"]["device"] == torch.device("cpu")
     assert loaded["data"].source == "qwen_cross_text"
     assert loaded["data"].sample_index == 2
@@ -293,8 +300,7 @@ def test_eval_artifact_can_include_private_metadata(
     )
 
     def load_eval_backend(config, **kwargs):
-        assert config.name == "longcat"
-        assert list(config) == ["name"]
+        assert config == BackendConfig(name="longcat")
         assert kwargs["device"] == torch.device("cpu")
         return backend
 

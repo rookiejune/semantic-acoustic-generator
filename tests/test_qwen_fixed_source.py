@@ -14,21 +14,34 @@ from anydataset.types import (
     TextMeta,
     TextView,
 )
-from anytrain.codec import AcousticLayout, SemanticAcousticCodes
+from anytrain.codec import AcousticLayout
 
+from semantic_acoustic_codec import datamodule
 from semantic_acoustic_codec.datamodule import BatchingConfig, DataConfig, DataModule
+from semantic_acoustic_codec.datamodule import longcat as longcat_data
+from semantic_acoustic_codec.datamodule import module as module_data
 from semantic_acoustic_codec.datamodule import qwen as qwen_data
+from semantic_acoustic_codec.datamodule.source import DataSource, Overlong
 
 
 def test_data_config_defaults_to_cross_text_grid_column() -> None:
     data = DataConfig()
 
     assert data.source == "qwen_cross_text"
+    assert data.source_type is DataSource.QWEN_CROSS_TEXT
+    assert data.overlong_policy is Overlong.ERROR
     assert data.role == "target"
     assert data.speaker_id == "vivian"
     assert data.validation_split is None
     with pytest.raises(ValueError, match="requires validation_split"):
         DataConfig(validation_sample_limit=2)
+
+
+def test_longcat_module_preserves_former_data_module_imports() -> None:
+    assert datamodule.DataConfig is module_data.DataConfig
+    assert datamodule.DataModule is module_data.DataModule
+    assert longcat_data.DataConfig is module_data.DataConfig
+    assert longcat_data.DataModule is module_data.DataModule
 
 
 def test_qwen_fixed_speaker_source_batches_fixed_length_units(
@@ -95,18 +108,12 @@ def test_qwen_cross_text_source_batches_explicit_pair_and_metadata(
 
     assert batch.has_reference
     assert len(batch.metadata) == 2
-    pairs = {
-        (item.target_text_index, item.reference_text_index)
-        for item in batch.metadata
-    }
+    pairs = {(item.target_text_index, item.reference_text_index) for item in batch.metadata}
     assert pairs == {(0, 1), (1, 0)}
     assert all(
-        item.target_speaker_id == item.reference_speaker_id == "vivian"
-        for item in batch.metadata
+        item.target_speaker_id == item.reference_speaker_id == "vivian" for item in batch.metadata
     )
-    assert {
-        (item.target_text, item.reference_text) for item in batch.metadata
-    } == {
+    assert {(item.target_text, item.reference_text) for item in batch.metadata} == {
         ("target text", "reference text"),
         ("reference text", "target text"),
     }
@@ -153,17 +160,14 @@ def test_qwen_cross_text_uses_anydataset_cost_batching(
     assert type(loader).__module__ == "anydataset.dataset.batching"
     assert loader.batch_sampler.epoch == 3
     assert [len(batch.metadata) for batch in batches] == [2, 2]
-    assert sorted(
-        item.target_index
-        for batch in batches
-        for item in batch.metadata
-    ) == [0, 1, 2, 3]
+    assert sorted(item.target_index for batch in batches for item in batch.metadata) == [0, 1, 2, 3]
 
 
 def test_dynamic_batch_planning_does_not_load_qwen_codec_samples(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    accesses: list[int] = []
     grid = _grid(
         [
             (
@@ -172,26 +176,9 @@ def test_dynamic_batch_planning_does_not_load_qwen_codec_samples(
                 torch.ones(4, 1, dtype=torch.long),
             )
             for index in range(4)
-        ]
+        ],
+        accesses=accesses,
     )
-    loads: list[AudioView] = []
-    original_select = SpeakerAudioGrid.select
-
-    class TrackingSelection:
-        def __init__(self, selection) -> None:
-            self.selection = selection
-
-        def load(self, *, view=None):
-            loads.append(view)
-            return self.selection.load(view=view)
-
-    def select(self, *, source=None, text=None, speaker=None):
-        selection = original_select(self, source=source, text=text, speaker=speaker)
-        if self is grid:
-            return TrackingSelection(selection)
-        return selection
-
-    monkeypatch.setattr(SpeakerAudioGrid, "select", select)
     monkeypatch.setattr(
         qwen_data.qwen_tts,
         "speaker_grid",
@@ -210,9 +197,142 @@ def test_dynamic_batch_planning_does_not_load_qwen_codec_samples(
 
     module.setup()
 
-    assert loads == []
-    next(iter(module.train_dataloader()))
-    assert loads
+    assert accesses == []
+    assert module.dataset is not None
+    assert module.dataset.costs[0] == 3
+    assert accesses == [0, 1]
+    assert module.dataset.costs[0] == 3
+    assert accesses == [0, 1]
+
+
+def test_qwen_column_sample_reads_its_cell_once(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accesses: list[int] = []
+    grid = _grid(
+        [
+            (
+                "single text",
+                torch.tensor([[1], [2]], dtype=torch.long),
+                torch.tensor([[3], [4]], dtype=torch.long),
+            )
+        ],
+        accesses=accesses,
+    )
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    source = qwen_data.QwenCodecColumnDataset(
+        codec="bicodec",
+        root=tmp_path,
+        split="train",
+        role=Role.TARGET,
+        speaker_id="vivian",
+    )
+
+    sample = source[0]
+
+    assert accesses == [0]
+    assert sample.text == "single text"
+    assert sample.codes.semantic.tolist() == [[1], [2]]
+
+
+def test_qwen_pair_length_reuses_bounded_column_info_cache(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accesses: list[int] = []
+    grid = _grid(
+        [
+            ("text zero", torch.ones(2, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
+            ("text one", torch.ones(3, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
+        ],
+        accesses=accesses,
+    )
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    source = qwen_data.QwenCodecColumnDataset(
+        codec="bicodec",
+        root=tmp_path,
+        split="train",
+        role=Role.TARGET,
+        speaker_id="vivian",
+    )
+    pairs = qwen_data.QwenCodecPairDataset(source)
+
+    assert pairs.raw_length(0) == 3
+    assert accesses == [0, 1]
+    assert pairs.raw_length(1) == 3
+    assert accesses == [0, 1]
+
+
+def test_qwen_pair_reference_cache_is_bounded(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(qwen_data, "_REFERENCE_CACHE_SIZE", 2)
+    grid = _grid([(f"text {index}", torch.ones(2, 1), torch.ones(4, 1)) for index in range(5)])
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    source = qwen_data.QwenCodecColumnDataset(
+        codec="bicodec",
+        root=tmp_path,
+        split="train",
+        role=Role.TARGET,
+        speaker_id="vivian",
+    )
+    pairs = qwen_data.QwenCodecPairDataset(source)
+
+    assert len(vars(pairs)["_reference_indices"]) == 0
+    for index in range(5):
+        pairs.raw_length(index)
+    assert len(vars(pairs)["_reference_indices"]) == 2
+
+
+def test_dynamic_batch_cost_cache_is_bounded_by_planning_window(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accesses: list[int] = []
+    grid = _grid(
+        [(f"text {index}", torch.ones(index + 1, 1), torch.ones(4, 1)) for index in range(3)],
+        accesses=accesses,
+    )
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    data = DataConfig(
+        source="qwen_fixed_speaker",
+        root=str(tmp_path / "prepared"),
+        batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        batching=BatchingConfig(planning_window=1),
+    )
+    module = _module(data, tmp_path)
+    module.setup()
+    assert module.dataset is not None
+
+    costs = module.dataset.costs
+    assert costs[0] == 1
+    assert costs[0] == 1
+    assert accesses == [0]
+    assert costs[1] == 2
+    assert costs[0] == 1
+    assert accesses == [0, 1]
+    assert tuple(vars(costs)["_cache"]) == (0,)
 
 
 def test_dynamic_batch_budget_does_not_create_hard_duration_limit(
@@ -248,91 +368,116 @@ def test_dynamic_batch_budget_does_not_create_hard_duration_limit(
 
     module.setup()
     assert module.dataset is not None
-    assert module.dataset.costs == (1,)
+    assert module.dataset.costs[0] == 1
     batch = next(iter(module.train_dataloader()))
 
     assert batch.semantic_codes.shape == (1, 4, 1)
     assert batch.mask.tolist() == [[True, True, True, True]]
 
 
-def test_qwen_pair_dataset_construction_does_not_load_codec_samples() -> None:
-    codes = SemanticAcousticCodes(
-        semantic=torch.ones(2, 1, dtype=torch.long),
-        acoustic=torch.ones(2, 1, dtype=torch.long),
+def test_qwen_pair_dataset_construction_does_not_load_codec_samples(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accesses: list[int] = []
+    grid = _grid(
+        [
+            ("text zero", torch.ones(2, 1), torch.ones(4, 1)),
+            ("text one", torch.ones(2, 1), torch.ones(4, 1)),
+        ],
+        accesses=accesses,
     )
-    samples = [
-        qwen_data.QwenCodecSample(
-            index=index,
-            text_index=index,
-            source_index=index,
-            role=Role.TARGET,
-            utterance_id=f"utterance-{index}",
-            speaker_id="vivian",
-            text=f"text {index}",
-            codes=codes,
-        )
-        for index in range(2)
-    ]
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    source = qwen_data.QwenCodecColumnDataset(
+        codec="bicodec",
+        root=tmp_path,
+        split="train",
+        role=Role.TARGET,
+        speaker_id="vivian",
+    )
+    pairs = qwen_data.QwenCodecPairDataset(source)
 
-    class CountingSource:
-        def __init__(self) -> None:
-            self.loads: list[int] = []
-
-        def __len__(self) -> int:
-            return len(samples)
-
-        def __getitem__(self, index: int) -> qwen_data.QwenCodecSample:
-            self.loads.append(index)
-            return samples[index]
-
-    source = CountingSource()
-    pairs = qwen_data.QwenCodecPairDataset(source)  # type: ignore[arg-type]
-
-    assert source.loads == []
+    assert accesses == []
     pair = pairs[0]
-    assert source.loads == [0, 1]
+    assert accesses == [0, 1]
     assert pair.target.text != pair.reference.text
 
 
-def test_qwen_pair_sample_count_fences_reference_pool() -> None:
-    codes = SemanticAcousticCodes(
-        semantic=torch.ones(2, 1, dtype=torch.long),
-        acoustic=torch.ones(2, 1, dtype=torch.long),
+def test_qwen_pair_sample_count_fences_reference_pool(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accesses: list[int] = []
+    grid = _grid(
+        [(f"text {index}", torch.ones(2, 1), torch.ones(4, 1)) for index in range(4)],
+        accesses=accesses,
     )
-    samples = [
-        qwen_data.QwenCodecSample(
-            index=index,
-            text_index=index,
-            source_index=index,
-            role=Role.TARGET,
-            utterance_id=f"utterance-{index}",
-            speaker_id="vivian",
-            text=f"text {index}",
-            codes=codes,
-        )
-        for index in range(4)
-    ]
-
-    class CountingSource:
-        def __init__(self) -> None:
-            self.loads: list[int] = []
-
-        def __len__(self) -> int:
-            return len(samples)
-
-        def __getitem__(self, index: int) -> qwen_data.QwenCodecSample:
-            self.loads.append(index)
-            return samples[index]
-
-    source = CountingSource()
-    pairs = qwen_data.QwenCodecPairDataset(source, sample_count=2)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    source = qwen_data.QwenCodecColumnDataset(
+        codec="bicodec",
+        root=tmp_path,
+        split="train",
+        role=Role.TARGET,
+        speaker_id="vivian",
+    )
+    pairs = qwen_data.QwenCodecPairDataset(source, sample_count=2)
 
     pair = pairs[1]
 
     assert len(pairs) == 2
     assert pair.target_index == 1
     assert pair.reference_index == 0
-    assert source.loads == [1, 0]
+    assert accesses == [1, 0]
+
+
+def test_qwen_pair_reads_candidates_once_and_materializes_only_the_pair(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accesses: list[int] = []
+    materialized: list[object] = []
+    grid = _grid(
+        [
+            ("duplicate", torch.ones(2, 1), torch.ones(4, 1)),
+            ("duplicate", torch.ones(4, 1), torch.ones(4, 1)),
+            ("selected", torch.ones(3, 1), torch.ones(4, 1)),
+        ],
+        accesses=accesses,
+    )
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    original_codes = qwen_data._codes
+
+    def codes(value, codec):
+        materialized.append(value)
+        return original_codes(value, codec)
+
+    monkeypatch.setattr(qwen_data, "_codes", codes)
+    source = qwen_data.QwenCodecColumnDataset(
+        codec="bicodec",
+        root=tmp_path,
+        split="train",
+        role=Role.TARGET,
+        speaker_id="vivian",
+    )
+
+    pair = qwen_data.QwenCodecPairDataset(source)[0]
+
+    assert accesses == [0, 1, 2]
+    assert len(materialized) == 2
+    assert pair.target.text == "duplicate"
+    assert pair.reference.text == "selected"
 
 
 def test_datamodule_exposes_deterministic_held_out_split(
@@ -342,14 +487,30 @@ def test_datamodule_exposes_deterministic_held_out_split(
     grids = {
         "train": _grid(
             [
-                ("train zero", torch.ones(2, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
-                ("train one", torch.ones(2, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
+                (
+                    "train zero",
+                    torch.ones(2, 1, dtype=torch.long),
+                    torch.ones(4, 1, dtype=torch.long),
+                ),
+                (
+                    "train one",
+                    torch.ones(2, 1, dtype=torch.long),
+                    torch.ones(4, 1, dtype=torch.long),
+                ),
             ]
         ),
         "heldout": _grid(
             [
-                ("heldout zero", torch.ones(2, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
-                ("heldout one", torch.ones(2, 1, dtype=torch.long), torch.ones(4, 1, dtype=torch.long)),
+                (
+                    "heldout zero",
+                    torch.ones(2, 1, dtype=torch.long),
+                    torch.ones(4, 1, dtype=torch.long),
+                ),
+                (
+                    "heldout one",
+                    torch.ones(2, 1, dtype=torch.long),
+                    torch.ones(4, 1, dtype=torch.long),
+                ),
             ]
         ),
     }
@@ -382,6 +543,45 @@ def test_datamodule_exposes_deterministic_held_out_split(
         "heldout one",
     ]
     assert first.metadata == second.metadata
+
+
+def test_validate_setup_does_not_load_training_split(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grids = {
+        "heldout": _grid(
+            [
+                ("heldout zero", torch.ones(2, 1), torch.ones(4, 1)),
+                ("heldout one", torch.ones(2, 1), torch.ones(4, 1)),
+            ]
+        )
+    }
+    loaded_splits: list[str] = []
+
+    def speaker_grid(**kwargs):
+        split = kwargs["split"]
+        loaded_splits.append(split)
+        return SimpleNamespace(load=lambda: grids[split])
+
+    monkeypatch.setattr(qwen_data.qwen_tts, "speaker_grid", speaker_grid)
+    data = DataConfig(
+        source="qwen_cross_text",
+        root=str(tmp_path / "prepared"),
+        validation_split="heldout",
+        batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        batching=BatchingConfig(enabled=False),
+    )
+    module = _module(data, tmp_path)
+
+    module.setup("validate")
+
+    assert loaded_splits == ["heldout"]
+    assert module.dataset is None
+    assert module.val_dataset is not None
 
 
 def test_qwen_cross_text_filter_checks_target_and_reference_raw_lengths(
@@ -439,6 +639,8 @@ def _module(data: DataConfig, tmp_path, *, frame_rate: float = 50.0) -> DataModu
 
 def _grid(
     values: list[tuple[str, torch.Tensor, torch.Tensor]],
+    *,
+    accesses: list[int] | None = None,
 ) -> SpeakerAudioGrid:
     cells = [
         {
@@ -457,11 +659,24 @@ def _grid(
         }
         for index, (text, semantic, acoustic) in enumerate(values)
     ]
+    dataset = cells if accesses is None else _TrackingCells(cells, accesses)
     return SpeakerAudioGrid(
-        cells,
+        dataset,
         ("vivian",),
         row_specs=tuple(
-            SpeakerAudioRow(source_index=index, role=Role.TARGET)
-            for index in range(len(cells))
+            SpeakerAudioRow(source_index=index, role=Role.TARGET) for index in range(len(cells))
         ),
     )
+
+
+class _TrackingCells:
+    def __init__(self, cells, accesses: list[int]) -> None:
+        self.cells = cells
+        self.accesses = accesses
+
+    def __len__(self) -> int:
+        return len(self.cells)
+
+    def __getitem__(self, index: int):
+        self.accesses.append(index)
+        return self.cells[index]

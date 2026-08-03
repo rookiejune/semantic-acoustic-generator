@@ -9,6 +9,7 @@ from torch import nn
 from semantic_acoustic_codec.loss.repa import (
     WavLMTeacher,
     _require_prefix_mask,
+    _truncate_wavlm_encoder,
     decode_group_metrics,
 )
 
@@ -38,6 +39,11 @@ class FakeWavLM(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.bias = nn.Parameter(torch.zeros(1))
+        self.encoder = nn.Module()
+        self.encoder.layers = nn.ModuleList(
+            nn.Linear(self.config.hidden_size, self.config.hidden_size)
+            for _ in range(self.config.num_hidden_layers)
+        )
 
     @classmethod
     def from_pretrained(cls, checkpoint: str) -> FakeWavLM:
@@ -72,6 +78,15 @@ def _teacher(codec: RecordingCodec) -> WavLMTeacher:
 def teacher() -> tuple[WavLMTeacher, RecordingCodec]:
     codec = RecordingCodec()
     return _teacher(codec), codec
+
+
+def test_teacher_truncates_wavlm_after_requested_layer() -> None:
+    model = FakeWavLM()
+
+    _truncate_wavlm_encoder(model, 1)
+
+    assert len(model.encoder.layers) == 1
+    assert model.config.num_hidden_layers == 2
 
 
 def test_require_prefix_mask_rejects_holes() -> None:

@@ -12,6 +12,7 @@ from lightning import LightningModule
 
 from semantic_acoustic_codec.config import Route
 from semantic_acoustic_codec.loss.repa import decode_group_metrics
+from semantic_acoustic_codec.model.decoder import FMFeatureGenerator, RVQCodeGenerator
 from semantic_acoustic_codec.runtime.artifact import save_artifact
 from semantic_acoustic_codec.runtime.semantic import (
     SemanticCodecSupport,
@@ -54,6 +55,7 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
         weight_decay: float = 0.01,
         reference_dropout: float = 0.5,
         validation_seed: int = 0,
+        finite_loss_check_interval: int = 100,
         repa_teacher: Teacher | None = None,
     ) -> None:
         super().__init__()
@@ -69,6 +71,13 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
             raise TypeError("validation_seed must be an integer.")
         if validation_seed < 0:
             raise ValueError("validation_seed must be non-negative.")
+        if isinstance(finite_loss_check_interval, bool) or not isinstance(
+            finite_loss_check_interval,
+            int,
+        ):
+            raise TypeError("finite_loss_check_interval must be an integer.")
+        if finite_loss_check_interval <= 0:
+            raise ValueError("finite_loss_check_interval must be positive.")
         if support.route is not config.route:
             raise ValueError("module config route must match support route.")
         repa_weight = config.decoder.repa_loss_weight
@@ -93,6 +102,9 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
         self.weight_decay = weight_decay
         self.reference_dropout = float(reference_dropout)
         self.validation_seed = validation_seed
+        self.finite_loss_check_interval = finite_loss_check_interval
+        self._finite_training_loss_ok: Tensor | None = None
+        self._finite_training_loss_name: str | None = None
 
     @property
     def backend(self) -> SemanticAcousticCodec:
@@ -112,24 +124,44 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
         _move_external(self.backend, device=self.device)
         _move_external(self.repa_teacher, device=self.device)
 
+    def transfer_batch_to_device(
+        self,
+        batch: Any,
+        device: torch.device,
+        dataloader_idx: int,
+    ) -> Any:
+        if isinstance(batch, SemanticCodecBatch):
+            return batch.to(device, non_blocking=True)
+        return super().transfer_batch_to_device(batch, device, dataloader_idx)
+
     def training_step(self, batch: SemanticCodecBatch, batch_idx: int) -> dict[str, Any]:
         del batch_idx
         mask = batch.mask
         target_features = None
         if self.support.route is Route.FM:
             target_features = self._target_features(batch)
-        acoustic_mask = batch.target_acoustic_mask
+        acoustic_mask = batch.acoustic_mask
         condition, reference_rows = self._condition(batch)
-        output = self.support.generator.loss(
-            batch,
-            condition,
-            target_features,
-            feature_mean=self.support.feature_mean,
-            feature_std=self.support.feature_std,
-            repa_teacher=self.repa_teacher,
-        )
-        if not bool(torch.isfinite(output.loss.detach()).all()):
-            raise FloatingPointError(f"{output.primary} training loss is non-finite.")
+        if self.support.route is Route.FM:
+            if target_features is None:
+                raise RuntimeError("FM training requires acoustic target features.")
+            generator = self.support.generator
+            if not isinstance(generator, FMFeatureGenerator):
+                raise TypeError("FM support requires an FMFeatureGenerator.")
+            output = generator.loss(
+                batch,
+                condition,
+                target_features,
+                feature_mean=self.support.feature_mean,
+                feature_std=self.support.feature_std,
+                repa_teacher=self.repa_teacher,
+            )
+        else:
+            generator = self.support.generator
+            if not isinstance(generator, RVQCodeGenerator):
+                raise TypeError("RVQ support requires an RVQCodeGenerator.")
+            output = generator.loss(batch, condition)
+        self._track_finite_training_loss(output.loss, name=output.primary)
 
         live: dict[str, Any] = {
             f"{name}_loss": item.loss.mean() for name, item in output.items.items()
@@ -141,7 +173,7 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
             {primary_key: live[primary_key]},
             on_step=True,
             prog_bar=True,
-            sync_dist=True,
+            sync_dist=False,
         )
         secondary = {name: value for name, value in live.items() if name != primary_key}
         if secondary:
@@ -150,7 +182,7 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
                 secondary,
                 on_step=True,
                 prog_bar=False,
-                sync_dist=True,
+                sync_dist=False,
             )
         self.log_prefixed_dict(
             "train",
@@ -212,6 +244,7 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
             )
             metrics[f"val/with_reference_{suffix}"] = with_reference
             metrics[f"val/reference_gain_{suffix}"] = without - with_reference
+        # Lightning uses batch_size as the denominator weight for its epoch mean.
         for name, value in metrics.items():
             self.log(
                 name,
@@ -219,7 +252,7 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
                 on_step=False,
                 on_epoch=True,
                 sync_dist=True,
-                batch_size=batch.semantic_codes.size(0),
+                batch_size=batch.acoustic_valid_units,
             )
         return metrics
 
@@ -230,7 +263,19 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
             weight_decay=self.weight_decay,
         )
 
+    def on_before_optimizer_step(self, optimizer: torch.optim.Optimizer) -> None:
+        del optimizer
+        if (self.global_step + 1) % self.finite_loss_check_interval == 0:
+            self._flush_finite_training_loss()
+
+    def on_train_epoch_end(self) -> None:
+        self._flush_finite_training_loss()
+
+    def on_train_end(self) -> None:
+        self._flush_finite_training_loss()
+
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        self._flush_finite_training_loss()
         state = checkpoint.get("state_dict")
         if isinstance(state, dict):
             _strip_external_state(state)
@@ -280,7 +325,7 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
             )
 
     def export_artifact(self, path: str | Path) -> None:
-        save_artifact(path, self.support, self.config, backend=self.backend)
+        save_artifact(path, self.support, backend=self.backend)
 
     def _normalized_features(self, batch: SemanticCodecBatch) -> Tensor:
         features = self._target_features(batch)
@@ -318,6 +363,37 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
             return torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         return torch.rand(batch_size, device=self.device) >= self.reference_dropout
 
+    def _track_finite_training_loss(self, loss: Tensor, *, name: str) -> None:
+        finite = torch.isfinite(loss.detach()).all()
+        if finite.device.type == "cuda":
+            self._defer_finite_training_loss(finite, name=name)
+            return
+        if not bool(finite):
+            raise FloatingPointError(f"{name} training loss is non-finite.")
+
+    def _defer_finite_training_loss(self, finite: Tensor, *, name: str) -> None:
+        pending = self._finite_training_loss_ok
+        if pending is None:
+            self._finite_training_loss_ok = finite
+            self._finite_training_loss_name = name
+            return
+        pending.logical_and_(finite)
+
+    def _flush_finite_training_loss(self) -> None:
+        pending = self._finite_training_loss_ok
+        if pending is None:
+            return
+        reduced = pending.to(dtype=torch.uint8)
+        if self._trainer is not None:
+            reduced = self.trainer.strategy.reduce(reduced, reduce_op="min")
+        if not bool(reduced):
+            name = self._finite_training_loss_name
+            if name is None:
+                raise RuntimeError("finite loss guard is missing its loss name.")
+            raise FloatingPointError(f"{name} training loss is non-finite.")
+        self._finite_training_loss_ok = None
+        self._finite_training_loss_name = None
+
     def _validation_generator(self, batch_idx: int) -> torch.Generator:
         generator = torch.Generator(device=self.device)
         generator.manual_seed(self.validation_seed + batch_idx)
@@ -345,7 +421,7 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
                 device=prediction.device,
                 dtype=prediction.dtype,
             )
-            return _masked_mean((prediction - target).square().mean(dim=-1), batch.target_acoustic_mask)
+            return _masked_mean((prediction - target).square().mean(dim=-1), batch.acoustic_mask)
         prediction = self.support.sample_acoustic_codes(
             batch.semantic_codes,
             mask=batch.mask,
@@ -356,14 +432,14 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
         )
         target_codes = batch.acoustic_codes.to(device=prediction.device)
         error = (prediction != target_codes).float().mean(dim=-1)
-        return _masked_mean(error, batch.target_acoustic_mask)
+        return _masked_mean(error, batch.acoustic_mask)
 
     @torch.no_grad()
     def _target_features(self, batch: SemanticCodecBatch) -> Tensor:
         return masked_acoustic_features(
             self.backend,
             batch.acoustic_codes,
-            batch.target_acoustic_mask,
+            batch.acoustic_mask,
             validate=False,
         )
 
@@ -373,7 +449,9 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
             return None
         reference = batch.reference
         mask = reference.acoustic_mask.to(device=batch.semantic_codes.device)
-        return masked_acoustic_features(self.backend, reference.acoustic_codes, mask, validate=False)
+        return masked_acoustic_features(
+            self.backend, reference.acoustic_codes, mask, validate=False
+        )
 
 
 @torch.no_grad()
@@ -389,6 +467,7 @@ def build_module(
     weight_decay: float = 0.01,
     reference_dropout: float = 0.5,
     validation_seed: int = 0,
+    finite_loss_check_interval: int = 100,
     repa_teacher: Teacher | None = None,
 ) -> SemanticCodecModule:
     if normalize_features and config.route is not Route.RVQ:
@@ -416,6 +495,7 @@ def build_module(
         weight_decay=weight_decay,
         reference_dropout=reference_dropout,
         validation_seed=validation_seed,
+        finite_loss_check_interval=finite_loss_check_interval,
         repa_teacher=repa_teacher,
     )
 
@@ -425,7 +505,7 @@ def feature_stats(
     backend: SemanticAcousticCodec,
     batch: SemanticCodecBatch,
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
-    acoustic_mask = batch.target_acoustic_mask
+    acoustic_mask = batch.acoustic_mask
     target = masked_acoustic_features(backend, batch.acoustic_codes, acoustic_mask).float()
     acoustic_mask = acoustic_mask.to(device=target.device)
     valid = target[acoustic_mask]
@@ -441,24 +521,37 @@ def dataset_feature_stats(
     backend: SemanticAcousticCodec,
     batches: Iterable[SemanticCodecBatch],
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
-    total = torch.zeros(backend.acoustic_feature_dim, dtype=torch.float64)
-    squares = torch.zeros_like(total)
+    mean: Tensor | None = None
+    m2: Tensor | None = None
     count = 0
     for batch in batches:
-        mask = batch.target_acoustic_mask
-        target = masked_acoustic_features(backend, batch.acoustic_codes, mask).double()
+        mask = batch.acoustic_mask
+        target = masked_acoustic_features(backend, batch.acoustic_codes, mask).float()
         valid = target[mask.to(device=target.device)]
         if valid.numel() == 0:
             continue
-        total += valid.sum(dim=0).cpu()
-        squares += valid.square().sum(dim=0).cpu()
-        count += valid.size(0)
-    if count == 0:
+        batch_variance, batch_mean = torch.var_mean(valid, dim=0, correction=0)
+        batch_count = valid.size(0)
+        batch_mean = batch_mean.double()
+        batch_m2 = batch_variance.double() * batch_count
+        if mean is None or m2 is None:
+            mean = batch_mean
+            m2 = batch_m2
+            count = batch_count
+            continue
+        combined_count = count + batch_count
+        delta = batch_mean - mean
+        mean = mean + delta * (batch_count / combined_count)
+        m2 = m2 + batch_m2 + delta.square() * (count * batch_count / combined_count)
+        count = combined_count
+    if count == 0 or mean is None or m2 is None:
         raise ValueError("feature stats require at least one valid acoustic unit.")
-    mean = total / count
-    variance = (squares / count - mean.square()).clamp_min(0)
-    std = variance.sqrt().clamp_min(1e-5)
-    return _tuple(mean), _tuple(std)
+    std = (m2 / count).clamp_min(0).sqrt().clamp_min(1e-5)
+    stats = torch.stack((mean, std)).cpu()
+    return (
+        tuple(float(item) for item in stats[0]),
+        tuple(float(item) for item in stats[1]),
+    )
 
 
 def _tuple(value: Tensor) -> tuple[float, ...]:

@@ -50,7 +50,7 @@ python scripts/smoke.py \
 测试和 lint 以 `pyproject.toml` 为准：
 
 ```bash
-pytest
+python -m pytest
 ruff check .
 basedpyright
 ```
@@ -68,8 +68,9 @@ python scripts/train.py experiment=smoke
 # 固定 pair overfit
 python scripts/train.py experiment=overfit backend=longcat model/route=fm
 
-# 984-pair screening；FLOPs calibration 时显式追加 callback.performance.profile_flops=true
-python scripts/train.py experiment=screening backend=longcat model/route=fm
+# 984-pair screening FLOPs calibration
+python scripts/train.py experiment=screening backend=longcat model/route=fm \
+  callback.performance.enabled=true callback.performance.profile_flops=true
 
 # LongCat-FM REPA / EMA ablation（screening 预算）
 python scripts/train.py experiment=ablation_fm_baseline
@@ -79,6 +80,8 @@ python scripts/train.py experiment=ablation_fm_ema
 
 `pl_module.ema_decay` 非空时启用 `anytrain.lightning.EMACallback`；sample / artifact 导出使用 EMA
 权重。`loss.repa_loss_weight>0` 时 train 入口构造 `WavLMTeacher`（当前仅 LongCat frame-aligned FM）。
+CUDA 训练通过 `pl_module.finite_loss_check_interval` 有界延迟检查非有限 loss，并在 epoch 结束和
+checkpoint 保存前强制检查；smoke / overfit 将该值设为 `1` 以获得逐步诊断。
 
 四条正式路线分别由 `experiment=001_longcat_fm|001_longcat_rvq|001_bicodec_fm|001_bicodec_rvq`
 完整组合，也有对应的 job wrapper：
@@ -119,11 +122,14 @@ python scripts/eval_artifact.py \
 
 artifact 目录只包含 `codec.json` 和 `model.ckpt`；当前 schema 为 `7`，`codec.json` 内保存 generator 配置、backend
 兼容性 metadata、sampling 和 feature normalization。`SemanticCodecRuntime` 负责加载 artifact、生成缺失
-acoustic units 并调用 backend 解码 waveform。
+acoustic units 并调用 backend 解码 waveform。导出配置只取自 support 的构造配置；schema 7 字段缺失、
+类型不精确或包含非有限数值时会直接拒绝，不补默认值，也不把字符串或 bool 强转为数值。
 
-`callback.performance.profile_flops=true` 会通过 anytrain 对真实 train batch 统计动态 FLOPs，用于短
-calibration。该模式有 profiler 开销；生产 timing run 保持关闭，并显式传入 calibration 得到的
-`callback.performance.model_flops_per_step`，不能把 profiled step time 当作生产吞吐。
+同时设置 `callback.performance.enabled=true callback.performance.profile_flops=true` 会通过 anytrain
+对真实 train batch 统计动态 FLOPs，用于短 calibration。该模式有 profiler 开销；生产 timing run
+保持 profiling 关闭，并显式传入 calibration 得到的
+`callback.performance.enabled=true callback.performance.model_flops_per_step=<value>`，不能把 profiled
+step time 当作生产吞吐。
 
 frame-aligned waveform decode 会裁掉连续的右侧 padding；一个 batch 内的有效 semantic 长度必须相同，
 不同长度的请求需要先分组或逐行 decode。

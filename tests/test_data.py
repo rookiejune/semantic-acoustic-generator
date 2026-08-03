@@ -48,6 +48,7 @@ def test_collate_pads_right_side_only() -> None:
     assert batch.semantic_codes.tolist() == [[[1], [4]], [[7], [10]]]
     assert batch.acoustic_codes.tolist() == [[[2, 3], [5, 6]], [[8, 9], [11, 12]]]
     assert batch.mask.tolist() == [[True, True], [True, False]]
+    assert batch.acoustic_mask.tolist() == [[True, True], [True, False]]
     assert batch.semantic_pad_id == 10
     assert batch.acoustic_pad_ids == (11, 12)
 

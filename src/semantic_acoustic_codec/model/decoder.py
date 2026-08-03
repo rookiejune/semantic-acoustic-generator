@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
 from anytrain.codec import AcousticLayout
@@ -11,12 +10,12 @@ from anytrain.loss import (
     LossItem,
     MaskedCodebookCrossEntropyLoss,
     MaskedCosineAlignmentLoss,
-    MaskedFrameMSELoss,
 )
 from anytrain.module.qwen import QwenMTPCodebookPredictor
 from torch import nn
 
 from semantic_acoustic_codec.config import DecoderConfig, Route, RVQPredictor
+from semantic_acoustic_codec.loss.flow import FlowLoss, FlowRuntime
 from semantic_acoustic_codec.model.condition import FixedLengthConditioner
 from semantic_acoustic_codec.model.dit import DiTDecoder
 from semantic_acoustic_codec.model.rvq import AcousticRVQDecoder
@@ -38,7 +37,40 @@ class DecoderLoss:
     scalars: dict[str, Tensor | float] = field(default_factory=dict)
 
 
-class CodecUnitGenerator(ABC, nn.Module):
+@runtime_checkable
+class FeatureSampler(Protocol):
+    def sample_features(
+        self,
+        condition: Tensor,
+        mask: Tensor,
+        *,
+        feature_mean: Tensor,
+        feature_std: Tensor,
+        flow_steps: int,
+        unconditional_condition: Tensor | None = None,
+        cfg_scale: float = 1.0,
+        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
+        output_length: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor: ...
+
+
+@runtime_checkable
+class AcousticCodeSampler(Protocol):
+    def sample_acoustic_codes(
+        self,
+        condition: Tensor,
+        mask: Tensor,
+        *,
+        temperature: float,
+        top_p: float,
+        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
+        output_length: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor: ...
+
+
+class CodecUnitGenerator(nn.Module):
     route: Route
 
     def __init__(self, condition_dim: int, *, fixed_length: int | None = None) -> None:
@@ -67,66 +99,6 @@ class CodecUnitGenerator(ABC, nn.Module):
             validate=validate,
         )
 
-    @abstractmethod
-    def sample_features(
-        self,
-        condition: Tensor,
-        mask: Tensor,
-        *,
-        feature_mean: Tensor,
-        feature_std: Tensor,
-        flow_steps: int,
-        temperature: float,
-        top_p: float,
-        unconditional_condition: Tensor | None = None,
-        cfg_scale: float = 1.0,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> Tensor: ...
-
-    def sample_acoustic_codes(
-        self,
-        condition: Tensor,
-        mask: Tensor,
-        *,
-        temperature: float,
-        top_p: float,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> Tensor:
-        raise RuntimeError("sample_acoustic_codes is only available for acoustic-code decoders.")
-
-    @abstractmethod
-    def loss_from_condition(
-        self,
-        condition: Tensor,
-        target_mask: Tensor,
-        *,
-        target_features: Tensor | None = None,
-        target_codes: Tensor | None = None,
-        feature_mean: Tensor | None = None,
-        feature_std: Tensor | None = None,
-        repa_features: Tensor | None = None,
-        flow_runtime: ContinuousFlowRuntime | None = None,
-        include_top1: bool = False,
-        validate: bool = True,
-        include_details: bool = True,
-    ) -> DecoderLoss: ...
-
-    @abstractmethod
-    def loss(
-        self,
-        batch: SemanticCodecBatch,
-        condition: Tensor,
-        target_features: Tensor | None = None,
-        *,
-        feature_mean: Tensor,
-        feature_std: Tensor,
-        repa_teacher: Teacher | None = None,
-    ) -> DecoderLoss: ...
-
 
 class FMFeatureGenerator(CodecUnitGenerator):
     route = Route.FM
@@ -151,7 +123,7 @@ class FMFeatureGenerator(CodecUnitGenerator):
             repa_student_layer=config.repa_student_layer,
         )
         self.repa_loss_weight = config.repa_loss_weight
-        self.velocity_loss = MaskedFrameMSELoss()
+        self.flow_loss = FlowLoss()
         self.repa_loss = MaskedCosineAlignmentLoss()
         self.flow_runtime: ContinuousFlowRuntime | None = None
 
@@ -184,15 +156,12 @@ class FMFeatureGenerator(CodecUnitGenerator):
         feature_mean: Tensor,
         feature_std: Tensor,
         flow_steps: int,
-        temperature: float,
-        top_p: float,
         unconditional_condition: Tensor | None = None,
         cfg_scale: float = 1.0,
         acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
         output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        del temperature, top_p
         target_condition, target_mask = self._target_condition(
             condition,
             mask,
@@ -223,13 +192,13 @@ class FMFeatureGenerator(CodecUnitGenerator):
         self,
         batch: SemanticCodecBatch,
         condition: Tensor,
-        target_features: Tensor | None = None,
+        target_features: Tensor,
         *,
         feature_mean: Tensor,
         feature_std: Tensor,
         repa_teacher: Teacher | None = None,
     ) -> DecoderLoss:
-        target_mask = batch.target_acoustic_mask
+        target_mask = batch.acoustic_mask
         target_condition, _ = self._target_condition(
             condition,
             batch.mask,
@@ -248,7 +217,7 @@ class FMFeatureGenerator(CodecUnitGenerator):
                 batch.acoustic_codes,
                 batch.mask,
             )
-        return self.loss_from_condition(
+        return self.feature_loss_from_condition(
             target_condition,
             target_mask,
             target_features=target_features,
@@ -258,24 +227,19 @@ class FMFeatureGenerator(CodecUnitGenerator):
             validate=False,
         )
 
-    def loss_from_condition(
+    def feature_loss_from_condition(
         self,
         condition: Tensor,
         target_mask: Tensor,
         *,
-        target_features: Tensor | None = None,
-        target_codes: Tensor | None = None,
+        target_features: Tensor,
         feature_mean: Tensor | None = None,
         feature_std: Tensor | None = None,
         repa_features: Tensor | None = None,
-        flow_runtime: ContinuousFlowRuntime | None = None,
-        include_top1: bool = False,
+        flow_runtime: FlowRuntime | None = None,
         validate: bool = True,
         include_details: bool = True,
     ) -> DecoderLoss:
-        del target_codes, include_top1
-        if target_features is None:
-            raise ValueError("FM loss requires acoustic target features.")
         if repa_features is not None and self.repa_loss_weight <= 0:
             raise ValueError("REPA features require a positive repa_loss_weight.")
         target = _normalized_features(
@@ -286,26 +250,24 @@ class FMFeatureGenerator(CodecUnitGenerator):
         )
         runtime = self._flow_runtime() if flow_runtime is None else flow_runtime
         if self.repa_loss_weight <= 0:
-            item = _flow_velocity_item(
+            item = self.flow_loss(
                 self.core,
-                self.velocity_loss,
+                condition,
+                target,
+                target_mask,
                 runtime,
-                condition=condition,
-                target=target,
-                mask=target_mask,
                 validate=validate,
                 include_details=include_details,
             )
             return DecoderLoss(loss=item.loss.mean(), items={"flow": item}, primary="flow")
         if repa_features is None:
             raise RuntimeError("REPA requires precomputed teacher features.")
-        item, representation = _flow_velocity_item_with_features(
+        item, representation = self.flow_loss.forward_with_features(
             self.core,
-            self.velocity_loss,
+            condition,
+            target,
+            target_mask,
             runtime,
-            condition=condition,
-            target=target,
-            mask=target_mask,
             validate=validate,
             include_details=include_details,
         )
@@ -369,35 +331,6 @@ class RVQCodeGenerator(CodecUnitGenerator):
         self.rvq_loss = MaskedCodebookCrossEntropyLoss()
 
     @torch.no_grad()
-    def sample_features(
-        self,
-        condition: Tensor,
-        mask: Tensor,
-        *,
-        feature_mean: Tensor,
-        feature_std: Tensor,
-        flow_steps: int,
-        temperature: float,
-        top_p: float,
-        unconditional_condition: Tensor | None = None,
-        cfg_scale: float = 1.0,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> Tensor:
-        del (
-            feature_mean,
-            feature_std,
-            flow_steps,
-            temperature,
-            top_p,
-            unconditional_condition,
-            cfg_scale,
-            generator,
-        )
-        raise RuntimeError("RVQ feature conversion requires a codec runtime.")
-
-    @torch.no_grad()
     def sample_acoustic_codes(
         self,
         condition: Tensor,
@@ -427,15 +360,9 @@ class RVQCodeGenerator(CodecUnitGenerator):
         self,
         batch: SemanticCodecBatch,
         condition: Tensor,
-        target_features: Tensor | None = None,
-        *,
-        feature_mean: Tensor,
-        feature_std: Tensor,
-        repa_teacher: Teacher | None = None,
     ) -> DecoderLoss:
-        del target_features, feature_mean, feature_std, repa_teacher
         labels = batch.acoustic_codes
-        target_mask = batch.target_acoustic_mask
+        target_mask = batch.acoustic_mask
         target_condition, _ = self._target_condition(
             condition,
             batch.mask,
@@ -443,7 +370,7 @@ class RVQCodeGenerator(CodecUnitGenerator):
             output_length=labels.size(1),
             validate=False,
         )
-        return self.loss_from_condition(
+        return self.code_loss_from_condition(
             target_condition,
             target_mask,
             target_codes=labels,
@@ -451,33 +378,40 @@ class RVQCodeGenerator(CodecUnitGenerator):
             include_details=False,
         )
 
-    def loss_from_condition(
+    def code_loss_from_condition(
         self,
         condition: Tensor,
         target_mask: Tensor,
         *,
-        target_features: Tensor | None = None,
-        target_codes: Tensor | None = None,
-        feature_mean: Tensor | None = None,
-        feature_std: Tensor | None = None,
-        repa_features: Tensor | None = None,
-        flow_runtime: ContinuousFlowRuntime | None = None,
+        target_codes: Tensor,
         include_top1: bool = False,
         validate: bool = True,
         include_details: bool = True,
     ) -> DecoderLoss:
-        del target_features, feature_mean, feature_std, repa_features, flow_runtime
-        if target_codes is None:
-            raise ValueError("RVQ loss requires acoustic target codes.")
-        item = self.rvq_loss(
-            self.core(condition, target_codes, mask=target_mask, validate=validate),
-            target_codes,
-            target_mask,
-            include_top1=include_top1,
-            validate=validate,
-            include_details=include_details,
-        )
+        if isinstance(self.core, AcousticRVQDecoder):
+            packed = self.core.forward_packed(
+                condition,
+                target_codes,
+                mask=target_mask,
+                validate=validate,
+            )
+            item = self.rvq_loss.forward_packed(
+                packed,
+                include_top1=include_top1,
+                validate=False,
+                include_details=include_details,
+            )
+        else:
+            item = self.rvq_loss(
+                self.core(condition, target_codes, mask=target_mask, validate=validate),
+                target_codes,
+                target_mask,
+                include_top1=include_top1,
+                validate=validate,
+                include_details=include_details,
+            )
         return DecoderLoss(loss=item.loss.mean(), items={"rvq": item}, primary="rvq")
+
 
 def _target_condition(
     condition: Tensor,
@@ -491,9 +425,7 @@ def _target_condition(
     if validate and (
         condition.dim() != 3 or mask.shape != condition.shape[:2] or mask.dtype != torch.bool
     ):
-        raise ValueError(
-            "condition and mask must have shapes [B, semantic_unit, C] and [B, unit]."
-        )
+        raise ValueError("condition and mask must have shapes [B, semantic_unit, C] and [B, unit].")
     if validate and not bool(mask.any(dim=1).all()):
         raise ValueError("each condition row must contain at least one valid semantic unit.")
     if acoustic_layout is AcousticLayout.FRAME_ALIGNED:
@@ -535,69 +467,3 @@ def _normalized_features(
         return features
     features = features.to(device=feature_mean.device, dtype=feature_mean.dtype)
     return (features - feature_mean) / feature_std
-
-
-def _flow_velocity_item(
-    decoder: DiTDecoder,
-    velocity_loss: MaskedFrameMSELoss,
-    runtime: ContinuousFlowRuntime,
-    *,
-    condition: Tensor,
-    target: Tensor,
-    mask: Tensor,
-    validate: bool,
-    include_details: bool,
-) -> LossItem:
-    sample = runtime.training_sample(target)
-    prediction = decoder(
-        sample.x_t,
-        sample.t,
-        condition=condition,
-        mask=mask,
-        validate=validate,
-    )
-    if prediction.shape != sample.velocity.shape:
-        raise ValueError("flow decoder output must match target latent shape.")
-    item = velocity_loss(
-        prediction,
-        sample.velocity,
-        mask,
-        details={"t": sample.t},
-        detail_dtype=target.dtype,
-    )
-    if include_details:
-        return item
-    return LossItem(loss=item.loss, details=None)
-
-
-def _flow_velocity_item_with_features(
-    decoder: DiTDecoder,
-    velocity_loss: MaskedFrameMSELoss,
-    runtime: ContinuousFlowRuntime,
-    *,
-    condition: Tensor,
-    target: Tensor,
-    mask: Tensor,
-    validate: bool,
-    include_details: bool,
-) -> tuple[LossItem, Tensor]:
-    sample = runtime.training_sample(target)
-    prediction, representation = decoder.forward_with_features(
-        sample.x_t,
-        sample.t,
-        condition=condition,
-        mask=mask,
-        validate=validate,
-    )
-    if prediction.shape != sample.velocity.shape:
-        raise ValueError("flow decoder output must match target latent shape.")
-    item = velocity_loss(
-        prediction,
-        sample.velocity,
-        mask,
-        details={"t": sample.t},
-        detail_dtype=target.dtype,
-    )
-    if not include_details:
-        item = LossItem(loss=item.loss, details=None)
-    return item, representation

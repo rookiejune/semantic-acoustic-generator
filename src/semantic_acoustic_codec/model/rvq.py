@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 import torch
+from anytrain.loss import PackedCodebookLogits
 from anytrain.module.qwen import top_p_filter
 from torch import nn
 
@@ -44,7 +45,9 @@ class AcousticRVQDecoder(nn.Module):
         if hidden_dim <= 0:
             raise ValueError("decoder hidden dimension must be positive.")
         attention_heads = _heads(hidden_dim, heads)
-        sizes = (codebook_size,) * codebooks if isinstance(codebook_size, int) else tuple(codebook_size)
+        sizes = (
+            (codebook_size,) * codebooks if isinstance(codebook_size, int) else tuple(codebook_size)
+        )
         if len(sizes) != codebooks or any(size <= 0 for size in sizes):
             raise ValueError("codebook_size must provide one positive size per codebook.")
         if codebook_embeddings is not None:
@@ -58,7 +61,9 @@ class AcousticRVQDecoder(nn.Module):
         self.codebooks = codebooks
         self.codebook_sizes = sizes
         self.embedding_dim = embedding_dim
-        self.codebook_embeddings = nn.ModuleList(nn.Embedding(size, embedding_dim) for size in sizes)
+        self.codebook_embeddings = nn.ModuleList(
+            nn.Embedding(size, embedding_dim) for size in sizes
+        )
         if codebook_embeddings is None:
             for module in self.codebook_embeddings:
                 embedding = cast(nn.Embedding, cast(object, module))
@@ -70,12 +75,12 @@ class AcousticRVQDecoder(nn.Module):
                     embedding.weight.copy_(codebook_embeddings[index])
 
         self.embedding_projections = nn.ModuleList(
-            nn.Identity()
-            if embedding_dim == hidden_dim
-            else nn.Linear(embedding_dim, hidden_dim)
+            nn.Identity() if embedding_dim == hidden_dim else nn.Linear(embedding_dim, hidden_dim)
             for _ in range(codebooks)
         )
-        self.condition = nn.Identity() if condition_dim == hidden_dim else nn.Linear(condition_dim, hidden_dim)
+        self.condition = (
+            nn.Identity() if condition_dim == hidden_dim else nn.Linear(condition_dim, hidden_dim)
+        )
         self.codebook_bos = nn.Parameter(torch.zeros(codebooks, hidden_dim))
         self.decoder = _qwen3_model(
             hidden_dim=hidden_dim,
@@ -107,9 +112,43 @@ class AcousticRVQDecoder(nn.Module):
         validate: bool = True,
     ) -> tuple[Tensor, ...]:
         """Return one teacher-forced [B, F, K_q] tensor per codebook."""
+        packed, frame_mask, frame_indices = self._forward_packed(
+            condition,
+            target_acoustic_codes,
+            mask=mask,
+            validate=validate,
+        )
+        return tuple(_scatter(value, frame_mask, frame_indices) for value in packed.logits)
+
+    def forward_packed(
+        self,
+        condition: Tensor,
+        target_acoustic_codes: Tensor | None = None,
+        *,
+        mask: Tensor | None = None,
+        validate: bool = True,
+    ) -> PackedCodebookLogits:
+        """Return logits, labels, and batch-row indices for valid frames only."""
+        packed, _, _ = self._forward_packed(
+            condition,
+            target_acoustic_codes,
+            mask=mask,
+            validate=validate,
+        )
+        return packed
+
+    def _forward_packed(
+        self,
+        condition: Tensor,
+        target_acoustic_codes: Tensor | None,
+        *,
+        mask: Tensor | None,
+        validate: bool,
+    ) -> tuple[PackedCodebookLogits, Tensor, Tensor]:
         if validate:
             self._validate_condition(condition)
         frame_mask = _frame_mask(condition, mask, validate=validate)
+        frame_indices = frame_mask.flatten().nonzero().flatten()
         if target_acoustic_codes is not None:
             if validate:
                 _validate_targets(
@@ -117,13 +156,16 @@ class AcousticRVQDecoder(nn.Module):
                     condition,
                     self.codebooks,
                     self.codebook_sizes,
-                    frame_mask,
+                    frame_indices,
                 )
-            packed_targets = target_acoustic_codes.flatten(0, 1)[frame_mask.flatten()]
+            packed_targets = target_acoustic_codes.flatten(0, 1).index_select(
+                0,
+                frame_indices,
+            )
         else:
             packed_targets = None
 
-        packed_condition = condition.flatten(0, 1)[frame_mask.flatten()]
+        packed_condition = condition.flatten(0, 1).index_select(0, frame_indices)
         condition_hidden = self.condition(packed_condition)
         inputs = [condition_hidden + self.codebook_bos[0]]
         for codebook in range(1, self.codebooks):
@@ -146,12 +188,22 @@ class AcousticRVQDecoder(nn.Module):
             use_cache=False,
             return_dict=True,
         ).last_hidden_state
-        return tuple(
-            _scatter(
-                cast(nn.Linear, cast(object, self.heads[codebook]))(hidden[..., codebook, :]),
-                frame_mask,
-            )
+        packed_logits = tuple(
+            cast(nn.Linear, cast(object, self.heads[codebook]))(hidden[..., codebook, :])
             for codebook in range(self.codebooks)
+        )
+        return (
+            PackedCodebookLogits(
+                logits=packed_logits,
+                labels=packed_targets,
+                row_indices=frame_indices.div(
+                    condition.size(1),
+                    rounding_mode="floor",
+                ),
+                batch_size=condition.size(0),
+            ),
+            frame_mask,
+            frame_indices,
         )
 
     @torch.no_grad()
@@ -241,13 +293,16 @@ def _validate_targets(
     condition: Tensor,
     codebooks: int,
     codebook_sizes: Sequence[int],
-    frame_mask: Tensor,
+    frame_indices: Tensor,
 ) -> None:
     if target_acoustic_codes.shape != (condition.size(0), condition.size(1), codebooks):
         raise ValueError("target_acoustic_codes must have shape [B, F, codebooks].")
     if not is_signed_integer_dtype(target_acoustic_codes.dtype):
         raise TypeError("target_acoustic_codes must use a signed integer dtype.")
-    packed_targets = target_acoustic_codes.flatten(0, 1)[frame_mask.flatten()]
+    packed_targets = target_acoustic_codes.flatten(0, 1).index_select(
+        0,
+        frame_indices,
+    )
     limits = torch.tensor(codebook_sizes, device=packed_targets.device, dtype=torch.long)
     if bool(((packed_targets < 0) | (packed_targets >= limits)).any()):
         raise ValueError("target_acoustic_codes contains an ID outside its codebook.")
@@ -276,8 +331,13 @@ def _frame_mask(condition: Tensor, mask: Tensor | None, *, validate: bool = True
     return frame_mask
 
 
-def _scatter(values: Tensor, mask: Tensor) -> Tensor:
-    frame_indices = mask.flatten().nonzero().flatten()
+def _scatter(
+    values: Tensor,
+    mask: Tensor,
+    frame_indices: Tensor | None = None,
+) -> Tensor:
+    if frame_indices is None:
+        frame_indices = mask.flatten().nonzero().flatten()
     output = values.new_zeros((mask.numel(), *values.shape[1:]))
     output = output.index_copy(0, frame_indices, values)
     return output.unflatten(0, mask.shape)

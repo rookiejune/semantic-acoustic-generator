@@ -27,6 +27,10 @@ class Teacher(Protocol):
     ) -> Tensor: ...
 
 
+class _Encoder(Protocol):
+    layers: nn.ModuleList
+
+
 class WavLMTeacher(nn.Module):
     """Frozen WavLM features aligned to codec frames for the FM route."""
 
@@ -46,12 +50,12 @@ class WavLMTeacher(nn.Module):
         try:
             from transformers import WavLMModel
         except ImportError as error:
-            raise ImportError(
-                "WavLMTeacher requires semantic-acoustic-codec[rvq]."
-            ) from error
+            raise ImportError("WavLMTeacher requires semantic-acoustic-codec[rvq].") from error
         self.model = WavLMModel.from_pretrained(checkpoint)
         if not 0 <= layer <= self.model.config.num_hidden_layers:
             raise ValueError("WavLM teacher layer is outside hidden_states")
+        if layer < self.model.config.num_hidden_layers:
+            _truncate_wavlm_encoder(cast(nn.Module, self.model), layer)
         self.model.requires_grad_(False)
         self.model.eval()
         if device is not None:
@@ -83,9 +87,7 @@ class WavLMTeacher(nn.Module):
             raise ValueError("each teacher mask row must contain a valid frame")
 
         inputs, lengths = self._waveforms(semantic_codes, acoustic_codes, mask)
-        sample_mask = (
-            torch.arange(inputs.size(1), device=self._device)[None] < lengths[:, None]
-        )
+        sample_mask = torch.arange(inputs.size(1), device=self._device)[None] < lengths[:, None]
         output = self.model(
             inputs,
             attention_mask=sample_mask,
@@ -160,6 +162,14 @@ class WavLMTeacher(nn.Module):
         return output
 
 
+def _truncate_wavlm_encoder(model: nn.Module, layer: int) -> None:
+    encoder = getattr(model, "encoder", None)
+    layers = getattr(encoder, "layers", None)
+    if not isinstance(encoder, nn.Module) or not isinstance(layers, nn.ModuleList):
+        raise TypeError("WavLM model must expose encoder.layers as a ModuleList")
+    cast(_Encoder, encoder).layers = nn.ModuleList(list(layers[:layer]))
+
+
 def decode_group_metrics(mask: Tensor) -> dict[str, float]:
     """Stats for length-grouped codec decode; singleton_fraction=1 means fully per-row."""
     if mask.dtype != torch.bool:
@@ -190,7 +200,9 @@ def _mono_batch(waveform: Tensor) -> Tensor:
     if value.dim() == 3:
         value = value.mean(dim=1)
     if value.dim() != 2:
-        raise ValueError("codec teacher decode must produce [batch, time] or [batch, channel, time]")
+        raise ValueError(
+            "codec teacher decode must produce [batch, time] or [batch, channel, time]"
+        )
     return value
 
 

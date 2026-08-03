@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 from anytrain.codec import load_semantic_acoustic
+
+from semantic_acoustic_codec.backend.config import BackendConfig
 
 if TYPE_CHECKING:
     from anytrain.codec import SemanticAcousticCodec
@@ -23,26 +25,21 @@ class _BiCodecFactory(Protocol):
 
 
 def load_backend(
-    config: Any,
+    config: BackendConfig,
     device: str | torch.device | None,
 ) -> SemanticAcousticCodec:
-    name = str(config.name)
+    if not isinstance(config, BackendConfig):
+        raise TypeError("config must be a BackendConfig.")
+    name = config.name
     if name != "bicodec":
         return load_semantic_acoustic(name, device=device)
     return _bicodec_type().from_pretrained(
-        model_dir=_optional_string(config, "model_dir"),
-        revision=_optional_string(config, "revision"),
+        model_dir=config.model_dir,
+        revision=config.revision,
         device=device,
-        local_files_only=bool(config.get("local_files_only", True)),
-        allow_unpinned_revision=bool(config.get("allow_unpinned_revision", False)),
+        local_files_only=config.local_files_only,
+        allow_unpinned_revision=config.allow_unpinned_revision,
     )
-
-
-def _optional_string(config: Any, key: str) -> str | None:
-    value = config.get(key)
-    if value is None:
-        return None
-    return str(value)
 
 
 def _bicodec_type() -> type[_BiCodecFactory]:

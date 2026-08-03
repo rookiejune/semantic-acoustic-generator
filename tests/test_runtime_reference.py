@@ -9,7 +9,11 @@ from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 from torch import nn
 
 import semantic_acoustic_codec.runtime.semantic as runtime_semantic
-from semantic_acoustic_codec.config import DecoderConfig, Route, RVQPredictor
+from semantic_acoustic_codec.config import (
+    DecoderConfig,
+    Route,
+    RVQPredictor,
+)
 from semantic_acoustic_codec.model.condition import ReferenceConditioner, SemanticConditioner
 from semantic_acoustic_codec.model.decoder import CodecUnitGenerator
 from semantic_acoustic_codec.model.routes import RouteModules
@@ -21,6 +25,77 @@ from semantic_acoustic_codec.runtime import (
     build_support,
 )
 from semantic_acoustic_codec.runtime.artifact import load_artifact, save_artifact
+
+
+@pytest.mark.parametrize("value", [True, "16"])
+def test_sampling_config_rejects_non_integer_flow_steps(value: object) -> None:
+    with pytest.raises(TypeError, match="flow_steps"):
+        SamplingConfig(flow_steps=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["temperature", "top_p", "cfg_scale"])
+@pytest.mark.parametrize("value", [True, "1.0"])
+def test_sampling_config_rejects_non_numeric_fields(field: str, value: object) -> None:
+    with pytest.raises(TypeError, match=field):
+        SamplingConfig(**{field: value})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["temperature", "top_p", "cfg_scale"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_sampling_config_rejects_non_finite_fields(field: str, value: float) -> None:
+    with pytest.raises(ValueError, match=rf"{field} must be finite"):
+        SamplingConfig(**{field: value})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("route", "fm", "route must be a Route"),
+        ("condition_dim", True, "condition_dim must be an integer"),
+        ("condition_dim", "4", "condition_dim must be an integer"),
+        ("decoder", object(), "decoder must be a DecoderConfig"),
+        ("initialization", "codec", "initialization must be an Initialization"),
+        ("seed", True, "seed must be an integer"),
+        ("seed", "0", "seed must be an integer"),
+        ("sampling", object(), "sampling must be a SamplingConfig"),
+    ],
+)
+def test_semantic_support_config_rejects_invalid_field_types(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    options: dict[str, object] = {"route": Route.FM, "condition_dim": 4}
+    options[field] = value
+
+    with pytest.raises(TypeError, match=message):
+        SemanticSupportConfig(**options)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("feature_mean", (True,), TypeError),
+        ("feature_std", ("1.0",), TypeError),
+        ("feature_mean", (float("nan"),), ValueError),
+        ("feature_std", (float("inf"),), ValueError),
+    ],
+)
+def test_semantic_support_config_requires_finite_numeric_feature_stats(
+    field: str,
+    value: object,
+    error: type[Exception],
+) -> None:
+    options: dict[str, object] = {
+        "route": Route.FM,
+        "condition_dim": 4,
+        "feature_mean": (0.0,),
+        "feature_std": (1.0,),
+    }
+    options[field] = value
+
+    with pytest.raises(error, match=field):
+        SemanticSupportConfig(**options)  # type: ignore[arg-type]
 
 
 class FakeBackend:
@@ -73,21 +148,17 @@ class SeededGenerator(nn.Module):
         feature_mean: torch.Tensor,
         feature_std: torch.Tensor,
         flow_steps: int,
-        temperature: float,
-        top_p: float,
         unconditional_condition: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
         output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
-        del feature_mean, feature_std, flow_steps, temperature, top_p
+        del feature_mean, feature_std, flow_steps
         _validate_frame_aligned(condition, mask, acoustic_layout, output_length)
         self.conditions.append(condition.detach().clone())
         self.unconditional_conditions.append(
-            None
-            if unconditional_condition is None
-            else unconditional_condition.detach().clone()
+            None if unconditional_condition is None else unconditional_condition.detach().clone()
         )
         self.cfg_scales.append(float(cfg_scale))
         noise = torch.randn(
@@ -260,11 +331,15 @@ def test_support_acoustic_sampling_accepts_optional_reference() -> None:
 def test_runtime_rvq_sample_features_zeroes_padding_frames() -> None:
     class NonZeroPadBackend(FakeBackend):
         def acoustic_codes_to_features(self, acoustic_codes: torch.Tensor) -> torch.Tensor:
-            return (acoustic_codes.float() + 1).expand(
-                -1,
-                -1,
-                self.acoustic_feature_dim,
-            ).contiguous()
+            return (
+                (acoustic_codes.float() + 1)
+                .expand(
+                    -1,
+                    -1,
+                    self.acoustic_feature_dim,
+                )
+                .contiguous()
+            )
 
     support, _ = _support(Route.RVQ)
     runtime = SemanticCodecRuntime(support, NonZeroPadBackend())
@@ -276,6 +351,44 @@ def test_runtime_rvq_sample_features_zeroes_padding_frames() -> None:
     assert features.shape == (1, 3, 4)
     assert bool((features[0, :2] != 0).all())
     assert torch.equal(features[0, 2], torch.zeros(4))
+
+
+def test_sampling_prepares_semantic_input_once_per_public_call(monkeypatch) -> None:
+    original = SemanticCodecSupport._semantic_input
+    calls: list[Route] = []
+
+    def record_input(
+        self: SemanticCodecSupport,
+        value: torch.Tensor,
+        mask: torch.Tensor | None,
+        *,
+        validate: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append(self.route)
+        return original(self, value, mask, validate=validate)
+
+    monkeypatch.setattr(SemanticCodecSupport, "_semantic_input", record_input)
+    semantic = torch.tensor([[[1], [2]]], dtype=torch.long)
+    mask = torch.ones(1, 2, dtype=torch.bool)
+    fm_support, _ = _support(Route.FM)
+    rvq_support, _ = _support(Route.RVQ)
+
+    fm_support.sample_features(semantic, mask=mask, generator=_generator())
+    assert calls == [Route.FM]
+    calls.clear()
+    SemanticCodecRuntime(fm_support, FakeBackend()).decode(
+        semantic,
+        mask=mask,
+        generator=_generator(),
+    )
+    assert calls == [Route.FM]
+    calls.clear()
+    SemanticCodecRuntime(rvq_support, FakeBackend()).sample_features(
+        semantic,
+        mask=mask,
+        generator=_generator(),
+    )
+    assert calls == [Route.RVQ]
 
 
 def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
@@ -295,7 +408,7 @@ def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
         acoustic_feature_dim=backend.acoustic_feature_dim,
         acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
     )
-    save_artifact(tmp_path, support, config, backend=backend)
+    save_artifact(tmp_path, support, backend=backend)
 
     config_path = tmp_path / "codec.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
@@ -341,7 +454,7 @@ def test_schema_seven_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
         acoustic_feature_dim=backend.acoustic_feature_dim,
         acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
     )
-    save_artifact(tmp_path, support, config, backend=backend)
+    save_artifact(tmp_path, support, backend=backend)
 
     config_path = tmp_path / "codec.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
@@ -352,7 +465,7 @@ def test_schema_seven_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
         load_artifact(tmp_path)
 
 
-def test_schema_seven_artifact_defaults_missing_cfg_scale(tmp_path, monkeypatch) -> None:
+def test_schema_seven_artifact_rejects_missing_cfg_scale(tmp_path) -> None:
     backend = FakeBackend()
     config = SemanticSupportConfig(
         route=Route.FM,
@@ -366,25 +479,84 @@ def test_schema_seven_artifact_defaults_missing_cfg_scale(tmp_path, monkeypatch)
         acoustic_feature_dim=backend.acoustic_feature_dim,
         acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
     )
-    save_artifact(tmp_path, support, config, backend=backend)
+    save_artifact(tmp_path, support, backend=backend)
 
     config_path = tmp_path / "codec.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
     del data["config"]["sampling"]["cfg_scale"]
     config_path.write_text(json.dumps(data), encoding="utf-8")
 
-    captured: list[SemanticSupportConfig] = []
-    original = runtime_semantic.build_support
+    with pytest.raises(ValueError, match="missing 'cfg_scale'"):
+        load_artifact(tmp_path)
 
-    def capture(options: SemanticSupportConfig, **kwargs: Any) -> SemanticCodecSupport:
-        captured.append(options)
-        return original(options, **kwargs)
 
-    monkeypatch.setattr(runtime_semantic, "build_support", capture)
-    load_artifact(tmp_path)
+@pytest.mark.parametrize(
+    ("section", "field", "value", "message"),
+    [
+        ("config", "condition_dim", True, "config.condition_dim"),
+        ("decoder", "layers", "1", "decoder.layers"),
+        ("sampling", "temperature", "1.0", "sampling.temperature"),
+    ],
+)
+def test_schema_seven_artifact_rejects_lossy_numeric_coercion(
+    tmp_path,
+    section: str,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    backend = FakeBackend()
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=4,
+        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        sampling=SamplingConfig(flow_steps=1),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    )
+    save_artifact(tmp_path, support, backend=backend)
 
-    assert len(captured) == 1
-    assert captured[0].sampling.cfg_scale == 1.0
+    config_path = tmp_path / "codec.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    target = data["config"] if section == "config" else data["config"][section]
+    target[field] = value
+    config_path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(TypeError, match=message.replace(".", r"\.")):
+        load_artifact(tmp_path)
+
+
+@pytest.mark.parametrize("value", [False, "0.0", float("nan")])
+def test_schema_seven_artifact_rejects_invalid_feature_metadata(tmp_path, value: object) -> None:
+    backend = FakeBackend()
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=4,
+        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        sampling=SamplingConfig(flow_steps=1),
+        feature_mean=(0.0, 0.0, 0.0, 0.0),
+        feature_std=(1.0, 1.0, 1.0, 1.0),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    )
+    save_artifact(tmp_path, support, backend=backend)
+
+    config_path = tmp_path / "codec.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data["config"]["feature_mean"][0] = value
+    config_path.write_text(json.dumps(data), encoding="utf-8")
+
+    error = ValueError if isinstance(value, float) else TypeError
+    with pytest.raises(error, match="feature_mean metadata"):
+        load_artifact(tmp_path)
 
 
 def _support(

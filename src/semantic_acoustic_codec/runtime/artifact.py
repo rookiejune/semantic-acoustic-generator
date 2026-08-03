@@ -5,7 +5,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodec
@@ -123,20 +123,21 @@ class AcousticGeneratorArtifact:
 def save_artifact(
     path: str | Path,
     support: SemanticCodecSupport,
-    config: SemanticSupportConfig,
     *,
     backend: SemanticAcousticCodec,
 ) -> None:
+    artifact_config = support.config
+    if artifact_config is None:
+        raise ValueError("artifact support must expose its construction config.")
+    _validate_support_runtime_config(support, artifact_config)
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
-    if config.route is not support.route:
-        raise ValueError("artifact config route must match support route.")
     metadata = _backend_metadata(support, backend)
     validate_backend_metadata(metadata, backend)
     torch.save(support.state_dict(), root / CHECKPOINT_NAME)
     data = {
         "schema_version": SCHEMA_VERSION,
-        "config": _config_dict(config),
+        "config": _config_dict(artifact_config),
         "backend": metadata,
         "checkpoint": CHECKPOINT_NAME,
     }
@@ -160,10 +161,10 @@ def load_generator_artifact(
     """Load the reusable acoustic generator and its strict input contract."""
     checkpoint, metadata, config = _artifact(path)
     generator = _generator(config, metadata)
+    state = _load_state(checkpoint)
+    generator.load_state_dict(_generator_state(state))
     if device is not None:
         generator.to(device=device)
-    state = _load_state(checkpoint, device=device)
-    generator.load_state_dict(_generator_state(state))
     generator.eval()
     acoustic_feature_dim = _metadata_int(metadata, "acoustic_feature_dim")
     spec = AcousticGeneratorSpec(
@@ -178,7 +179,7 @@ def load_generator_artifact(
         semantic_embedding_dim=_metadata_int(metadata, "semantic_embedding_dim"),
         acoustic_feature_dim=acoustic_feature_dim,
         acoustic_codebook_sizes=_metadata_sizes(metadata),
-        acoustic_layout=AcousticLayout(str(metadata["acoustic_layout"])),
+        acoustic_layout=AcousticLayout(_metadata_string(metadata, "acoustic_layout")),
         acoustic_unit_length=_metadata_optional_int(metadata, "acoustic_unit_length"),
         feature_mean=_feature_values(config.feature_mean, acoustic_feature_dim, fill=0.0),
         feature_std=_feature_values(config.feature_std, acoustic_feature_dim, fill=1.0),
@@ -198,6 +199,25 @@ def _backend_metadata(
         "semantic_frame_rate": float(backend.semantic_frame_rate),
         **support_metadata(support),
     }
+
+
+def _validate_support_runtime_config(
+    support: SemanticCodecSupport,
+    config: SemanticSupportConfig,
+) -> None:
+    if support.route is not config.route:
+        raise ValueError("support route no longer matches its construction config.")
+    if support.sampling != config.sampling:
+        raise ValueError("support sampling no longer matches its construction config.")
+    expected_mean = _feature_values(config.feature_mean, support.acoustic_feature_dim, fill=0.0)
+    expected_std = _feature_values(config.feature_std, support.acoustic_feature_dim, fill=1.0)
+    mean = support.feature_mean.detach()
+    std = support.feature_std.detach()
+    expected_mean_tensor = mean.new_tensor(expected_mean).view_as(mean)
+    expected_std_tensor = std.new_tensor(expected_std).view_as(std)
+    if not torch.equal(mean, expected_mean_tensor) or not torch.equal(std, expected_std_tensor):
+        raise ValueError("support feature normalization no longer matches its construction config.")
+
 
 def _validate_acoustic_backend_metadata(
     data: Mapping[str, object],
@@ -228,11 +248,11 @@ def _load_artifact(
         ),
         acoustic_feature_dim=_metadata_int(backend_data, "acoustic_feature_dim"),
         acoustic_codebook_sizes=_metadata_sizes(backend_data),
-        acoustic_layout=AcousticLayout(str(backend_data["acoustic_layout"])),
+        acoustic_layout=AcousticLayout(_metadata_string(backend_data, "acoustic_layout")),
         acoustic_unit_length=_metadata_optional_int(backend_data, "acoustic_unit_length"),
         artifact_backend_metadata=backend_data,
     )
-    state = _load_state(checkpoint, device=device)
+    state = _load_state(checkpoint)
     support.load_state_dict(state)
     if device is not None:
         support.to(device=device)
@@ -245,15 +265,20 @@ def _artifact(path: str | Path) -> tuple[Path, Mapping[str, object], SemanticSup
     data = json.loads((root / CONFIG_NAME).read_text(encoding="utf-8"))
     if not isinstance(data, Mapping):
         raise TypeError("semantic codec config must contain a mapping.")
-    if data.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"unsupported semantic codec schema: {data.get('schema_version')!r}")
+    schema_version = data.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != SCHEMA_VERSION
+    ):
+        raise ValueError(f"unsupported semantic codec schema: {schema_version!r}")
     backend = data.get("backend")
     if not isinstance(backend, Mapping):
         raise TypeError("semantic codec backend metadata must be a mapping.")
     raw_config = data.get("config")
     if not isinstance(raw_config, Mapping):
         raise TypeError("semantic codec config metadata must be a mapping.")
-    checkpoint = data.get("checkpoint", CHECKPOINT_NAME)
+    checkpoint = data.get("checkpoint")
     if not isinstance(checkpoint, str) or not checkpoint:
         raise TypeError("semantic codec checkpoint must be a non-empty string.")
     return root / checkpoint, cast(Mapping[str, object], backend), _config(raw_config)
@@ -265,7 +290,7 @@ def _generator(
 ) -> CodecUnitGenerator:
     acoustic_feature_dim = _metadata_int(metadata, "acoustic_feature_dim")
     acoustic_codebook_sizes = _metadata_sizes(metadata)
-    layout = AcousticLayout(str(metadata["acoustic_layout"]))
+    layout = AcousticLayout(_metadata_string(metadata, "acoustic_layout"))
     fixed_length = (
         _metadata_optional_int(metadata, "acoustic_unit_length")
         if layout is AcousticLayout.FIXED_LENGTH
@@ -290,21 +315,14 @@ def _generator(
 
 def _generator_state(state: Mapping[str, Tensor]) -> dict[str, Tensor]:
     prefix = "generator."
-    result = {
-        key[len(prefix) :]: value
-        for key, value in state.items()
-        if key.startswith(prefix)
-    }
+    result = {key[len(prefix) :]: value for key, value in state.items() if key.startswith(prefix)}
     if not result:
         raise RuntimeError("semantic codec checkpoint is missing generator state.")
     return result
 
 
-def _load_state(path: Path, *, device: str | torch.device | None) -> Mapping[str, Tensor]:
-    try:
-        state = torch.load(path, map_location=device, weights_only=True)
-    except TypeError:
-        state = torch.load(path, map_location=device)
+def _load_state(path: Path) -> Mapping[str, Tensor]:
+    state = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(state, Mapping):
         raise TypeError("semantic codec checkpoint must contain a state dict mapping.")
     return cast(Mapping[str, Tensor], state)
@@ -319,55 +337,113 @@ def _config_dict(config: SemanticSupportConfig) -> dict[str, object]:
     return cast(dict[str, object], data)
 
 
-def _config(data: Mapping[str, Any]) -> SemanticSupportConfig:
+def _config(data: Mapping[str, object]) -> SemanticSupportConfig:
     from semantic_acoustic_codec.runtime.semantic import SamplingConfig, SemanticSupportConfig
 
-    decoder = cast(Mapping[str, Any], data["decoder"])
-    sampling = cast(Mapping[str, Any], data["sampling"])
+    decoder = _schema_mapping(data, "decoder", owner="config")
+    sampling = _schema_mapping(data, "sampling", owner="config")
     return SemanticSupportConfig(
-        route=Route(cast(str, data["route"])),
-        condition_dim=int(data["condition_dim"]),
+        route=Route(_schema_string(data, "route", owner="config")),
+        condition_dim=_schema_int(data, "condition_dim", owner="config"),
         decoder=DecoderConfig(
-            hidden_dim=cast(Optional[int], decoder["hidden_dim"]),
-            layers=int(decoder["layers"]),
-            heads=int(decoder["heads"]),
-            ffn_ratio=int(decoder["ffn_ratio"]),
-            rvq_predictor=RVQPredictor(
-                cast(str, _schema_field(decoder, "rvq_predictor", owner="decoder"))
+            hidden_dim=_schema_optional_int(decoder, "hidden_dim", owner="decoder"),
+            layers=_schema_int(decoder, "layers", owner="decoder"),
+            heads=_schema_int(decoder, "heads", owner="decoder"),
+            ffn_ratio=_schema_int(decoder, "ffn_ratio", owner="decoder"),
+            rvq_predictor=RVQPredictor(_schema_string(decoder, "rvq_predictor", owner="decoder")),
+            mtp_layers=_schema_int(decoder, "mtp_layers", owner="decoder"),
+            mtp_heads=_schema_int(decoder, "mtp_heads", owner="decoder"),
+            repa_feature_dim=_schema_optional_int(
+                decoder,
+                "repa_feature_dim",
+                owner="decoder",
             ),
-            mtp_layers=int(_schema_field(decoder, "mtp_layers", owner="decoder")),
-            mtp_heads=int(_schema_field(decoder, "mtp_heads", owner="decoder")),
-            repa_feature_dim=cast(
-                Optional[int],
-                _schema_field(decoder, "repa_feature_dim", owner="decoder"),
+            repa_student_layer=_schema_optional_int(
+                decoder,
+                "repa_student_layer",
+                owner="decoder",
             ),
-            repa_student_layer=cast(
-                Optional[int],
-                _schema_field(decoder, "repa_student_layer", owner="decoder"),
-            ),
-            repa_loss_weight=float(
-                _schema_field(decoder, "repa_loss_weight", owner="decoder")
+            repa_loss_weight=_schema_float(
+                decoder,
+                "repa_loss_weight",
+                owner="decoder",
             ),
         ),
-        initialization=Initialization(cast(str, data["initialization"])),
-        seed=int(data["seed"]),
+        initialization=Initialization(_schema_string(data, "initialization", owner="config")),
+        seed=_schema_int(data, "seed", owner="config"),
         sampling=SamplingConfig(
-            flow_steps=int(sampling["flow_steps"]),
-            temperature=float(sampling["temperature"]),
-            top_p=float(sampling["top_p"]),
-            cfg_scale=float(sampling.get("cfg_scale", 1.0)),
+            flow_steps=_schema_int(sampling, "flow_steps", owner="sampling"),
+            temperature=_schema_float(sampling, "temperature", owner="sampling"),
+            top_p=_schema_float(sampling, "top_p", owner="sampling"),
+            cfg_scale=_schema_float(sampling, "cfg_scale", owner="sampling"),
         ),
-        feature_mean=_float_tuple(data.get("feature_mean")),
-        feature_std=_float_tuple(data.get("feature_std")),
+        feature_mean=_float_tuple(
+            _schema_field(data, "feature_mean", owner="config"),
+            name="feature_mean",
+        ),
+        feature_std=_float_tuple(
+            _schema_field(data, "feature_std", owner="config"),
+            name="feature_std",
+        ),
     )
 
 
-def _schema_field(data: Mapping[str, Any], key: str, *, owner: str) -> Any:
+def _schema_field(data: Mapping[str, object], key: str, *, owner: str) -> object:
     if key not in data:
-        raise ValueError(
-            f"semantic codec schema {SCHEMA_VERSION} {owner} is missing {key!r}."
-        )
+        raise ValueError(f"semantic codec schema {SCHEMA_VERSION} {owner} is missing {key!r}.")
     return data[key]
+
+
+def _schema_mapping(
+    data: Mapping[str, object],
+    key: str,
+    *,
+    owner: str,
+) -> Mapping[str, object]:
+    value = _schema_field(data, key, owner=owner)
+    if not isinstance(value, Mapping):
+        raise TypeError(f"semantic codec schema {SCHEMA_VERSION} {owner}.{key} must be a mapping.")
+    return cast(Mapping[str, object], value)
+
+
+def _schema_string(data: Mapping[str, object], key: str, *, owner: str) -> str:
+    value = _schema_field(data, key, owner=owner)
+    if not isinstance(value, str):
+        raise TypeError(f"semantic codec schema {SCHEMA_VERSION} {owner}.{key} must be a string.")
+    return value
+
+
+def _schema_int(data: Mapping[str, object], key: str, *, owner: str) -> int:
+    value = _schema_field(data, key, owner=owner)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"semantic codec schema {SCHEMA_VERSION} {owner}.{key} must be an integer.")
+    return value
+
+
+def _schema_optional_int(
+    data: Mapping[str, object],
+    key: str,
+    *,
+    owner: str,
+) -> int | None:
+    value = _schema_field(data, key, owner=owner)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            f"semantic codec schema {SCHEMA_VERSION} {owner}.{key} must be an integer or null."
+        )
+    return value
+
+
+def _schema_float(data: Mapping[str, object], key: str, *, owner: str) -> float:
+    value = _schema_field(data, key, owner=owner)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"semantic codec schema {SCHEMA_VERSION} {owner}.{key} must be a number.")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"semantic codec schema {SCHEMA_VERSION} {owner}.{key} must be finite.")
+    return result
 
 
 def _feature_values(
@@ -384,12 +460,18 @@ def _feature_values(
     return values
 
 
-def _float_tuple(value: object) -> tuple[float, ...] | None:
+def _float_tuple(value: object, *, name: str) -> tuple[float, ...] | None:
     if value is None:
         return None
     if not isinstance(value, list):
-        raise TypeError("feature normalization metadata must be a list.")
-    return tuple(float(item) for item in value)
+        raise TypeError(f"{name} metadata must be a list or null.")
+    if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in value):
+        raise TypeError(f"{name} metadata must contain only numbers.")
+    result = tuple(float(item) for item in value)
+    if any(not math.isfinite(item) for item in result):
+        raise ValueError(f"{name} metadata values must be finite.")
+    return result
+
 
 def _validate_metadata(
     data: Mapping[str, object],
@@ -404,6 +486,8 @@ def _metadata_int(data: Mapping[str, object], key: str) -> int:
     value = data.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"artifact backend metadata {key!r} must be an integer.")
+    if value <= 0:
+        raise ValueError(f"artifact backend metadata {key!r} must be positive.")
     return value
 
 
@@ -411,9 +495,10 @@ def _metadata_float(data: Mapping[str, object], key: str) -> float:
     value = data.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"artifact backend metadata {key!r} must be a number.")
-    if value <= 0:
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
         raise ValueError(f"artifact backend metadata {key!r} must be positive.")
-    return float(value)
+    return result
 
 
 def _metadata_string(data: Mapping[str, object], key: str) -> str:

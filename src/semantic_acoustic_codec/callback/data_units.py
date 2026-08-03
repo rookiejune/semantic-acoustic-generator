@@ -28,12 +28,9 @@ class SemanticFrameUnits:
         del trainer, pl_module, outputs, batch_idx
         if not isinstance(batch, SemanticCodecBatch):
             raise TypeError("SemanticFrameUnits expects a SemanticCodecBatch.")
-        mask = batch.mask
-        if mask.dtype != torch.bool:
-            raise TypeError("SemanticCodecBatch.mask must be boolean.")
         return UnitBatch(
-            valid=float(mask.sum().item()),
-            padded=float(mask.numel()),
+            valid=float(batch.semantic_valid_frames),
+            padded=float(batch.semantic_padded_frames),
             unit="frames",
         )
 
@@ -41,6 +38,14 @@ class SemanticFrameUnits:
 @dataclass(frozen=True)
 class _Measurement:
     elapsed: float
+    valid: float
+    padded: float | None
+
+
+@dataclass(frozen=True)
+class _PendingCudaMeasurement:
+    start: torch.cuda.Event
+    end: torch.cuda.Event
     valid: float
     padded: float | None
 
@@ -71,6 +76,8 @@ class UnitThroughputCallback(pl.Callback):
         self.measure_window_steps = measure_window_steps
         self.sync_cuda = sync_cuda
         self._batch_started_at: float | None = None
+        self._cuda_batch_started_at: torch.cuda.Event | None = None
+        self._pending_cuda: deque[_PendingCudaMeasurement] = deque(maxlen=measure_window_steps)
         self._measurements: deque[_Measurement] = deque(maxlen=measure_window_steps)
 
     def on_train_batch_start(
@@ -80,11 +87,15 @@ class UnitThroughputCallback(pl.Callback):
         batch: Any,
         batch_idx: int,
     ) -> None:
-        del trainer, pl_module, batch, batch_idx
-        if self._batch_started_at is not None:
+        del trainer, batch, batch_idx
+        if self._batch_started_at is not None or self._cuda_batch_started_at is not None:
             raise RuntimeError("A training batch started before the previous batch ended.")
-        _sync_cuda(self.sync_cuda)
-        self._batch_started_at = time.perf_counter()
+        if self.sync_cuda and torch.cuda.is_available() and _uses_cuda(pl_module):
+            started = torch.cuda.Event(enable_timing=True)
+            started.record()
+            self._cuda_batch_started_at = started
+        else:
+            self._batch_started_at = time.perf_counter()
 
     def on_train_batch_end(
         self,
@@ -94,13 +105,8 @@ class UnitThroughputCallback(pl.Callback):
         batch: Any,
         batch_idx: int,
     ) -> None:
-        if self._batch_started_at is None:
+        if self._batch_started_at is None and self._cuda_batch_started_at is None:
             return
-
-        _sync_cuda(self.sync_cuda)
-        elapsed = time.perf_counter() - self._batch_started_at
-        self._batch_started_at = None
-        _require_positive(elapsed, "measured batch time")
 
         units = self.unit_provider(
             trainer=trainer,
@@ -109,15 +115,10 @@ class UnitThroughputCallback(pl.Callback):
             batch=batch,
             batch_idx=batch_idx,
         )
-        measurement = _Measurement(
-            elapsed=elapsed,
-            valid=float(units.valid),
-            padded=None if units.padded is None else float(units.padded),
-        )
-        self._measurements.append(measurement)
-
         step = int(getattr(trainer, "global_step", 0))
-        if step < self.warmup_steps or step % self.log_every_n_steps != 0:
+        should_log = step >= self.warmup_steps and step % self.log_every_n_steps == 0
+        measurement = self._finish_measurement(units, should_log=should_log)
+        if measurement is None:
             return
         pl_module.log_dict(
             _metrics(units.unit, current=measurement, window=self._measurements),
@@ -133,7 +134,7 @@ class UnitThroughputCallback(pl.Callback):
         pl_module: pl.LightningModule,
     ) -> None:
         del trainer, pl_module
-        self._batch_started_at = None
+        self._reset_active_timer()
 
     def on_exception(
         self,
@@ -142,7 +143,66 @@ class UnitThroughputCallback(pl.Callback):
         exception: BaseException,
     ) -> None:
         del trainer, pl_module, exception
+        self._reset_active_timer()
+        self._pending_cuda.clear()
+
+    def _finish_measurement(
+        self,
+        units: UnitBatch,
+        *,
+        should_log: bool,
+    ) -> _Measurement | None:
+        padded = None if units.padded is None else float(units.padded)
+        started = self._cuda_batch_started_at
+        if started is not None:
+            ended = torch.cuda.Event(enable_timing=True)
+            ended.record()
+            self._cuda_batch_started_at = None
+            self._pending_cuda.append(
+                _PendingCudaMeasurement(
+                    start=started,
+                    end=ended,
+                    valid=float(units.valid),
+                    padded=padded,
+                )
+            )
+            if not should_log:
+                return None
+            ended.synchronize()
+            current = self._resolve_cuda_measurements()
+            if current is None:
+                raise RuntimeError("CUDA throughput measurement window is empty.")
+            return current
+
+        started_at = self._batch_started_at
+        if started_at is None:
+            raise RuntimeError("Training batch timer is not active.")
         self._batch_started_at = None
+        measurement = _Measurement(
+            elapsed=time.perf_counter() - started_at,
+            valid=float(units.valid),
+            padded=padded,
+        )
+        _require_positive(measurement.elapsed, "measured batch time")
+        self._measurements.append(measurement)
+        return measurement if should_log else None
+
+    def _resolve_cuda_measurements(self) -> _Measurement | None:
+        current: _Measurement | None = None
+        while self._pending_cuda:
+            pending = self._pending_cuda.popleft()
+            current = _Measurement(
+                elapsed=float(pending.start.elapsed_time(pending.end)) / 1000.0,
+                valid=pending.valid,
+                padded=pending.padded,
+            )
+            _require_positive(current.elapsed, "measured batch time")
+            self._measurements.append(current)
+        return current
+
+    def _reset_active_timer(self) -> None:
+        self._batch_started_at = None
+        self._cuda_batch_started_at = None
 
 
 def _metrics(
@@ -188,9 +248,9 @@ def _padding_ratio(*, valid: float, padded: float) -> float:
     return 1.0 - valid / padded
 
 
-def _sync_cuda(enabled: bool) -> None:
-    if enabled and torch.cuda.is_available():
-        torch.cuda.synchronize()
+def _uses_cuda(module: pl.LightningModule) -> bool:
+    device = getattr(module, "device", None)
+    return isinstance(device, (str, torch.device)) and torch.device(device).type == "cuda"
 
 
 def _require_positive_int(value: int, name: str) -> None:

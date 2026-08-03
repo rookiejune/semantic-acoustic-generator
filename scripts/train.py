@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Union, cast
 
 import hydra
 import torch
@@ -32,8 +33,6 @@ from semantic_acoustic_codec.config import (
     Route,
 )
 from semantic_acoustic_codec.datamodule import (
-    BatchingConfig,
-    DataConfig,
     DataModule,
     load_batch,
     single_batch_loader,
@@ -43,9 +42,33 @@ from semantic_acoustic_codec.pl_module import build_module, dataset_feature_stat
 from semantic_acoustic_codec.runtime import SamplingConfig, SemanticSupportConfig
 
 if __package__:
-    from ._train_config import TrainConfig, output_dir, parse_train_config
+    from ._train_config import (
+        CallbackConfig,
+        CheckpointCallbackConfig,
+        CodebookUsageCallbackConfig,
+        DataThroughputCallbackConfig,
+        EMACallbackConfig,
+        PerformanceCallbackConfig,
+        PLModuleConfig,
+        SampleCallbackConfig,
+        TrainConfig,
+        output_dir,
+        parse_train_config,
+    )
 else:
-    from _train_config import TrainConfig, output_dir, parse_train_config
+    from _train_config import (
+        CallbackConfig,
+        CheckpointCallbackConfig,
+        CodebookUsageCallbackConfig,
+        DataThroughputCallbackConfig,
+        EMACallbackConfig,
+        PerformanceCallbackConfig,
+        PLModuleConfig,
+        SampleCallbackConfig,
+        TrainConfig,
+        output_dir,
+        parse_train_config,
+    )
 
 if TYPE_CHECKING:
     from anytrain.codec import SemanticAcousticCodec
@@ -65,8 +88,8 @@ def run(config: DictConfig | TrainConfig) -> None:
     seed = config.seed
     pl.seed_everything(seed, workers=True)
     device = _device(config.runtime.device)
-    output_dir = _output_dir(config)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = output_dir(config)
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     codec = config.backend.name
     data = config.datamodule
@@ -96,11 +119,18 @@ def run(config: DictConfig | TrainConfig) -> None:
     route = config.model.route
     repa_teacher = _repa_teacher(config, backend, device=device, route=route)
     support_config = _support_config(config, seed=seed, repa_teacher=repa_teacher)
+    ckpt_path = config.trainer.ckpt_path
     normalize_features = config.pl_module.normalize_features
     feature_mean: tuple[float, ...] | None = None
     feature_std: tuple[float, ...] | None = None
     if normalize_features and support_config.route is Route.FM:
-        if config.datamodule.fixed_batch:
+        checkpoint_stats = _checkpoint_feature_stats(
+            ckpt_path,
+            feature_dim=int(backend.acoustic_feature_dim),
+        )
+        if checkpoint_stats is not None:
+            feature_mean, feature_std = checkpoint_stats
+        elif config.datamodule.fixed_batch:
             feature_mean, feature_std = dataset_feature_stats(backend, (fixed_batch,))
         else:
             feature_mean, feature_std = dataset_feature_stats(
@@ -118,13 +148,13 @@ def run(config: DictConfig | TrainConfig) -> None:
         weight_decay=config.pl_module.weight_decay,
         reference_dropout=config.pl_module.reference_dropout,
         validation_seed=config.pl_module.validation_seed,
+        finite_loss_check_interval=config.pl_module.finite_loss_check_interval,
         repa_teacher=repa_teacher,
     )
 
     checkpoint = config.callback.checkpoint
-    callbacks = _build_callbacks(config, output_dir=output_dir, fixed_batch=fixed_batch)
+    callbacks = _build_callbacks(config, output_dir=run_dir, fixed_batch=fixed_batch)
 
-    ckpt_path = _ckpt_path(config)
     trainer = pl.Trainer(
         accelerator=config.trainer.accelerator,
         devices=cast(Union[str, int], config.trainer.devices),
@@ -135,7 +165,7 @@ def run(config: DictConfig | TrainConfig) -> None:
         log_every_n_steps=config.trainer.log_every_n_steps,
         enable_checkpointing=checkpoint.enabled,
         gradient_clip_val=config.trainer.gradient_clip_val,
-        default_root_dir=str(output_dir),
+        default_root_dir=str(run_dir),
         callbacks=callbacks,
         use_distributed_sampler=config.trainer.use_distributed_sampler,
         val_check_interval=config.trainer.val_check_interval,
@@ -233,7 +263,7 @@ def _repa_teacher(
 
 
 def _build_callbacks(
-    config: Any,
+    config: TrainConfig,
     *,
     output_dir: Path,
     fixed_batch: SemanticCodecBatch,
@@ -246,29 +276,21 @@ def _build_callbacks(
     ]
     callbacks.extend(_loss_callbacks(callback_config))
 
-    codebook_usage_callback = _codebook_usage_callback(
-        callback_config.get("codebook_usage"),
-        trainer_log_every_n_steps=config.trainer.log_every_n_steps,
-    )
+    codebook_usage_callback = _codebook_usage_callback(callback_config.codebook_usage)
     if codebook_usage_callback is not None:
         callbacks.append(codebook_usage_callback)
 
-    performance_callback = _performance_callback(
-        performance,
-        trainer_log_every_n_steps=config.trainer.log_every_n_steps,
-    )
+    performance_callback = _performance_callback(performance)
     if performance_callback is not None:
         callbacks.append(performance_callback)
 
     throughput_callback = _data_throughput_callback(
-        callback_config.get("data_throughput"),
-        performance=performance,
-        trainer_log_every_n_steps=config.trainer.log_every_n_steps,
+        callback_config.data_throughput,
     )
     if throughput_callback is not None:
         callbacks.append(throughput_callback)
 
-    ema_callback = _ema_callback(config.pl_module, callback_config.get("ema"))
+    ema_callback = _ema_callback(config.pl_module, callback_config.ema)
     if ema_callback is not None:
         callbacks.append(ema_callback)
 
@@ -283,111 +305,79 @@ def _build_callbacks(
 
 
 def _codebook_usage_callback(
-    config: Any,
-    *,
-    trainer_log_every_n_steps: Any,
+    config: CodebookUsageCallbackConfig,
 ) -> Callback | None:
-    if config is not None and not bool(config.get("enabled", True)):
+    if not config.enabled:
         return None
-    usage = {} if config is None else config
-    return CodebookUsageLogger(
-        every_n_steps=int(usage.get("every_n_steps", trainer_log_every_n_steps))
-    )
+    return CodebookUsageLogger(every_n_steps=config.every_n_steps)
 
 
-def _loss_callbacks(config: Any) -> list[Callback]:
+def _loss_callbacks(config: CallbackConfig) -> list[Callback]:
     callbacks: list[Callback] = []
-    loss_summary = config.get("loss_summary")
-    if loss_summary is None or bool(loss_summary.get("enabled", True)):
-        summary = {} if loss_summary is None else loss_summary
-        callbacks.append(LossSummaryCallback(window_capacity=int(summary.get("window_capacity", 20))))
+    loss_summary = config.loss_summary
+    if loss_summary.enabled:
+        callbacks.append(LossSummaryCallback(window_capacity=loss_summary.window_capacity))
 
-    loss_time_bucket = config.get("loss_time_bucket")
-    if loss_time_bucket is None or bool(loss_time_bucket.get("enabled", True)):
-        bucket = {} if loss_time_bucket is None else loss_time_bucket
-        every_n_steps = bucket.get("every_n_steps", 100)
+    loss_time_bucket = config.loss_time_bucket
+    if loss_time_bucket.enabled:
         callbacks.append(
             LossTimeBucketLoggerCallback(
-                item_name=str(bucket.get("item_name", "flow")),
-                detail_key=str(bucket.get("detail_key", "t")),
-                histogram_tag=cast(
-                    Optional[str],
-                    bucket.get("histogram_tag", "train/flow_loss/t_hist"),
-                ),
-                scalar_template=str(
-                    bucket.get(
-                        "scalar_template",
-                        "train/flow_loss/t/{lower:.1f}_{upper:.1f}",
-                    )
-                ),
-                every_n_steps=None if every_n_steps is None else int(every_n_steps),
-                bucket_count=int(bucket.get("bucket_count", 10)),
+                item_name=loss_time_bucket.item_name,
+                detail_key=loss_time_bucket.detail_key,
+                histogram_tag=loss_time_bucket.histogram_tag,
+                scalar_template=loss_time_bucket.scalar_template,
+                every_n_steps=loss_time_bucket.every_n_steps,
+                bucket_count=loss_time_bucket.bucket_count,
             )
         )
     return callbacks
 
 
 def _performance_callback(
-    config: Any,
-    *,
-    trainer_log_every_n_steps: Any,
+    config: PerformanceCallbackConfig,
 ) -> Callback | None:
-    if not bool(config.get("enabled", True)):
+    if not config.enabled:
         return None
     return PerformanceCallback(
-        model_flops_per_step=_optional_float(config.get("model_flops_per_step")),
-        profile_flops=bool(config.get("profile_flops", False)),
-        hardware_peak_flops=_optional_float(config.get("hardware_peak_flops")),
-        log_every_n_steps=int(config.get("log_every_n_steps", trainer_log_every_n_steps)),
-        warmup_steps=int(config.get("warmup_steps", 20)),
-        measure_window_steps=int(config.get("measure_window_steps", 100)),
+        model_flops_per_step=config.model_flops_per_step,
+        profile_flops=config.profile_flops,
+        hardware_peak_flops=config.hardware_peak_flops,
+        log_every_n_steps=config.log_every_n_steps,
+        warmup_steps=config.warmup_steps,
+        measure_window_steps=config.measure_window_steps,
     )
 
 
 def _data_throughput_callback(
-    config: Any,
-    *,
-    performance: Any,
-    trainer_log_every_n_steps: Any,
+    config: DataThroughputCallbackConfig,
 ) -> Callback | None:
-    if config is not None and not bool(config.get("enabled", True)):
+    if not config.enabled:
         return None
-    throughput = {} if config is None else config
     return UnitThroughputCallback(
         unit_provider=SemanticFrameUnits(),
-        log_every_n_steps=int(
-            throughput.get(
-                "log_every_n_steps",
-                performance.get("log_every_n_steps", trainer_log_every_n_steps),
-            )
-        ),
-        warmup_steps=int(throughput.get("warmup_steps", performance.get("warmup_steps", 20))),
-        measure_window_steps=int(
-            throughput.get(
-                "measure_window_steps",
-                performance.get("measure_window_steps", 100),
-            )
-        ),
+        log_every_n_steps=config.log_every_n_steps,
+        warmup_steps=config.warmup_steps,
+        measure_window_steps=config.measure_window_steps,
     )
 
 
-def _ema_callback(config: Any, ema_config: Any) -> Callback | None:
-    ema_decay = config.get("ema_decay")
+def _ema_callback(config: PLModuleConfig, ema_config: EMACallbackConfig) -> Callback | None:
+    ema_decay = config.ema_decay
     if ema_decay is None:
         return None
     return EMACallback(
-        decay=float(ema_decay),
-        update_after_step=int(config.get("ema_update_after_step", 0)),
-        use_ema_weights=bool(True if ema_config is None else ema_config.get("use_ema_weights", True)),
+        decay=ema_decay,
+        update_after_step=config.ema_update_after_step,
+        use_ema_weights=ema_config.use_ema_weights,
     )
 
 
 def _sample_callback(
-    config: Any,
+    config: SampleCallbackConfig,
     output_dir: Path,
     fixed_batch: SemanticCodecBatch,
 ) -> Callback | None:
-    if not bool(config.enabled):
+    if not config.enabled:
         return None
     if not fixed_batch.has_reference:
         warnings.warn(
@@ -399,70 +389,78 @@ def _sample_callback(
         output_dir,
         fixed_batch,
         SampleLogConfig(
-            every_n_train_steps=int(config.every_n_train_steps),
-            seed=int(config.seed),
+            every_n_train_steps=config.every_n_train_steps,
+            seed=config.seed,
         ),
     )
 
 
-def _checkpoint_callback(config: Any, output_dir: Path) -> Callback | None:
-    if not bool(config.enabled):
+def _checkpoint_callback(
+    config: CheckpointCallbackConfig,
+    output_dir: Path,
+) -> Callback | None:
+    if not config.enabled:
         return None
     return ModelCheckpoint(
         dirpath=output_dir / "checkpoints",
-        filename=str(config.filename),
-        save_last=bool(config.save_last),
-        save_top_k=int(config.save_top_k),
-        every_n_train_steps=int(config.every_n_train_steps),
+        filename=config.filename,
+        save_last=config.save_last,
+        save_top_k=config.save_top_k,
+        every_n_train_steps=config.every_n_train_steps,
         auto_insert_metric_name=False,
     )
 
 
-def _data_config(config: Any) -> DataConfig:
-    if isinstance(config, DataConfig):
-        return config
-    batching = config.batching
-    return DataConfig(
-        source=str(config.get("source", "qwen_cross_text")),
-        root=cast(Optional[str], config.get("root")),
-        split=str(config.split),
-        validation_split=cast(Optional[str], config.get("validation_split")),
-        validation_sample_limit=cast(Optional[int], config.get("validation_sample_limit")),
-        role=str(config.get("role", "target")),
-        speaker_id=str(config.get("speaker_id", "vivian")),
-        sample_index=int(config.sample_index),
-        max_seconds=cast(Optional[float], config.get("max_seconds")),
-        overlong=str(config.overlong),
-        sample_limit=cast(Optional[int], config.get("sample_limit")),
-        batch_size=int(config.batch_size),
-        num_workers=int(config.num_workers),
-        pin_memory=bool(config.pin_memory),
-        persistent_workers=bool(config.persistent_workers),
-        batching=BatchingConfig(
-            enabled=bool(batching.enabled),
-            max_batch_seconds=float(batching.max_batch_seconds),
-            planning_window=int(batching.planning_window),
-            prefetch_factor=int(batching.prefetch_factor),
-            drop_distributed_tail=bool(batching.drop_distributed_tail),
-            seed=int(batching.seed),
-        ),
+def _checkpoint_feature_stats(
+    path: str | None,
+    *,
+    feature_dim: int,
+) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
+    if path is None or not Path(path).is_file():
+        return None
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("training checkpoint must contain a mapping.")
+    state = checkpoint.get("state_dict")
+    if state is None:
+        return None
+    if not isinstance(state, Mapping):
+        raise TypeError("training checkpoint state_dict must be a mapping.")
+    mean = state.get("support.feature_mean")
+    std = state.get("support.feature_std")
+    if mean is None or std is None:
+        return None
+    return (
+        _checkpoint_feature_stat(mean, feature_dim=feature_dim, name="feature_mean"),
+        _checkpoint_feature_stat(std, feature_dim=feature_dim, name="feature_std", positive=True),
     )
 
 
-def _output_dir(config: TrainConfig) -> Path:
-    return output_dir(config)
-
-
-def _ckpt_path(config: TrainConfig) -> str | None:
-    return config.trainer.ckpt_path
-
-
-def _optional_float(value: Any) -> float | None:
-    return None if value is None else float(value)
+def _checkpoint_feature_stat(
+    value: object,
+    *,
+    feature_dim: int,
+    name: str,
+    positive: bool = False,
+) -> tuple[float, ...]:
+    if not isinstance(value, torch.Tensor) or not torch.is_floating_point(value):
+        raise TypeError(f"checkpoint {name} must be a floating-point Tensor.")
+    flattened = value.detach().reshape(-1)
+    if flattened.numel() != feature_dim:
+        raise ValueError(
+            f"checkpoint {name} has {flattened.numel()} values; expected {feature_dim}."
+        )
+    if not bool(torch.isfinite(flattened).all()):
+        raise ValueError(f"checkpoint {name} must contain only finite values.")
+    if positive and not bool((flattened > 0).all()):
+        raise ValueError(f"checkpoint {name} must contain only positive values.")
+    return tuple(float(item) for item in flattened)
 
 
 def _device(value: str | None) -> torch.device:
-    requested = torch.device("cuda" if value is None and torch.cuda.is_available() else (value or "cpu"))
+    requested = torch.device(
+        "cuda" if value is None and torch.cuda.is_available() else (value or "cpu")
+    )
     if requested.type == "cuda" and requested.index is None:
         return torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
     return requested

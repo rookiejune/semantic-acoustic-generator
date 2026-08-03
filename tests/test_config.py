@@ -7,9 +7,63 @@ from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig
 
 from scripts._train_config import TrainConfig, parse_train_config
-from semantic_acoustic_codec.config import Route, RVQPredictor
+from semantic_acoustic_codec.backend import BackendConfig
+from semantic_acoustic_codec.config import (
+    DecoderConfig,
+    Route,
+    RVQPredictor,
+    decoder_options,
+)
 
 CONFIG_DIR = Path(__file__).parents[1] / "configs"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "hidden_dim",
+        "layers",
+        "heads",
+        "ffn_ratio",
+        "mtp_layers",
+        "mtp_heads",
+        "repa_feature_dim",
+        "repa_student_layer",
+    ],
+)
+@pytest.mark.parametrize("value", [True, "4"])
+def test_decoder_config_rejects_non_integer_fields(field: str, value: object) -> None:
+    with pytest.raises(TypeError, match=field):
+        DecoderConfig(**{field: value})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [True, "0.1"])
+def test_decoder_config_rejects_non_numeric_repa_weight(value: object) -> None:
+    with pytest.raises(TypeError, match="repa_loss_weight"):
+        DecoderConfig(repa_loss_weight=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_decoder_config_rejects_non_finite_repa_weight(value: float) -> None:
+    with pytest.raises(ValueError, match="repa_loss_weight must be finite"):
+        DecoderConfig(repa_loss_weight=value)
+
+
+def test_decoder_config_requires_declared_predictor() -> None:
+    with pytest.raises(TypeError, match="rvq_predictor must be an RVQPredictor"):
+        DecoderConfig(rvq_predictor="mtp")  # type: ignore[arg-type]
+
+
+def test_decoder_options_rejects_non_finite_repa_weight() -> None:
+    with pytest.raises(ValueError, match="repa_loss_weight must be finite"):
+        decoder_options(
+            {
+                "layers": 8,
+                "heads": 8,
+                "ffn_ratio": 4,
+                "repa_loss_weight": float("nan"),
+            }
+        )
 
 
 def _compose(*overrides: str) -> DictConfig:
@@ -52,6 +106,7 @@ def test_root_has_no_legacy_flat_training_groups() -> None:
     assert config.seed == 0
     assert config.datamodule.fixed_batch is False
     assert config.pl_module.reference_dropout == 0.5
+    assert config.pl_module.finite_loss_check_interval == 100
     assert config.runtime.sampling.cfg_scale == 1.0
     assert config.callback.checkpoint.enabled is True
     assert config.callback.performance.profile_flops is False
@@ -69,11 +124,33 @@ def test_train_config_parses_to_typed_entry_schema() -> None:
     config = parse_train_config(_compose())
 
     assert isinstance(config, TrainConfig)
+    assert isinstance(config.backend, BackendConfig)
     assert config.model.route is Route.FM
     assert config.model.decoder.rvq_predictor is RVQPredictor.MTP
     assert config.datamodule.fixed_batch is False
+    assert config.callback.performance.enabled is False
     assert config.runtime.sampling.cfg_scale == 1.0
     assert config.output_subdir == "longcat/fm-8l/codec"
+
+
+@pytest.mark.parametrize("experiment", ["smoke", "smoke32", "overfit"])
+def test_debug_experiments_check_finite_loss_every_step(experiment: str) -> None:
+    config = _compose(f"experiment={experiment}")
+
+    assert config.pl_module.finite_loss_check_interval == 1
+
+
+def test_train_config_rejects_non_positive_finite_loss_interval() -> None:
+    raw = _compose("pl_module.finite_loss_check_interval=0")
+
+    with pytest.raises(ValueError, match="finite_loss_check_interval"):
+        parse_train_config(raw)
+
+
+def test_train_config_preserves_false_backend_boolean() -> None:
+    config = parse_train_config(_compose("+backend.local_files_only=false"))
+
+    assert config.backend.local_files_only is False
 
 
 def test_train_config_rejects_unknown_fields_before_training() -> None:

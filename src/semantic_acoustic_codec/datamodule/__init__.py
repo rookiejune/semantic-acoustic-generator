@@ -1,8 +1,8 @@
-from semantic_acoustic_codec.datamodule.longcat import (
+from semantic_acoustic_codec.datamodule.longcat import collate_codes
+from semantic_acoustic_codec.datamodule.module import (
     BatchingConfig,
     DataConfig,
     DataModule,
-    collate_codes,
     collate_samples,
     length,
     load_batch,

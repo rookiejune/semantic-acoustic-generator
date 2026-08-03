@@ -83,8 +83,14 @@ class DiTDecoder(nn.Module):
             raise ValueError("flow sample steps must be positive.")
         if condition.dim() != 3:
             raise ValueError("condition must have shape [B, F, C].")
+        if condition.size(0) < 1 or condition.size(1) < 1:
+            raise ValueError("condition must contain at least one frame per row.")
         if mask is not None and (mask.shape != condition.shape[:2] or mask.dtype != torch.bool):
             raise ValueError("flow sample mask must be boolean with shape [B, F].")
+        if mask is not None and mask.device != condition.device:
+            raise ValueError("flow sample mask and condition must use the same device.")
+        if mask is not None and not bool(mask.any(dim=1).all()):
+            raise ValueError("each flow sample mask row must contain at least one valid frame.")
         if isinstance(guidance_scale, bool) or not isinstance(guidance_scale, (int, float)):
             raise TypeError("guidance_scale must be a number.")
         if not math.isfinite(guidance_scale) or guidance_scale < 0:
@@ -110,13 +116,20 @@ class DiTDecoder(nn.Module):
         dt = 1.0 / steps
         for index in range(steps):
             t = condition.new_full((condition.size(0),), (index + 0.5) * dt)
-            velocity = self.decoder(latent, t, condition_state=condition_state, mask=mask)
+            velocity = self.decoder(
+                latent,
+                t,
+                condition_state=condition_state,
+                mask=mask,
+                validate=False,
+            )
             if unconditional_state is not None:
                 unconditional = self.decoder(
                     latent,
                     t,
                     condition_state=unconditional_state,
                     mask=mask,
+                    validate=False,
                 )
                 velocity = unconditional + guidance_scale * (velocity - unconditional)
             latent = latent + dt * velocity

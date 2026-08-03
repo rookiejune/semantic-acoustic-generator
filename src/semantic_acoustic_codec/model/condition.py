@@ -129,19 +129,21 @@ class ReferenceConditioner(nn.Module):
         mask = mask.to(device=features.device)
         if validate and not bool(mask.any(dim=1).all()):
             raise ValueError("each reference row must contain at least one valid frame.")
+        if validate and (
+            use_reference is not None
+            and (use_reference.shape != (features.size(0),) or use_reference.dtype != torch.bool)
+        ):
+            raise ValueError("use_reference must be boolean with shape [B].")
 
-        reference = self.projection(features)
-        weights = mask[..., None].to(dtype=reference.dtype)
-        pooled = (reference * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
-        pooled = self.norm(pooled)
+        if use_reference is not None:
+            use_reference = use_reference.to(device=features.device)
+
+        weights = mask[..., None].to(dtype=features.dtype)
+        pooled = (features * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
+        pooled = self.norm(self.projection(pooled))
         conditioned = pooled[:, None] * torch.tanh(self.gate)[None, None]
         if use_reference is None:
             return conditioned
-        if validate and (
-            use_reference.shape != (features.size(0),) or use_reference.dtype != torch.bool
-        ):
-            raise ValueError("use_reference must be boolean with shape [B].")
-        use_reference = use_reference.to(device=features.device)
         null = self.null_condition.view(1, 1, -1).expand(features.size(0), 1, -1)
         return torch.where(use_reference[:, None, None], conditioned, null)
 
@@ -249,7 +251,9 @@ def _validate_semantic_tokens(values: Tensor, *, pad_id: int) -> None:
     if bool((values < 0).any()):
         raise ValueError("semantic_codes must not contain negative IDs.")
     if bool((values > pad_id).any()):
-        raise ValueError("semantic_codes contain an ID outside the semantic codebook and pad token.")
+        raise ValueError(
+            "semantic_codes contain an ID outside the semantic codebook and pad token."
+        )
 
 
 def matched_random_weight(reference: Tensor, *, seed: int, rows: int | None = None) -> Tensor:
@@ -291,8 +295,7 @@ def _sinusoidal_positions(
 ) -> Tensor:
     positions = torch.arange(length, device=device, dtype=torch.float32)[:, None]
     frequencies = torch.exp(
-        torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-        * (-math.log(10_000.0) / dim)
+        torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (-math.log(10_000.0) / dim)
     )
     angles = positions * frequencies[None]
     encoding = torch.zeros(length, dim, device=device, dtype=torch.float32)

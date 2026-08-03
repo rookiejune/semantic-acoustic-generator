@@ -3,10 +3,11 @@ sample:
   every_n_train_steps: 10000
   seed: 0
 performance:
-  enabled: true
-  # Production default: no per-step FLOPs counter. Short screening/ablation/smoke
-  # experiments opt into profile_flops=true; longruns pass a calibrated
-  # model_flops_per_step or model_flops_per_batch instead.
+  # The generic timer synchronizes CUDA (and DDP ranks) every batch. Keep it
+  # calibration-only; production throughput uses the event-based callback below.
+  enabled: false
+  # Short screening/ablation/smoke experiments explicitly enable FLOPs profiling.
+  # Longruns can opt in with a calibrated model_flops_per_step.
   model_flops_per_step: null
   profile_flops: false
   hardware_peak_flops: null

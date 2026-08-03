@@ -43,7 +43,7 @@ class SACRLAdapter:
         for candidate_id in range(group_size):
             features = self.runtime.sample_features(
                 batch.semantic_codes,
-                mask=batch.semantic_mask,
+                mask=batch.mask,
                 reference_features=reference_features,
                 reference_mask=batch.reference_acoustic_mask,
                 generator=generator,
@@ -51,14 +51,14 @@ class SACRLAdapter:
             waveforms = _decode_rows(self.runtime, batch, features)
             for sample_id in range(batch.semantic_codes.size(0)):
                 metadata = _metadata(batch, sample_id)
-                acoustic_mask = batch.target_acoustic_mask[sample_id : sample_id + 1]
+                acoustic_mask = batch.acoustic_mask[sample_id : sample_id + 1]
                 candidates.append(
                     SACCandidate(
                         sample_id=sample_id,
                         group_id=sample_id,
                         candidate_id=candidate_id,
                         semantic_codes=batch.semantic_codes[sample_id : sample_id + 1].detach(),
-                        semantic_mask=batch.semantic_mask[sample_id : sample_id + 1].detach(),
+                        semantic_mask=batch.mask[sample_id : sample_id + 1].detach(),
                         acoustic_features=features[sample_id : sample_id + 1].detach(),
                         acoustic_mask=acoustic_mask.detach(),
                         waveform=waveforms[sample_id].detach(),
@@ -182,7 +182,7 @@ def _decode_rows(
         runtime.decode_features(
             batch.semantic_codes[index : index + 1],
             features[index : index + 1],
-            mask=batch.semantic_mask[index : index + 1],
+            mask=batch.mask[index : index + 1],
         )
         for index in range(batch.semantic_codes.size(0))
     )

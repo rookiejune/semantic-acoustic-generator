@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import torch
 from anytrain.codec import AcousticLayout
@@ -25,6 +26,31 @@ class SemanticCodecPairMetadata:
     reference_speaker_id: str
     target_text: str
     reference_text: str
+
+    def as_dict(self, *, include_private: bool = False) -> dict[str, int | str]:
+        """Serialize pair metadata with an explicit public allowlist."""
+        data: dict[str, int | str] = {
+            "target_index": self.target_index,
+            "reference_index": self.reference_index,
+            "target_text_index": self.target_text_index,
+            "reference_text_index": self.reference_text_index,
+            "target_source_index": self.target_source_index,
+            "reference_source_index": self.reference_source_index,
+            "target_role": self.target_role,
+            "reference_role": self.reference_role,
+        }
+        if include_private:
+            data.update(
+                {
+                    "target_utterance_id": self.target_utterance_id,
+                    "reference_utterance_id": self.reference_utterance_id,
+                    "target_speaker_id": self.target_speaker_id,
+                    "reference_speaker_id": self.reference_speaker_id,
+                    "target_text": self.target_text,
+                    "reference_text": self.reference_text,
+                }
+            )
+        return data
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -78,21 +104,20 @@ class SemanticCodecBatch:
     mask: Tensor
     semantic_pad_id: int
     acoustic_pad_ids: tuple[int, ...]
-    acoustic_mask: Tensor | None = None
+    acoustic_mask: Tensor
     acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED
     reference_semantic_codes: Tensor | None = None
     reference_acoustic_codes: Tensor | None = None
     reference_mask: Tensor | None = None
     reference_acoustic_mask: Tensor | None = None
     metadata: tuple[SemanticCodecPairMetadata, ...] = ()
+    _semantic_valid_frames: int = field(init=False, repr=False)
+    _semantic_padded_frames: int = field(init=False, repr=False)
+    _acoustic_valid_units: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.acoustic_layout, AcousticLayout):
             raise TypeError("acoustic_layout must be an AcousticLayout.")
-        acoustic_mask = self.acoustic_mask
-        if acoustic_mask is None:
-            acoustic_mask = self.mask
-            self.acoustic_mask = acoustic_mask
         _check_positive_int(self.semantic_pad_id, name="semantic_pad_id")
         for index, pad_id in enumerate(self.acoustic_pad_ids):
             _check_positive_int(pad_id, name=f"acoustic_pad_ids[{index}]")
@@ -100,12 +125,15 @@ class SemanticCodecBatch:
             semantic_codes=self.semantic_codes,
             acoustic_codes=self.acoustic_codes,
             mask=self.mask,
-            acoustic_mask=acoustic_mask,
+            acoustic_mask=self.acoustic_mask,
             semantic_pad_id=self.semantic_pad_id,
             acoustic_pad_ids=self.acoustic_pad_ids,
             acoustic_layout=self.acoustic_layout,
             name="target",
         )
+        self._semantic_valid_frames = int(self.mask.sum().item())
+        self._semantic_padded_frames = self.mask.numel()
+        self._acoustic_valid_units = int(self.acoustic_mask.sum().item())
         references = (
             self.reference_semantic_codes,
             self.reference_acoustic_codes,
@@ -138,44 +166,16 @@ class SemanticCodecBatch:
             raise ValueError("pair metadata must contain one item per batch row.")
 
     @property
-    def semantic_codebook_size(self) -> int:
-        return self.semantic_pad_id
+    def semantic_valid_frames(self) -> int:
+        return self._semantic_valid_frames
 
     @property
-    def acoustic_codebook_sizes(self) -> tuple[int, ...]:
-        return self.acoustic_pad_ids
+    def semantic_padded_frames(self) -> int:
+        return self._semantic_padded_frames
 
     @property
-    def semantic_mask(self) -> Tensor:
-        """Validity mask for the semantic time axis."""
-        return self.mask
-
-    @property
-    def target_semantic_codes(self) -> Tensor:
-        return self.semantic_codes
-
-    @property
-    def target_acoustic_codes(self) -> Tensor:
-        return self.acoustic_codes
-
-    @property
-    def target_mask(self) -> Tensor:
-        return self.mask
-
-    @property
-    def target_acoustic_mask(self) -> Tensor:
-        if self.acoustic_mask is None:
-            raise RuntimeError("SemanticCodecBatch must expose acoustic_mask after validation.")
-        return self.acoustic_mask
-
-    @property
-    def target(self) -> SemanticCodecSide:
-        return SemanticCodecSide(
-            semantic_codes=self.semantic_codes,
-            acoustic_codes=self.acoustic_codes,
-            mask=self.mask,
-            acoustic_mask=self.target_acoustic_mask,
-        )
+    def acoustic_valid_units(self) -> int:
+        return self._acoustic_valid_units
 
     @property
     def reference(self) -> SemanticCodecSide:
@@ -207,26 +207,89 @@ class SemanticCodecBatch:
     ) -> SemanticCodecBatch:
         """Move all codec tensors while preserving pair metadata and layout."""
 
-        def move(value: Tensor | None) -> Tensor | None:
-            return None if value is None else value.to(device=device, non_blocking=non_blocking)
+        def move(value: Tensor) -> Tensor:
+            return value.to(device=device, non_blocking=non_blocking)
 
-        return SemanticCodecBatch(
-            semantic_codes=self.semantic_codes.to(device=device, non_blocking=non_blocking),
-            acoustic_codes=self.acoustic_codes.to(device=device, non_blocking=non_blocking),
-            mask=self.mask.to(device=device, non_blocking=non_blocking),
+        return self._map_tensors(move)
+
+    def pin_memory(self) -> SemanticCodecBatch:
+        """Pin all codec tensors for an asynchronous accelerator transfer."""
+
+        def pin(value: Tensor) -> Tensor:
+            return value.pin_memory()
+
+        return self._map_tensors(pin)
+
+    def _map_tensors(self, transform: Callable[[Tensor], Tensor]) -> SemanticCodecBatch:
+        transformed: dict[int, Tensor] = {}
+
+        def required(value: Tensor) -> Tensor:
+            key = id(value)
+            result = transformed.get(key)
+            if result is None:
+                result = transform(value)
+                transformed[key] = result
+            return result
+
+        def optional(value: Tensor | None) -> Tensor | None:
+            return None if value is None else required(value)
+
+        return self._from_validated(
+            semantic_codes=required(self.semantic_codes),
+            acoustic_codes=required(self.acoustic_codes),
+            mask=required(self.mask),
             semantic_pad_id=self.semantic_pad_id,
             acoustic_pad_ids=self.acoustic_pad_ids,
-            acoustic_mask=self.target_acoustic_mask.to(
-                device=device,
-                non_blocking=non_blocking,
-            ),
+            acoustic_mask=required(self.acoustic_mask),
             acoustic_layout=self.acoustic_layout,
-            reference_semantic_codes=move(self.reference_semantic_codes),
-            reference_acoustic_codes=move(self.reference_acoustic_codes),
-            reference_mask=move(self.reference_mask),
-            reference_acoustic_mask=move(self.reference_acoustic_mask),
+            reference_semantic_codes=optional(self.reference_semantic_codes),
+            reference_acoustic_codes=optional(self.reference_acoustic_codes),
+            reference_mask=optional(self.reference_mask),
+            reference_acoustic_mask=optional(self.reference_acoustic_mask),
             metadata=self.metadata,
+            semantic_valid_frames=self.semantic_valid_frames,
+            semantic_padded_frames=self.semantic_padded_frames,
+            acoustic_valid_units=self.acoustic_valid_units,
         )
+
+    @classmethod
+    def _from_validated(
+        cls,
+        *,
+        semantic_codes: Tensor,
+        acoustic_codes: Tensor,
+        mask: Tensor,
+        semantic_pad_id: int,
+        acoustic_pad_ids: tuple[int, ...],
+        acoustic_mask: Tensor,
+        acoustic_layout: AcousticLayout,
+        reference_semantic_codes: Tensor | None,
+        reference_acoustic_codes: Tensor | None,
+        reference_mask: Tensor | None,
+        reference_acoustic_mask: Tensor | None,
+        metadata: tuple[SemanticCodecPairMetadata, ...],
+        semantic_valid_frames: int,
+        semantic_padded_frames: int,
+        acoustic_valid_units: int,
+    ) -> SemanticCodecBatch:
+        """Copy an already validated batch after a tensor-preserving transform."""
+        batch = object.__new__(cls)
+        batch.semantic_codes = semantic_codes
+        batch.acoustic_codes = acoustic_codes
+        batch.mask = mask
+        batch.semantic_pad_id = semantic_pad_id
+        batch.acoustic_pad_ids = acoustic_pad_ids
+        batch.acoustic_mask = acoustic_mask
+        batch.acoustic_layout = acoustic_layout
+        batch.reference_semantic_codes = reference_semantic_codes
+        batch.reference_acoustic_codes = reference_acoustic_codes
+        batch.reference_mask = reference_mask
+        batch.reference_acoustic_mask = reference_acoustic_mask
+        batch.metadata = metadata
+        batch._semantic_valid_frames = semantic_valid_frames
+        batch._semantic_padded_frames = semantic_padded_frames
+        batch._acoustic_valid_units = acoustic_valid_units
+        return batch
 
 
 def _validate_side(

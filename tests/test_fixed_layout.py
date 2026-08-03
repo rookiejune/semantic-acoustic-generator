@@ -135,12 +135,12 @@ def _paired_batch() -> SemanticCodecBatch:
         mask=target.mask,
         semantic_pad_id=target.semantic_pad_id,
         acoustic_pad_ids=target.acoustic_pad_ids,
-        acoustic_mask=target.target_acoustic_mask,
+        acoustic_mask=target.acoustic_mask,
         acoustic_layout=target.acoustic_layout,
         reference_semantic_codes=reference.semantic_codes,
         reference_acoustic_codes=reference.acoustic_codes,
         reference_mask=reference.mask,
-        reference_acoustic_mask=reference.target_acoustic_mask,
+        reference_acoustic_mask=reference.acoustic_mask,
         metadata=(metadata,),
     )
 

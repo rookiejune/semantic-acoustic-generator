@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,6 +15,7 @@ from anytrain.loss import (
 )
 from anytrain.module.qwen import QwenMTPCodebookPredictor
 
+import semantic_acoustic_codec.model.rvq as rvq_module
 from semantic_acoustic_codec.config import DecoderConfig, Route, RVQPredictor
 from semantic_acoustic_codec.model import (
     AcousticRVQDecoder,
@@ -25,6 +28,7 @@ from semantic_acoustic_codec.model import (
 )
 from semantic_acoustic_codec.model.condition import FixedLengthConditioner
 from semantic_acoustic_codec.runtime import (
+    SamplingConfig,
     SemanticCodecRuntime,
     SemanticSupportConfig,
     build_support,
@@ -66,8 +70,12 @@ class FakeCodec:
     def acoustic_codes_to_features(self, acoustic_codes: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.pad(acoustic_codes.float(), (0, 2))[:, :, :4]
 
-    def decode_features(self, semantic_codes: torch.Tensor, acoustic_features: torch.Tensor) -> torch.Tensor:
-        return acoustic_features.new_zeros((semantic_codes.size(0), 1, semantic_codes.size(1) * 320))
+    def decode_features(
+        self, semantic_codes: torch.Tensor, acoustic_features: torch.Tensor
+    ) -> torch.Tensor:
+        return acoustic_features.new_zeros(
+            (semantic_codes.size(0), 1, semantic_codes.size(1) * 320)
+        )
 
 
 def test_decoder_config_defaults_to_temporal_mtp() -> None:
@@ -134,6 +142,10 @@ def test_fm_sample_applies_classifier_free_guidance() -> None:
     class GuidanceProbe(torch.nn.Module):
         latent_dim = 2
 
+        def __init__(self) -> None:
+            super().__init__()
+            self.validations: list[bool] = []
+
         def prepare_condition(self, condition: torch.Tensor) -> torch.Tensor:
             return condition
 
@@ -146,13 +158,15 @@ def test_fm_sample_applies_classifier_free_guidance() -> None:
             mask: torch.Tensor | None = None,
             validate: bool = True,
         ) -> torch.Tensor:
-            del latent, t, mask, validate
+            del latent, t, mask
+            self.validations.append(validate)
             if condition_state is None:
                 raise AssertionError("condition_state is required")
             return condition_state
 
     decoder = DiTDecoder(2, 2, layers=1, heads=1, ffn_ratio=2)
-    decoder.decoder = GuidanceProbe()
+    probe = GuidanceProbe()
+    decoder.decoder = probe
     condition = torch.tensor([[[3.0, 5.0], [7.0, 11.0]]])
     unconditional = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
     seed = 37
@@ -168,6 +182,15 @@ def test_fm_sample_applies_classifier_free_guidance() -> None:
     expected = initial + unconditional + 1.5 * (condition - unconditional)
 
     assert torch.allclose(sample, expected)
+    assert probe.validations == [False, False]
+
+
+def test_fm_sample_validates_mask_before_the_flow_loop() -> None:
+    decoder = DiTDecoder(2, 2, layers=1, heads=1, ffn_ratio=2)
+    condition = torch.randn(1, 2, 2)
+
+    with pytest.raises(ValueError, match="at least one valid frame"):
+        decoder.sample(condition, mask=torch.zeros(1, 2, dtype=torch.bool))
 
 
 def test_reference_conditioner_uses_explicit_and_null_reference() -> None:
@@ -189,6 +212,58 @@ def test_reference_conditioner_uses_explicit_and_null_reference() -> None:
     assert torch.equal(mixed[1], null[1])
     assert "null_condition" in conditioner.state_dict()
     assert "default_feature" not in conditioner.state_dict()
+
+
+def test_reference_conditioner_pool_before_projection_preserves_outputs_and_gradients() -> None:
+    conditioner = ReferenceConditioner(feature_dim=4, condition_dim=6)
+    legacy = ReferenceConditioner(feature_dim=4, condition_dim=6)
+    with torch.no_grad():
+        conditioner.gate.fill_(0.7)
+    legacy.load_state_dict(conditioner.state_dict())
+    features = torch.randn(2, 4, 4, requires_grad=True)
+    legacy_features = features.detach().clone().requires_grad_(True)
+    mask = torch.tensor([[True, True, False, False], [True, True, True, False]])
+    output_weight = torch.randn(2, 1, 6)
+
+    actual = conditioner(features, mask=mask)
+    projected = legacy.projection(legacy_features)
+    weights = mask[..., None].to(dtype=projected.dtype)
+    pooled = (projected * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
+    expected = legacy.norm(pooled)[:, None] * torch.tanh(legacy.gate)[None, None]
+    (actual * output_weight).sum().backward()
+    (expected * output_weight).sum().backward()
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+    assert features.grad is not None
+    assert legacy_features.grad is not None
+    assert torch.allclose(features.grad, legacy_features.grad, atol=1e-6, rtol=1e-5)
+    for (name, parameter), (legacy_name, legacy_parameter) in zip(
+        conditioner.named_parameters(),
+        legacy.named_parameters(),
+    ):
+        assert name == legacy_name
+        if parameter.grad is None or legacy_parameter.grad is None:
+            assert parameter.grad is legacy_parameter.grad is None
+            continue
+        assert torch.allclose(parameter.grad, legacy_parameter.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_reference_conditioner_projects_only_pooled_rows() -> None:
+    conditioner = ReferenceConditioner(feature_dim=4, condition_dim=6)
+    projected_shapes: list[tuple[int, ...]] = []
+
+    def record_projection_batch(_module, inputs) -> None:
+        projected_shapes.append(tuple(inputs[0].shape))
+
+    handle = conditioner.projection.register_forward_pre_hook(record_projection_batch)
+    output = conditioner(
+        torch.randn(3, 2, 4),
+        use_reference=torch.tensor([True, False, True]),
+    )
+    handle.remove()
+
+    assert projected_shapes == [(3, 4)]
+    assert torch.equal(output[1, 0], conditioner.null_condition)
 
 
 def test_fixed_length_conditioner_uses_slot_queries_and_full_semantic_memory() -> None:
@@ -318,7 +393,9 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     reference = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
 
-    features = support.sample_features(semantic, mask=mask, generator=torch.Generator().manual_seed(0))
+    features = support.sample_features(
+        semantic, mask=mask, generator=torch.Generator().manual_seed(0)
+    )
     condition = support.condition(
         semantic,
         mask=mask,
@@ -327,7 +404,7 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     )
     runtime = SemanticCodecRuntime(support, backend)
     waveform = runtime.decode(semantic, mask=mask, generator=torch.Generator().manual_seed(1))
-    save_artifact(tmp_path, support, config, backend=backend)
+    save_artifact(tmp_path, support, backend=backend)
     loaded = load_artifact(tmp_path)
     acoustic = load_generator_artifact(tmp_path)
     loaded_features = loaded.sample_features(
@@ -374,6 +451,31 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     assert torch.allclose(features, loaded_features)
 
 
+def test_artifact_rejects_runtime_state_that_differs_from_construction_config(tmp_path) -> None:
+    backend = FakeCodec()
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=10,
+        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        sampling=SamplingConfig(flow_steps=2),
+        feature_mean=(0.0, 0.0, 0.0, 0.0),
+        feature_std=(1.0, 1.0, 1.0, 1.0),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    )
+    support.sampling = replace(config.sampling, temperature=0.5)
+
+    with pytest.raises(ValueError, match="support sampling"):
+        save_artifact(tmp_path, support, backend=backend)
+
+    assert not (tmp_path / "codec.json").exists()
+    assert not (tmp_path / "model.ckpt").exists()
+
+
 def test_generator_artifact_ignores_unrelated_state_but_remains_strict(tmp_path) -> None:
     backend = FakeCodec()
     config = SemanticSupportConfig(
@@ -387,7 +489,7 @@ def test_generator_artifact_ignores_unrelated_state_but_remains_strict(tmp_path)
         acoustic_feature_dim=backend.acoustic_feature_dim,
         acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
     ).eval()
-    save_artifact(tmp_path, support, config, backend=backend)
+    save_artifact(tmp_path, support, backend=backend)
     checkpoint = tmp_path / "model.ckpt"
     original = torch.load(checkpoint, weights_only=True)
     incompatible = dict(original)
@@ -413,6 +515,36 @@ def test_generator_artifact_ignores_unrelated_state_but_remains_strict(tmp_path)
     torch.save(unexpected, checkpoint)
     with pytest.raises(RuntimeError, match="state_dict"):
         load_generator_artifact(tmp_path)
+
+
+def test_artifact_loads_cpu_state_before_moving_to_target_device(tmp_path, monkeypatch) -> None:
+    backend = FakeCodec()
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=10,
+        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    )
+    save_artifact(tmp_path, support, backend=backend)
+    load_options: list[tuple[object, object]] = []
+    original_load = torch.load
+
+    def record_load(*args, **kwargs):
+        load_options.append((kwargs.get("map_location"), kwargs.get("weights_only")))
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", record_load)
+    loaded = load_artifact(tmp_path, device="meta")
+    acoustic = load_generator_artifact(tmp_path, device="meta")
+
+    assert load_options == [("cpu", True), ("cpu", True)]
+    assert next(loaded.parameters()).device.type == "meta"
+    assert next(acoustic.generator.parameters()).device.type == "meta"
 
 
 def test_frame_aligned_decode_trims_right_padding() -> None:
@@ -487,7 +619,9 @@ def test_fm_route_trains_one_step() -> None:
     )
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
-    output = modules.generator.loss(
+    generator = modules.generator
+    assert isinstance(generator, FMFeatureGenerator)
+    output = generator.loss(
         _batch(semantic, acoustic, mask),
         condition,
         target,
@@ -516,8 +650,10 @@ def test_fm_generator_accepts_external_condition() -> None:
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     condition = modules.conditioner(semantic).masked_fill(~mask[..., None], 0)
+    generator = modules.generator
+    assert isinstance(generator, FMFeatureGenerator)
 
-    output = modules.generator.loss_from_condition(
+    output = generator.feature_loss_from_condition(
         condition,
         mask,
         target_features=target,
@@ -554,12 +690,9 @@ def test_rvq_route_trains_one_step_when_qwen3_builder_is_available() -> None:
     target = masked_acoustic_features(backend, acoustic, mask)
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
     condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
-    output = modules.generator.loss(
-        _batch(semantic, acoustic, mask),
-        condition,
-        feature_mean=torch.zeros(1, 1, backend.acoustic_feature_dim),
-        feature_std=torch.ones(1, 1, backend.acoustic_feature_dim),
-    )
+    generator = modules.generator
+    assert isinstance(generator, RVQCodeGenerator)
+    output = generator.loss(_batch(semantic, acoustic, mask), condition)
     loss = output.loss
     loss.backward()
     optimizer.step()
@@ -596,7 +729,7 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
     generator = modules.generator
     assert isinstance(generator, RVQCodeGenerator)
     logits = generator.core(condition, acoustic, mask=mask)
-    output = generator.loss_from_condition(condition, mask, target_codes=acoustic)
+    output = generator.code_loss_from_condition(condition, mask, target_codes=acoustic)
     loss = output.loss
     loss.backward()
     generated = generator.sample_acoustic_codes(
@@ -661,12 +794,7 @@ def test_fixed_length_rvq_rejects_codebook_ar_and_uses_mtp_slot_axis() -> None:
         acoustic_mask=torch.ones(1, slots, dtype=torch.bool),
         acoustic_layout=AcousticLayout.FIXED_LENGTH,
     )
-    output = generator.loss(
-        batch,
-        condition,
-        feature_mean=torch.zeros(1, 1, 1),
-        feature_std=torch.ones(1, 1, 1),
-    )
+    output = generator.loss(batch, condition)
     output.loss.backward()
     generated = generator.sample_acoustic_codes(
         condition,
@@ -700,6 +828,107 @@ def test_rvq_loss_validates_per_codebook_logits() -> None:
     assert set(item.details) == {"codebook_0", "codebook_1", "frames"}
 
 
+class _PackedDecoderCore(torch.nn.Module):
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(1, hidden_dim)
+
+    def forward(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        use_cache: bool,
+        return_dict: bool,
+    ) -> SimpleNamespace:
+        del use_cache, return_dict
+        return SimpleNamespace(last_hidden_state=inputs_embeds)
+
+
+def test_rvq_decoder_exposes_valid_frames_without_scattering(monkeypatch) -> None:
+    monkeypatch.setattr(
+        rvq_module,
+        "_qwen3_model",
+        lambda **options: _PackedDecoderCore(options["hidden_dim"]),
+    )
+    decoder = AcousticRVQDecoder(
+        4,
+        2,
+        (5, 7),
+        hidden_dim=4,
+        layers=1,
+        heads=1,
+        ffn_ratio=2,
+    )
+    condition = torch.randn(2, 3, 4)
+    labels = torch.tensor(
+        [
+            [[1, 2], [3, 4], [-1, -1]],
+            [[2, 6], [-1, -1], [-1, -1]],
+        ]
+    )
+    mask = torch.tensor([[True, True, False], [True, False, False]])
+
+    packed = decoder.forward_packed(condition, labels, mask=mask)
+    padded = decoder(condition, labels, mask=mask)
+
+    assert packed.labels is not None
+    assert torch.equal(packed.labels, torch.tensor([[1, 2], [3, 4], [2, 6]]))
+    assert torch.equal(packed.row_indices, torch.tensor([0, 0, 1]))
+    assert packed.batch_size == 2
+    assert [tuple(value.shape) for value in packed.logits] == [(3, 5), (3, 7)]
+    for packed_value, padded_value in zip(packed.logits, padded):
+        assert torch.equal(padded_value[mask], packed_value)
+        assert torch.equal(padded_value[~mask], torch.zeros_like(padded_value[~mask]))
+
+
+def test_rvq_codebook_ar_loss_does_not_scatter_or_revalidate(monkeypatch) -> None:
+    monkeypatch.setattr(
+        rvq_module,
+        "_qwen3_model",
+        lambda **options: _PackedDecoderCore(options["hidden_dim"]),
+    )
+    generator = RVQCodeGenerator(
+        4,
+        (5, 7),
+        DecoderConfig(
+            hidden_dim=4,
+            layers=1,
+            heads=1,
+            ffn_ratio=2,
+            rvq_predictor=RVQPredictor.CODEBOOK_AR,
+        ),
+    )
+    condition = torch.randn(2, 3, 4)
+    labels = torch.tensor(
+        [
+            [[1, 2], [3, 4], [-1, -1]],
+            [[2, 6], [-1, -1], [-1, -1]],
+        ]
+    )
+    mask = torch.tensor([[True, True, False], [True, False, False]])
+
+    def fail_scatter(*_args, **_kwargs):
+        raise AssertionError("packed loss must not scatter logits")
+
+    def fail_validation(*_args, **_kwargs):
+        raise AssertionError("decoder-owned packed values must not be revalidated")
+
+    monkeypatch.setattr(rvq_module, "_scatter", fail_scatter)
+    monkeypatch.setattr(
+        "anytrain.loss.codebook._validate_packed_inputs",
+        fail_validation,
+    )
+    output = generator.code_loss_from_condition(
+        condition,
+        mask,
+        target_codes=labels,
+        include_details=False,
+    )
+
+    assert torch.isfinite(output.loss)
+    assert output.items["rvq"].details is None
+
+
 def test_rvq_decoder_import_is_lazy() -> None:
     if _has_qwen3_builder():
         decoder = AcousticRVQDecoder(4, 2, (5, 7), hidden_dim=4, layers=1, heads=1, ffn_ratio=2)
@@ -720,13 +949,16 @@ def _has_qwen3_builder() -> bool:
     return callable(build_qwen3_model)
 
 
-def _batch(semantic: torch.Tensor, acoustic: torch.Tensor, mask: torch.Tensor) -> SemanticCodecBatch:
+def _batch(
+    semantic: torch.Tensor, acoustic: torch.Tensor, mask: torch.Tensor
+) -> SemanticCodecBatch:
     return SemanticCodecBatch(
         semantic_codes=semantic,
         acoustic_codes=acoustic,
         mask=mask,
         semantic_pad_id=8,
         acoustic_pad_ids=(5, 7),
+        acoustic_mask=mask,
     )
 
 

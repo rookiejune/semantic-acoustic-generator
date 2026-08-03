@@ -14,6 +14,7 @@ from semantic_acoustic_codec.config import (
     Initialization,
     Route,
 )
+from semantic_acoustic_codec.model.decoder import AcousticCodeSampler, FeatureSampler
 from semantic_acoustic_codec.model.routes import RouteModules, build_route
 from semantic_acoustic_codec.runtime.metadata import (
     support_metadata,
@@ -38,11 +39,14 @@ class SamplingConfig:
     cfg_scale: float = 1.0
 
     def __post_init__(self) -> None:
+        _integer(self.flow_steps, name="flow_steps")
+        temperature = _finite_number(self.temperature, name="temperature")
+        top_p = _finite_number(self.top_p, name="top_p")
         if self.flow_steps < 1:
             raise ValueError("flow_steps must be positive.")
-        if self.temperature <= 0:
+        if temperature <= 0:
             raise ValueError("temperature must be positive.")
-        if not 0 < self.top_p <= 1:
+        if not 0 < top_p <= 1:
             raise ValueError("top_p must be in (0, 1].")
         _cfg_scale(self.cfg_scale)
 
@@ -59,12 +63,24 @@ class SemanticSupportConfig:
     feature_std: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.route, Route):
+            raise TypeError("route must be a Route.")
+        _integer(self.condition_dim, name="condition_dim")
+        if not isinstance(self.decoder, DecoderConfig):
+            raise TypeError("decoder must be a DecoderConfig.")
+        if not isinstance(self.initialization, Initialization):
+            raise TypeError("initialization must be an Initialization.")
+        _integer(self.seed, name="seed")
+        if not isinstance(self.sampling, SamplingConfig):
+            raise TypeError("sampling must be a SamplingConfig.")
         if self.condition_dim <= 0:
             raise ValueError("condition_dim must be positive.")
         if (self.feature_mean is None) != (self.feature_std is None):
             raise ValueError("feature_mean and feature_std must be set together.")
         if self.feature_mean is None or self.feature_std is None:
             return
+        _feature_values(self.feature_mean, name="feature_mean")
+        _feature_values(self.feature_std, name="feature_std")
         if len(self.feature_mean) != len(self.feature_std):
             raise ValueError("feature_mean and feature_std must have the same length.")
         if not self.feature_mean:
@@ -81,6 +97,7 @@ class SemanticCodecSupport(nn.Module):
         modules: RouteModules,
         acoustic_feature_dim: int,
         *,
+        config: SemanticSupportConfig | None = None,
         acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
         acoustic_unit_length: int | None = None,
         sampling: SamplingConfig | None = None,
@@ -106,12 +123,25 @@ class SemanticCodecSupport(nn.Module):
         self.acoustic_codebook_sizes = modules.acoustic_codebook_sizes
         self.acoustic_layout = acoustic_layout
         self.acoustic_unit_length = acoustic_unit_length
+        self.config = config
         self.sampling = SamplingConfig() if sampling is None else sampling
         self.artifact_backend_metadata = (
             None if artifact_backend_metadata is None else dict(artifact_backend_metadata)
         )
         self.feature_mean = nn.Buffer(_feature_stat(acoustic_feature_dim, feature_mean, fill=0.0))
         self.feature_std = nn.Buffer(_feature_stat(acoustic_feature_dim, feature_std, fill=1.0))
+
+    @property
+    def feature_sampler(self) -> FeatureSampler:
+        if not isinstance(self.generator, FeatureSampler):
+            raise RuntimeError("feature generation requires the FM route.")
+        return self.generator
+
+    @property
+    def code_sampler(self) -> AcousticCodeSampler:
+        if not isinstance(self.generator, AcousticCodeSampler):
+            raise RuntimeError("acoustic-code generation requires the RVQ route.")
+        return self.generator
 
     @torch.no_grad()
     def sample_features(
@@ -126,33 +156,57 @@ class SemanticCodecSupport(nn.Module):
         generator: torch.Generator | None = None,
     ) -> Tensor:
         prepared, frame_mask = self._semantic_input(semantic_codes, mask)
-        condition = self.condition(
+        return self._sample_features(
             prepared,
-            mask=frame_mask,
+            frame_mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
+            output_length=output_length,
+            cfg_scale=cfg_scale,
+            generator=generator,
+        )
+
+    def _sample_features(
+        self,
+        prepared: Tensor,
+        frame_mask: Tensor,
+        *,
+        reference_features: Tensor | None,
+        reference_mask: Tensor | None,
+        output_length: int | None,
+        cfg_scale: float | None,
+        generator: torch.Generator | None,
+    ) -> Tensor:
+        semantic = self.conditioner(prepared, validate=False)
+        condition = self._condition(
+            semantic,
+            frame_mask,
+            reference_features=reference_features,
+            reference_mask=reference_mask,
+            use_reference=None,
+            validate=True,
         )
         if self.route is Route.RVQ:
             raise RuntimeError("RVQ feature conversion requires a codec runtime.")
         guidance_scale = _cfg_scale(self.sampling.cfg_scale if cfg_scale is None else cfg_scale)
         unconditional_condition = None
         if reference_features is not None and guidance_scale != 1.0:
-            unconditional_condition = self.condition(
-                prepared,
-                mask=frame_mask,
+            unconditional_condition = self._condition(
+                semantic,
+                frame_mask,
                 reference_features=None,
                 reference_mask=None,
+                use_reference=None,
+                validate=False,
             )
         target_length = self._output_length(output_length)
         target_mask = self._output_mask(frame_mask, target_length)
-        features = self.generator.sample_features(
+        features = self.feature_sampler.sample_features(
             condition,
             frame_mask,
             feature_mean=self.feature_mean,
             feature_std=self.feature_std,
             flow_steps=self.sampling.flow_steps,
-            temperature=self.sampling.temperature,
-            top_p=self.sampling.top_p,
             unconditional_condition=unconditional_condition,
             cfg_scale=guidance_scale,
             acoustic_layout=self.acoustic_layout,
@@ -173,14 +227,36 @@ class SemanticCodecSupport(nn.Module):
         generator: torch.Generator | None = None,
     ) -> Tensor:
         prepared, frame_mask = self._semantic_input(semantic_codes, mask)
-        condition = self.condition(
+        return self._sample_acoustic_codes(
             prepared,
-            mask=frame_mask,
+            frame_mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
+            output_length=output_length,
+            generator=generator,
+        )
+
+    def _sample_acoustic_codes(
+        self,
+        prepared: Tensor,
+        frame_mask: Tensor,
+        *,
+        reference_features: Tensor | None,
+        reference_mask: Tensor | None,
+        output_length: int | None,
+        generator: torch.Generator | None,
+    ) -> Tensor:
+        semantic = self.conditioner(prepared, validate=False)
+        condition = self._condition(
+            semantic,
+            frame_mask,
+            reference_features=reference_features,
+            reference_mask=reference_mask,
+            use_reference=None,
+            validate=True,
         )
         target_length = self._output_length(output_length)
-        return self.generator.sample_acoustic_codes(
+        return self.code_sampler.sample_acoustic_codes(
             condition,
             frame_mask,
             temperature=self.sampling.temperature,
@@ -226,9 +302,28 @@ class SemanticCodecSupport(nn.Module):
         validate: bool = True,
     ) -> Tensor:
         prepared, frame_mask = self._semantic_input(semantic_codes, mask, validate=validate)
-        semantic = self.conditioner(prepared, validate=validate)
+        semantic = self.conditioner(prepared, validate=False)
+        return self._condition(
+            semantic,
+            frame_mask,
+            reference_features=reference_features,
+            reference_mask=reference_mask,
+            use_reference=use_reference,
+            validate=validate,
+        )
+
+    def _condition(
+        self,
+        semantic: Tensor,
+        frame_mask: Tensor,
+        *,
+        reference_features: Tensor | None,
+        reference_mask: Tensor | None,
+        use_reference: Tensor | None,
+        validate: bool,
+    ) -> Tensor:
         reference = self._reference_condition(
-            batch_size=prepared.size(0),
+            batch_size=semantic.size(0),
             reference_features=reference_features,
             reference_mask=reference_mask,
             use_reference=use_reference,
@@ -302,7 +397,9 @@ class SemanticCodecSupport(nn.Module):
                 raise ValueError("valid semantic_codes must not contain negative IDs.")
             if bool((valid >= self.conditioner.semantic_codebook_size).any()):
                 raise ValueError("semantic_codes contain an ID outside the semantic codebook.")
-        return prepared.masked_fill(~frame_mask[..., None], self.conditioner.semantic_pad_id), frame_mask
+        return prepared.masked_fill(
+            ~frame_mask[..., None], self.conditioner.semantic_pad_id
+        ), frame_mask
 
 
 class SemanticCodecRuntime:
@@ -353,26 +450,45 @@ class SemanticCodecRuntime:
         cfg_scale: float | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
+        prepared, frame_mask = self.support._semantic_input(semantic_codes, mask)
+        return self._sample_features(
+            prepared,
+            frame_mask,
+            reference_features=reference_features,
+            reference_mask=reference_mask,
+            cfg_scale=cfg_scale,
+            generator=generator,
+        )
+
+    def _sample_features(
+        self,
+        prepared: Tensor,
+        frame_mask: Tensor,
+        *,
+        reference_features: Tensor | None,
+        reference_mask: Tensor | None,
+        cfg_scale: float | None,
+        generator: torch.Generator | None,
+    ) -> Tensor:
         output_length = self.backend.acoustic_unit_length
         if self.support.route is Route.FM:
-            return self.support.sample_features(
-                semantic_codes,
-                mask=mask,
+            return self.support._sample_features(
+                prepared,
+                frame_mask,
                 reference_features=reference_features,
                 reference_mask=reference_mask,
                 output_length=output_length,
                 cfg_scale=cfg_scale,
                 generator=generator,
             )
-        codes = self.support.sample_acoustic_codes(
-            semantic_codes,
-            mask=mask,
+        codes = self.support._sample_acoustic_codes(
+            prepared,
+            frame_mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
             output_length=output_length,
             generator=generator,
         )
-        _, frame_mask = self.support._semantic_input(semantic_codes, mask)
         target_mask = self.support._output_mask(frame_mask, output_length)
         features = self.backend.acoustic_codes_to_features(codes)
         return features.masked_fill(~target_mask.to(device=features.device)[..., None], 0)
@@ -390,9 +506,9 @@ class SemanticCodecRuntime:
     ) -> Tensor:
         prepared, frame_mask = self.support._semantic_input(semantic_codes, mask)
         prepared, frame_mask = _trim_decode_input(prepared, frame_mask)
-        features = self.sample_features(
+        features = self._sample_features(
             prepared,
-            mask=frame_mask,
+            frame_mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
             cfg_scale=cfg_scale,
@@ -454,11 +570,20 @@ def build_support(
         acoustic_layout=acoustic_layout,
         acoustic_unit_length=acoustic_unit_length,
     )
-    mean = None if config.feature_mean is None else torch.tensor(config.feature_mean, dtype=torch.float32)
-    std = None if config.feature_std is None else torch.tensor(config.feature_std, dtype=torch.float32)
+    mean = (
+        None
+        if config.feature_mean is None
+        else torch.tensor(config.feature_mean, dtype=torch.float32)
+    )
+    std = (
+        None
+        if config.feature_std is None
+        else torch.tensor(config.feature_std, dtype=torch.float32)
+    )
     return SemanticCodecSupport(
         modules,
         acoustic_feature_dim,
+        config=config,
         acoustic_layout=acoustic_layout,
         acoustic_unit_length=acoustic_unit_length,
         sampling=config.sampling,
@@ -496,9 +621,28 @@ def _trim_decode_input(semantic: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def _cfg_scale(value: float) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError("cfg_scale must be a number.")
-    result = float(value)
-    if not math.isfinite(result) or result < 0:
-        raise ValueError("cfg_scale must be finite and non-negative.")
+    result = _finite_number(value, name="cfg_scale")
+    if result < 0:
+        raise ValueError("cfg_scale must be non-negative.")
     return result
+
+
+def _integer(value: object, *, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer.")
+
+
+def _finite_number(value: object, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number.")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite.")
+    return result
+
+
+def _feature_values(value: object, *, name: str) -> None:
+    if not isinstance(value, tuple):
+        raise TypeError(f"{name} must be a tuple.")
+    for item in value:
+        _finite_number(item, name=f"{name} values")

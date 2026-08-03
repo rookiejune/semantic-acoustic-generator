@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,6 +11,20 @@ from semantic_acoustic_codec.types import SemanticCodecBatch
 
 if TYPE_CHECKING:
     from anytrain.codec import SemanticAcousticCodec
+
+    from semantic_acoustic_codec.runtime.semantic import SemanticCodecRuntime
+
+
+@dataclass(frozen=True)
+class PairedFeatureEvaluation:
+    without_reference: Tensor
+    with_reference: Tensor
+    mse_without_reference: float
+    mse_with_reference: float
+
+    @property
+    def reference_gain(self) -> float:
+        return self.mse_without_reference - self.mse_with_reference
 
 
 @torch.no_grad()
@@ -22,7 +37,7 @@ def target_acoustic_features(
     return masked_acoustic_features(
         backend,
         batch.acoustic_codes,
-        batch.target_acoustic_mask,
+        batch.acoustic_mask,
         validate=validate,
     )
 
@@ -33,9 +48,9 @@ def reference_acoustic_condition(
     batch: SemanticCodecBatch,
     *,
     validate: bool = True,
-) -> tuple[Tensor | None, Tensor | None]:
+) -> tuple[Tensor, Tensor]:
     if not batch.has_reference:
-        return None, None
+        raise ValueError("reference acoustic condition requires reference codec units.")
     reference = batch.reference
     mask = reference.acoustic_mask.to(device=batch.semantic_codes.device)
     features = masked_acoustic_features(
@@ -66,15 +81,61 @@ def masked_feature_mse(
     return float(value.detach().cpu())
 
 
+@torch.no_grad()
+def evaluate_feature_pair(
+    runtime: SemanticCodecRuntime,
+    backend: SemanticAcousticCodec,
+    batch: SemanticCodecBatch,
+    *,
+    seed: int,
+    cfg_scale: float | None = None,
+    name: str,
+) -> PairedFeatureEvaluation:
+    if not batch.has_reference:
+        raise ValueError(f"{name} evaluation requires reference codec units.")
+    target = target_acoustic_features(backend, batch)
+    reference, reference_mask = reference_acoustic_condition(backend, batch)
+    device = batch.semantic_codes.device
+    without = runtime.sample_features(
+        batch.semantic_codes,
+        mask=batch.mask,
+        reference_features=None,
+        reference_mask=None,
+        generator=seeded_generator(device, seed),
+    )
+    with_reference = runtime.sample_features(
+        batch.semantic_codes,
+        mask=batch.mask,
+        reference_features=reference,
+        reference_mask=reference_mask,
+        cfg_scale=cfg_scale,
+        generator=seeded_generator(device, seed),
+    )
+    return PairedFeatureEvaluation(
+        without_reference=without,
+        with_reference=with_reference,
+        mse_without_reference=masked_feature_mse(
+            without,
+            target,
+            batch.acoustic_mask,
+            name=name,
+        ),
+        mse_with_reference=masked_feature_mse(
+            with_reference,
+            target,
+            batch.acoustic_mask,
+            name=name,
+        ),
+    )
+
+
 def seeded_generator(device: torch.device | str, seed: int) -> torch.Generator:
-    try:
-        generator = torch.Generator(device=device)
-    except RuntimeError:
-        generator = torch.Generator()
-    return generator.manual_seed(seed)
+    return torch.Generator(device=device).manual_seed(seed)
 
 
 __all__ = [
+    "PairedFeatureEvaluation",
+    "evaluate_feature_pair",
     "masked_feature_mse",
     "reference_acoustic_condition",
     "seeded_generator",

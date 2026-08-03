@@ -4,10 +4,11 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import TypeVar, cast
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
+from semantic_acoustic_codec.backend import BackendConfig
 from semantic_acoustic_codec.config import (
     DecoderConfig,
     Initialization,
@@ -20,22 +21,8 @@ from semantic_acoustic_codec.runtime import SamplingConfig
 EnumT = TypeVar("EnumT", bound=Enum)
 
 
-class _ConfigNode:
-    def get(self, key: str, default: Any = None) -> Any:
-        return getattr(self, key, default)
-
-
 @dataclass(frozen=True)
-class BackendConfig(_ConfigNode):
-    name: str = "longcat"
-    model_dir: str | None = None
-    revision: str | None = None
-    local_files_only: bool = True
-    allow_unpinned_revision: bool = False
-
-
-@dataclass(frozen=True)
-class DataModuleConfig(_ConfigNode, DataConfig):
+class DataModuleConfig(DataConfig):
     fixed_batch: bool = False
 
     def __post_init__(self) -> None:
@@ -45,7 +32,7 @@ class DataModuleConfig(_ConfigNode, DataConfig):
 
 
 @dataclass(frozen=True)
-class ModelConfig(_ConfigNode):
+class ModelConfig:
     route: Route = Route.FM
     condition_dim: int = 1024
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
@@ -58,7 +45,7 @@ class ModelConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class RepaTeacherConfig(_ConfigNode):
+class RepaTeacherConfig:
     checkpoint: str = "microsoft/wavlm-base"
     layer: int = 9
     sample_rate: int | None = None
@@ -72,7 +59,7 @@ class RepaTeacherConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class LossConfig(_ConfigNode):
+class LossConfig:
     repa_feature_dim: int | None = None
     repa_student_layer: int | None = None
     repa_loss_weight: float = 0.0
@@ -85,12 +72,13 @@ class LossConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class PLModuleConfig(_ConfigNode):
+class PLModuleConfig:
     normalize_features: bool = True
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     reference_dropout: float = 0.5
     validation_seed: int = 0
+    finite_loss_check_interval: int = 100
     ema_decay: float | None = None
     ema_update_after_step: int = 0
 
@@ -101,19 +89,23 @@ class PLModuleConfig(_ConfigNode):
         _non_negative_number(self.weight_decay, "pl_module.weight_decay")
         _ratio(self.reference_dropout, "pl_module.reference_dropout")
         _non_negative_integer(self.validation_seed, "pl_module.validation_seed")
+        _positive_integer(
+            self.finite_loss_check_interval,
+            "pl_module.finite_loss_check_interval",
+        )
         _optional_positive_number(self.ema_decay, "pl_module.ema_decay")
         _non_negative_integer(self.ema_update_after_step, "pl_module.ema_update_after_step")
 
 
 @dataclass(frozen=True)
-class RuntimeConfig(_ConfigNode):
+class RuntimeConfig:
     device: str | None = None
     initialization: Initialization = Initialization.CODEC
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
 
 
 @dataclass(frozen=True)
-class SampleCallbackConfig(_ConfigNode):
+class SampleCallbackConfig:
     enabled: bool = True
     every_n_train_steps: int = 10_000
     seed: int = 0
@@ -125,8 +117,8 @@ class SampleCallbackConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class PerformanceCallbackConfig(_ConfigNode):
-    enabled: bool = True
+class PerformanceCallbackConfig:
+    enabled: bool = False
     model_flops_per_step: float | None = None
     profile_flops: bool = False
     hardware_peak_flops: float | None = None
@@ -151,7 +143,7 @@ class PerformanceCallbackConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class DataThroughputCallbackConfig(_ConfigNode):
+class DataThroughputCallbackConfig:
     enabled: bool = True
     log_every_n_steps: int = 100
     warmup_steps: int = 20
@@ -168,7 +160,7 @@ class DataThroughputCallbackConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class CodebookUsageCallbackConfig(_ConfigNode):
+class CodebookUsageCallbackConfig:
     enabled: bool = True
     every_n_steps: int = 100
 
@@ -178,7 +170,7 @@ class CodebookUsageCallbackConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class LossSummaryCallbackConfig(_ConfigNode):
+class LossSummaryCallbackConfig:
     enabled: bool = True
     window_capacity: int = 20
 
@@ -188,7 +180,7 @@ class LossSummaryCallbackConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class LossTimeBucketCallbackConfig(_ConfigNode):
+class LossTimeBucketCallbackConfig:
     enabled: bool = True
     item_name: str = "flow"
     detail_key: str = "t"
@@ -209,7 +201,7 @@ class LossTimeBucketCallbackConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class CheckpointCallbackConfig(_ConfigNode):
+class CheckpointCallbackConfig:
     enabled: bool = True
     filename: str = "step-{step:08d}"
     save_last: bool = True
@@ -228,7 +220,7 @@ class CheckpointCallbackConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class EMACallbackConfig(_ConfigNode):
+class EMACallbackConfig:
     use_ema_weights: bool = True
 
     def __post_init__(self) -> None:
@@ -236,7 +228,7 @@ class EMACallbackConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class CallbackConfig(_ConfigNode):
+class CallbackConfig:
     sample: SampleCallbackConfig = field(default_factory=SampleCallbackConfig)
     performance: PerformanceCallbackConfig = field(default_factory=PerformanceCallbackConfig)
     data_throughput: DataThroughputCallbackConfig = field(
@@ -252,7 +244,7 @@ class CallbackConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class TrainerConfig(_ConfigNode):
+class TrainerConfig:
     accelerator: str = "auto"
     devices: int | str = "auto"
     strategy: str = "auto"
@@ -292,10 +284,12 @@ class TrainerConfig(_ConfigNode):
 
 
 @dataclass(frozen=True)
-class TrainConfig(_ConfigNode):
+class TrainConfig:
     seed: int = 0
     output_dir: str | None = None
-    output_subdir: str = "${backend.name}/${model.route}-${model.decoder.layers}l/${runtime.initialization}"
+    output_subdir: str = (
+        "${backend.name}/${model.route}-${model.decoder.layers}l/${runtime.initialization}"
+    )
     backend: BackendConfig = field(default_factory=BackendConfig)
     datamodule: DataModuleConfig = field(default_factory=DataModuleConfig)
     model: ModelConfig = field(default_factory=ModelConfig)

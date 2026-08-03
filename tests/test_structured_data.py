@@ -4,7 +4,9 @@ import pytest
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
+import semantic_acoustic_codec.types as codec_types
 from semantic_acoustic_codec.datamodule import collate_structured_codes
+from semantic_acoustic_codec.pl_module.semantic import SemanticCodecModule
 from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
 
 
@@ -101,7 +103,7 @@ def test_fixed_length_batch_requires_shared_target_and_reference_batch_axes() ->
             mask=target.mask,
             semantic_pad_id=target.semantic_pad_id,
             acoustic_pad_ids=target.acoustic_pad_ids,
-            acoustic_mask=target.target_acoustic_mask,
+            acoustic_mask=target.acoustic_mask,
             acoustic_layout=target.acoustic_layout,
             reference_semantic_codes=semantic,
             reference_acoustic_codes=acoustic,
@@ -131,7 +133,7 @@ def test_reference_batch_requires_complete_units_and_row_metadata() -> None:
             mask=target.mask,
             semantic_pad_id=target.semantic_pad_id,
             acoustic_pad_ids=target.acoustic_pad_ids,
-            acoustic_mask=target.target_acoustic_mask,
+            acoustic_mask=target.acoustic_mask,
             acoustic_layout=target.acoustic_layout,
             reference_semantic_codes=target.semantic_codes,
         )
@@ -143,12 +145,12 @@ def test_reference_batch_requires_complete_units_and_row_metadata() -> None:
             mask=target.mask,
             semantic_pad_id=target.semantic_pad_id,
             acoustic_pad_ids=target.acoustic_pad_ids,
-            acoustic_mask=target.target_acoustic_mask,
+            acoustic_mask=target.acoustic_mask,
             acoustic_layout=target.acoustic_layout,
             reference_semantic_codes=target.semantic_codes,
             reference_acoustic_codes=target.acoustic_codes,
             reference_mask=target.mask,
-            reference_acoustic_mask=target.target_acoustic_mask,
+            reference_acoustic_mask=target.acoustic_mask,
         )
 
 
@@ -160,10 +162,120 @@ def test_batch_shape_validation_precedes_codebook_axis_access() -> None:
             mask=torch.ones(1, 1, dtype=torch.bool),
             semantic_pad_id=100,
             acoustic_pad_ids=(200,),
+            acoustic_mask=torch.ones(1, 1, dtype=torch.bool),
         )
 
 
 def test_semantic_codec_batch_to_moves_reference_tensors() -> None:
+    batch = _paired_batch()
+
+    moved = batch.to("cpu")
+
+    assert moved is not batch
+    assert moved.metadata == batch.metadata
+    assert moved.reference_semantic_codes is not None
+    assert moved.reference_acoustic_codes is not None
+    assert moved.reference_mask is not None
+    assert moved.reference_acoustic_mask is not None
+    assert moved.reference_semantic_codes.device.type == "cpu"
+    assert moved.reference_acoustic_codes.device.type == "cpu"
+    assert moved.reference_mask.device.type == "cpu"
+    assert moved.reference_acoustic_mask.device.type == "cpu"
+
+
+def test_batch_tensor_transforms_do_not_repeat_value_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = _paired_batch()
+    to_calls: list[dict[str, object]] = []
+
+    def fail_validation(**_: object) -> None:
+        raise AssertionError("trusted tensor transforms must not repeat batch validation")
+
+    def fake_to(tensor: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+        del args
+        to_calls.append(kwargs)
+        return tensor
+
+    def fail_count(*_: object, **__: object) -> int:
+        raise AssertionError("trusted tensor transforms must preserve cached frame counts")
+
+    monkeypatch.setattr(codec_types, "_validate_side", fail_validation)
+    monkeypatch.setattr(torch.Tensor, "to", fake_to)
+    monkeypatch.setattr(torch.Tensor, "sum", fail_count)
+    monkeypatch.setattr(torch.Tensor, "numel", fail_count)
+
+    moved = batch.to(torch.device("cpu"), non_blocking=True)
+
+    assert moved is not batch
+    assert moved.metadata is batch.metadata
+    assert moved.semantic_valid_frames == batch.semantic_valid_frames == 2
+    assert moved.semantic_padded_frames == batch.semantic_padded_frames == 2
+    assert moved.acoustic_valid_units == batch.acoustic_valid_units == 2
+    assert len(to_calls) == 8
+    assert all(call == {"device": torch.device("cpu"), "non_blocking": True} for call in to_calls)
+
+
+def test_dataloader_pin_memory_uses_batch_tensor_transform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = _paired_batch()
+    pinned_ids: list[int] = []
+
+    def fail_validation(**_: object) -> None:
+        raise AssertionError("pinning a validated batch must not repeat batch validation")
+
+    def fake_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+        pinned_ids.append(id(tensor))
+        return tensor.clone()
+
+    def fail_count(*_: object, **__: object) -> int:
+        raise AssertionError("pinning must preserve cached frame counts")
+
+    monkeypatch.setattr(codec_types, "_validate_side", fail_validation)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", fake_pin_memory)
+    monkeypatch.setattr(torch.Tensor, "sum", fail_count)
+    monkeypatch.setattr(torch.Tensor, "numel", fail_count)
+
+    pinned = torch.utils.data._utils.pin_memory.pin_memory(batch)
+
+    assert isinstance(pinned, SemanticCodecBatch)
+    assert pinned is not batch
+    assert pinned.metadata is batch.metadata
+    assert pinned.semantic_valid_frames == batch.semantic_valid_frames == 2
+    assert pinned.semantic_padded_frames == batch.semantic_padded_frames == 2
+    assert pinned.acoustic_valid_units == batch.acoustic_valid_units == 2
+    assert len(pinned_ids) == 8
+    assert pinned.semantic_codes is not batch.semantic_codes
+    assert pinned.reference_acoustic_codes is not batch.reference_acoustic_codes
+
+
+def test_lightning_transfer_requests_non_blocking_batch_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = _paired_batch()
+    calls: list[tuple[torch.device | str, bool]] = []
+
+    def fake_to(
+        self: SemanticCodecBatch,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = False,
+    ) -> SemanticCodecBatch:
+        calls.append((device, non_blocking))
+        return self
+
+    monkeypatch.setattr(SemanticCodecBatch, "to", fake_to)
+    module = object.__new__(SemanticCodecModule)
+    device = torch.device("cuda")
+
+    moved = module.transfer_batch_to_device(batch, device, dataloader_idx=0)
+
+    assert moved is batch
+    assert calls == [(device, True)]
+
+
+def _paired_batch() -> SemanticCodecBatch:
     target = collate_structured_codes(
         [
             SemanticAcousticCodes(
@@ -191,30 +303,17 @@ def test_semantic_codec_batch_to_moves_reference_tensors() -> None:
         target_text="target text",
         reference_text="reference text",
     )
-    batch = SemanticCodecBatch(
+    return SemanticCodecBatch(
         semantic_codes=target.semantic_codes,
         acoustic_codes=target.acoustic_codes,
         mask=target.mask,
         semantic_pad_id=target.semantic_pad_id,
         acoustic_pad_ids=target.acoustic_pad_ids,
-        acoustic_mask=target.target_acoustic_mask,
+        acoustic_mask=target.acoustic_mask,
         acoustic_layout=target.acoustic_layout,
         reference_semantic_codes=target.semantic_codes.clone(),
         reference_acoustic_codes=target.acoustic_codes.clone(),
         reference_mask=target.mask.clone(),
-        reference_acoustic_mask=target.target_acoustic_mask.clone(),
+        reference_acoustic_mask=target.acoustic_mask.clone(),
         metadata=(metadata,),
     )
-
-    moved = batch.to("cpu")
-
-    assert moved is not batch
-    assert moved.metadata == batch.metadata
-    assert moved.reference_semantic_codes is not None
-    assert moved.reference_acoustic_codes is not None
-    assert moved.reference_mask is not None
-    assert moved.reference_acoustic_mask is not None
-    assert moved.reference_semantic_codes.device.type == "cpu"
-    assert moved.reference_acoustic_codes.device.type == "cpu"
-    assert moved.reference_mask.device.type == "cpu"
-    assert moved.reference_acoustic_mask.device.type == "cpu"

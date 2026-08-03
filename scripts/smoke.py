@@ -17,7 +17,7 @@ from anytrain.framework.flow_matching import ContinuousFlowRuntime
 
 from semantic_acoustic_codec.config import DecoderConfig, Route
 from semantic_acoustic_codec.datamodule import BatchingConfig, DataConfig, load_batch
-from semantic_acoustic_codec.model import build_route
+from semantic_acoustic_codec.model import FMFeatureGenerator, RVQCodeGenerator, build_route
 from semantic_acoustic_codec.runtime import (
     SemanticCodecRuntime,
     SemanticSupportConfig,
@@ -72,7 +72,9 @@ class FakeCodec:
         return torch.nn.functional.pad(acoustic_codes.float(), (0, 2))[:, :, :4]
 
     def decode_features(self, semantic_codes: Tensor, acoustic_features: Tensor) -> Tensor:
-        return acoustic_features.new_zeros((semantic_codes.size(0), 1, semantic_codes.size(1) * 320))
+        return acoustic_features.new_zeros(
+            (semantic_codes.size(0), 1, semantic_codes.size(1) * 320)
+        )
 
 
 def main() -> None:
@@ -210,7 +212,9 @@ def _route_smoke(
         )
         condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
         if route is Route.FM:
-            output = modules.generator.loss_from_condition(
+            if not isinstance(modules.generator, FMFeatureGenerator):
+                raise TypeError("FM route must build an FMFeatureGenerator.")
+            output = modules.generator.feature_loss_from_condition(
                 condition,
                 mask,
                 target_features=target,
@@ -219,7 +223,9 @@ def _route_smoke(
                 flow_runtime=ContinuousFlowRuntime(),
             )
         elif route is Route.RVQ:
-            output = modules.generator.loss_from_condition(
+            if not isinstance(modules.generator, RVQCodeGenerator):
+                raise TypeError("RVQ route must build an RVQCodeGenerator.")
+            output = modules.generator.code_loss_from_condition(
                 condition,
                 mask,
                 target_codes=acoustic,
@@ -284,7 +290,7 @@ def _artifact_smoke(backend: FakeCodec, decoder: DecoderConfig) -> None:
         if waveform.dim() != 3 or not bool(torch.isfinite(waveform).all()):
             raise RuntimeError(f"artifact {name} smoke produced an invalid waveform.")
     with tempfile.TemporaryDirectory(prefix="semantic-acoustic-codec-") as tmp:
-        save_artifact(tmp, support, config, backend=backend)
+        save_artifact(tmp, support, backend=backend)
         loaded = load_artifact(tmp)
         loaded_without = loaded.sample_features(
             semantic,
@@ -342,7 +348,7 @@ def _data_smoke(
     target = masked_acoustic_features(
         backend,
         batch.acoustic_codes.to(device),
-        batch.target_acoustic_mask.to(device),
+        batch.acoustic_mask.to(device),
     )
     if not bool(torch.isfinite(target).all()):
         raise RuntimeError("real target acoustic features must be finite.")
@@ -373,7 +379,7 @@ def _validate_batch(batch: SemanticCodecBatch) -> None:
         raise RuntimeError("real codec batch contains no valid semantic frames.")
     if not bool((batch.semantic_codes[batch.mask] >= 0).all()):
         raise RuntimeError("valid semantic codes must be non-negative.")
-    if not bool((batch.acoustic_codes[batch.target_acoustic_mask] >= 0).all()):
+    if not bool((batch.acoustic_codes[batch.acoustic_mask] >= 0).all()):
         raise RuntimeError("valid acoustic codes must be non-negative.")
     if batch.has_reference:
         reference = batch.reference

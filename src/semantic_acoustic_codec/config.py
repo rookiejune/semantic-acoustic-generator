@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,17 @@ class DecoderConfig:
     repa_loss_weight: float = 0.0
 
     def __post_init__(self) -> None:
+        _optional_int(self.hidden_dim, name="hidden_dim")
+        _int(self.layers, name="layers")
+        _int(self.heads, name="heads")
+        _int(self.ffn_ratio, name="ffn_ratio")
+        if not isinstance(self.rvq_predictor, RVQPredictor):
+            raise TypeError("rvq_predictor must be an RVQPredictor.")
+        _int(self.mtp_layers, name="mtp_layers")
+        _int(self.mtp_heads, name="mtp_heads")
+        _optional_int(self.repa_feature_dim, name="repa_feature_dim")
+        _optional_int(self.repa_student_layer, name="repa_student_layer")
+        _float(self.repa_loss_weight, name="repa_loss_weight")
         if self.layers <= 0 or self.heads <= 0 or self.ffn_ratio <= 0:
             raise ValueError("decoder depth, heads, and FFN ratio must be positive.")
         if self.mtp_layers <= 0 or self.mtp_heads <= 0:
@@ -92,7 +104,10 @@ def _int(value: object, *, name: str) -> int:
 def _float(value: object, *, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be a number.")
-    return float(value)
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite.")
+    return result
 
 
 __all__ = [

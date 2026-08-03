@@ -34,23 +34,21 @@ def _monitors(
     del outputs, pl_module
     if not isinstance(batch, SemanticCodecBatch):
         raise TypeError("CodebookUsageLogger requires a SemanticCodecBatch.")
-    semantic_indices = batch.target_semantic_codes[..., 0].masked_fill(
-        ~batch.target_mask,
+    semantic_indices = batch.semantic_codes[..., 0].masked_fill(
+        ~batch.mask,
         -1,
     )
-    acoustic_mask = batch.target_acoustic_mask.unsqueeze(-1).expand_as(
-        batch.target_acoustic_codes
-    )
-    acoustic_indices = batch.target_acoustic_codes.masked_fill(~acoustic_mask, -1)
+    acoustic_mask = batch.acoustic_mask.unsqueeze(-1).expand_as(batch.acoustic_codes)
+    acoustic_indices = batch.acoustic_codes.masked_fill(~acoustic_mask, -1)
     return {
         "semantic": CodebookUsageMonitor(
             indices=semantic_indices,
-            codebook_sizes=(batch.semantic_codebook_size,),
-            active_codebook_mask=batch.target_mask,
+            codebook_sizes=(batch.semantic_pad_id,),
+            active_codebook_mask=batch.mask,
         ),
         "acoustic": CodebookUsageMonitor(
             indices=acoustic_indices,
-            codebook_sizes=batch.acoustic_codebook_sizes,
+            codebook_sizes=batch.acoustic_pad_ids,
             active_codebook_mask=acoustic_mask,
         ),
     }
