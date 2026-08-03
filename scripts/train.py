@@ -29,9 +29,7 @@ from semantic_acoustic_codec.callback import (
 )
 from semantic_acoustic_codec.config import (
     DecoderConfig,
-    Initialization,
     Route,
-    RVQPredictor,
 )
 from semantic_acoustic_codec.datamodule import (
     BatchingConfig,
@@ -43,6 +41,11 @@ from semantic_acoustic_codec.datamodule import (
 from semantic_acoustic_codec.loss import WavLMTeacher
 from semantic_acoustic_codec.pl_module import build_module, dataset_feature_stats
 from semantic_acoustic_codec.runtime import SamplingConfig, SemanticSupportConfig
+
+if __package__:
+    from ._train_config import TrainConfig, output_dir, parse_train_config
+else:
+    from _train_config import TrainConfig, output_dir, parse_train_config
 
 if TYPE_CHECKING:
     from anytrain.codec import SemanticAcousticCodec
@@ -57,15 +60,16 @@ def main(config: DictConfig) -> None:
     run(config)
 
 
-def run(config: DictConfig) -> None:
-    seed = int(config.seed)
+def run(config: DictConfig | TrainConfig) -> None:
+    config = parse_train_config(config)
+    seed = config.seed
     pl.seed_everything(seed, workers=True)
-    device = _device(cast(Optional[str], config.runtime.get("device")))
+    device = _device(config.runtime.device)
     output_dir = _output_dir(config)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    codec = str(config.backend.name)
-    data = _data_config(config.datamodule)
+    codec = config.backend.name
+    data = config.datamodule
     backend = load_backend(config.backend, device=device)
     semantic_pad_id = int(backend.semantic_codebook.size(0))
     acoustic_pad_ids = backend.acoustic_codebook_sizes
@@ -77,7 +81,7 @@ def run(config: DictConfig) -> None:
         semantic_pad_id=semantic_pad_id,
         acoustic_pad_ids=acoustic_pad_ids,
     )
-    if bool(config.datamodule.fixed_batch):
+    if config.datamodule.fixed_batch:
         fixed_batch = load_batch(
             data,
             codec=codec,
@@ -89,14 +93,14 @@ def run(config: DictConfig) -> None:
     else:
         data_module.setup("fit")
         fixed_batch = data_module.sample_batch()
-    route = _route(config.model.route)
+    route = config.model.route
     repa_teacher = _repa_teacher(config, backend, device=device, route=route)
     support_config = _support_config(config, seed=seed, repa_teacher=repa_teacher)
-    normalize_features = bool(config.pl_module.normalize_features)
+    normalize_features = config.pl_module.normalize_features
     feature_mean: tuple[float, ...] | None = None
     feature_std: tuple[float, ...] | None = None
     if normalize_features and support_config.route is Route.FM:
-        if bool(config.datamodule.fixed_batch):
+        if config.datamodule.fixed_batch:
             feature_mean, feature_std = dataset_feature_stats(backend, (fixed_batch,))
         else:
             feature_mean, feature_std = dataset_feature_stats(
@@ -110,10 +114,10 @@ def run(config: DictConfig) -> None:
         normalize_features=normalize_features,
         feature_mean=feature_mean,
         feature_std=feature_std,
-        learning_rate=float(config.pl_module.learning_rate),
-        weight_decay=float(config.pl_module.weight_decay),
-        reference_dropout=float(config.pl_module.reference_dropout),
-        validation_seed=int(config.pl_module.get("validation_seed", seed)),
+        learning_rate=config.pl_module.learning_rate,
+        weight_decay=config.pl_module.weight_decay,
+        reference_dropout=config.pl_module.reference_dropout,
+        validation_seed=config.pl_module.validation_seed,
         repa_teacher=repa_teacher,
     )
 
@@ -122,28 +126,22 @@ def run(config: DictConfig) -> None:
 
     ckpt_path = _ckpt_path(config)
     trainer = pl.Trainer(
-        accelerator=str(config.trainer.accelerator),
+        accelerator=config.trainer.accelerator,
         devices=cast(Union[str, int], config.trainer.devices),
-        strategy=str(config.trainer.strategy),
+        strategy=config.trainer.strategy,
         precision=cast(Any, config.trainer.precision),
-        max_steps=int(config.trainer.max_steps),
-        max_epochs=int(config.trainer.max_epochs),
-        log_every_n_steps=int(config.trainer.log_every_n_steps),
-        enable_checkpointing=bool(checkpoint.enabled),
-        gradient_clip_val=float(config.trainer.gradient_clip_val),
+        max_steps=config.trainer.max_steps,
+        max_epochs=config.trainer.max_epochs,
+        log_every_n_steps=config.trainer.log_every_n_steps,
+        enable_checkpointing=checkpoint.enabled,
+        gradient_clip_val=config.trainer.gradient_clip_val,
         default_root_dir=str(output_dir),
         callbacks=callbacks,
-        use_distributed_sampler=bool(config.trainer.use_distributed_sampler),
-        val_check_interval=cast(
-            Union[int, float],
-            config.trainer.get("val_check_interval", 1.0),
-        ),
-        check_val_every_n_epoch=cast(
-            Optional[int],
-            config.trainer.get("check_val_every_n_epoch"),
-        ),
+        use_distributed_sampler=config.trainer.use_distributed_sampler,
+        val_check_interval=config.trainer.val_check_interval,
+        check_val_every_n_epoch=config.trainer.check_val_every_n_epoch,
     )
-    if not bool(config.datamodule.fixed_batch):
+    if not config.datamodule.fixed_batch:
         trainer.fit(
             module,
             datamodule=data_module,
@@ -163,7 +161,7 @@ def run(config: DictConfig) -> None:
 
 
 def _support_config(
-    config: DictConfig,
+    config: TrainConfig,
     *,
     seed: int,
     repa_teacher: Teacher | None,
@@ -171,7 +169,7 @@ def _support_config(
     decoder = config.model.decoder
     loss = config.loss
     sampling = config.runtime.sampling
-    repa_feature_dim = cast(Optional[int], loss.get("repa_feature_dim"))
+    repa_feature_dim = loss.repa_feature_dim
     if repa_teacher is not None:
         if repa_feature_dim is None:
             repa_feature_dim = int(repa_teacher.feature_dim)
@@ -181,38 +179,38 @@ def _support_config(
                 f"{repa_feature_dim} != {repa_teacher.feature_dim}."
             )
     return SemanticSupportConfig(
-        route=_route(config.model.route),
-        condition_dim=int(config.model.condition_dim),
+        route=config.model.route,
+        condition_dim=config.model.condition_dim,
         decoder=DecoderConfig(
-            hidden_dim=cast(Optional[int], decoder.get("hidden_dim")),
-            layers=int(decoder.layers),
-            heads=int(decoder.heads),
-            ffn_ratio=int(decoder.ffn_ratio),
-            rvq_predictor=_rvq_predictor(decoder.get("rvq_predictor", "mtp")),
-            mtp_layers=int(decoder.get("mtp_layers", 2)),
-            mtp_heads=int(decoder.get("mtp_heads", 4)),
+            hidden_dim=decoder.hidden_dim,
+            layers=decoder.layers,
+            heads=decoder.heads,
+            ffn_ratio=decoder.ffn_ratio,
+            rvq_predictor=decoder.rvq_predictor,
+            mtp_layers=decoder.mtp_layers,
+            mtp_heads=decoder.mtp_heads,
             repa_feature_dim=repa_feature_dim,
-            repa_student_layer=cast(Optional[int], loss.get("repa_student_layer")),
-            repa_loss_weight=float(loss.repa_loss_weight),
+            repa_student_layer=loss.repa_student_layer,
+            repa_loss_weight=loss.repa_loss_weight,
         ),
-        initialization=_initialization(config.runtime.initialization),
+        initialization=config.runtime.initialization,
         seed=seed,
         sampling=SamplingConfig(
-            flow_steps=int(sampling.flow_steps),
-            temperature=float(sampling.temperature),
-            top_p=float(sampling.top_p),
+            flow_steps=sampling.flow_steps,
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
         ),
     )
 
 
 def _repa_teacher(
-    config: DictConfig,
+    config: TrainConfig,
     backend: SemanticAcousticCodec,
     *,
     device: torch.device,
     route: Route,
 ) -> Teacher | None:
-    weight = float(config.loss.repa_loss_weight)
+    weight = config.loss.repa_loss_weight
     if weight <= 0:
         return None
     if route is not Route.FM:
@@ -222,23 +220,19 @@ def _repa_teacher(
     decode = getattr(backend, "decode", None)
     if not callable(decode):
         raise TypeError("REPA teacher requires a backend that implements decode(codes).")
-    teacher = config.loss.get("repa_teacher")
-    checkpoint = "microsoft/wavlm-base" if teacher is None else str(
-        teacher.get("checkpoint", "microsoft/wavlm-base")
-    )
-    layer = 9 if teacher is None else int(teacher.get("layer", 9))
-    sample_rate = None if teacher is None else teacher.get("sample_rate")
+    teacher = config.loss.repa_teacher
+    sample_rate = teacher.sample_rate
     return WavLMTeacher(
         cast(Any, backend),
-        checkpoint=checkpoint,
-        layer=layer,
+        checkpoint=teacher.checkpoint,
+        layer=teacher.layer,
         sample_rate=int(backend.sample_rate if sample_rate is None else sample_rate),
         device=device,
     )
 
 
 def _build_callbacks(
-    config: DictConfig,
+    config: Any,
     *,
     output_dir: Path,
     fixed_batch: SemanticCodecBatch,
@@ -420,7 +414,9 @@ def _checkpoint_callback(config: Any, output_dir: Path) -> Callback | None:
     )
 
 
-def _data_config(config: DictConfig) -> DataConfig:
+def _data_config(config: Any) -> DataConfig:
+    if isinstance(config, DataConfig):
+        return config
     batching = config.batching
     return DataConfig(
         source=str(config.get("source", "qwen_cross_text")),
@@ -449,20 +445,12 @@ def _data_config(config: DictConfig) -> DataConfig:
     )
 
 
-def _output_dir(config: DictConfig) -> Path:
-    value = config.get("output_dir")
-    if value is not None:
-        return Path(str(value)).expanduser()
-    root = os.environ.get("SEMANTIC_ACOUSTIC_CODEC_TRAIN_ROOT")
-    if root is None:
-        dynamic = os.environ.get("DYNAMIC_HOME")
-        root = "/tmp/semantic-acoustic-codec" if dynamic is None else f"{dynamic}/train/semantic-acoustic-codec"
-    return Path(root).expanduser() / str(config.output_subdir)
+def _output_dir(config: TrainConfig) -> Path:
+    return output_dir(config)
 
 
-def _ckpt_path(config: DictConfig) -> str | None:
-    value = config.trainer.get("ckpt_path")
-    return None if value is None else str(value)
+def _ckpt_path(config: TrainConfig) -> str | None:
+    return config.trainer.ckpt_path
 
 
 def _optional_float(value: Any) -> float | None:
@@ -474,21 +462,6 @@ def _device(value: str | None) -> torch.device:
     if requested.type == "cuda" and requested.index is None:
         return torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
     return requested
-
-
-def _route(value: Any) -> Route:
-    raw = str(value)
-    return Route[raw] if raw in Route.__members__ else Route(raw)
-
-
-def _initialization(value: Any) -> Initialization:
-    raw = str(value)
-    return Initialization[raw] if raw in Initialization.__members__ else Initialization(raw)
-
-
-def _rvq_predictor(value: Any) -> RVQPredictor:
-    raw = str(value)
-    return RVQPredictor[raw] if raw in RVQPredictor.__members__ else RVQPredictor(raw)
 
 
 if __name__ == "__main__":

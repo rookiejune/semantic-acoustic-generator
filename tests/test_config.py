@@ -6,6 +6,9 @@ import pytest
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig
 
+from scripts._train_config import TrainConfig, parse_train_config
+from semantic_acoustic_codec.config import Route, RVQPredictor
+
 CONFIG_DIR = Path(__file__).parents[1] / "configs"
 
 
@@ -52,6 +55,43 @@ def test_root_has_no_legacy_flat_training_groups() -> None:
     assert config.callback.checkpoint.enabled is True
     assert config.callback.performance.profile_flops is False
     assert config.callback.data_throughput.enabled is True
+
+
+def test_train_config_parses_to_typed_entry_schema() -> None:
+    config = parse_train_config(_compose())
+
+    assert isinstance(config, TrainConfig)
+    assert config.model.route is Route.FM
+    assert config.model.decoder.rvq_predictor is RVQPredictor.MTP
+    assert config.datamodule.fixed_batch is False
+    assert config.output_subdir == "longcat/fm-8l/codec"
+
+
+def test_train_config_rejects_unknown_fields_before_training() -> None:
+    raw = _compose("+callback.unused=1")
+
+    with pytest.raises(Exception) as raised:
+        parse_train_config(raw)
+
+    assert "callback.unused" in str(raised.value)
+
+
+def test_train_config_rejects_unsafe_output_subdir() -> None:
+    raw = _compose("output_subdir=../bad")
+
+    with pytest.raises(ValueError, match="output_subdir"):
+        parse_train_config(raw)
+
+
+def test_train_config_rejects_repa_on_rvq_route() -> None:
+    raw = _compose(
+        "model/route=rvq",
+        "loss.repa_loss_weight=0.1",
+        "loss.repa_feature_dim=768",
+    )
+
+    with pytest.raises(ValueError, match="REPA requires model.route=fm"):
+        parse_train_config(raw)
 
 
 def test_experiment_composition_can_be_overridden_explicitly() -> None:
