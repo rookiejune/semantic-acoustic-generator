@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,11 @@ class Overlong(StrEnum):
 @runtime_checkable
 class _RawLengthDataset(Protocol):
     def raw_length(self, index: int) -> int: ...
+
+
+@runtime_checkable
+class _DurationDataset(Protocol):
+    def duration(self, index: int) -> float: ...
 
 
 @dataclass(frozen=True)
@@ -94,6 +100,17 @@ class SourceAdapter(ABC):
         if value < 1:
             raise ValueError("dataset raw_length() must be positive.")
         return value
+
+    def duration(self, dataset: Dataset[Any], index: int) -> float:
+        if not isinstance(dataset, _DurationDataset):
+            raise TypeError("dynamic batching requires dataset duration() metadata.")
+        value = dataset.duration(index)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("dataset duration() must return a number.")
+        duration = float(value)
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("dataset duration() must be finite and positive.")
+        return duration
 
 
 class _QwenAdapter(SourceAdapter):

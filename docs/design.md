@@ -380,10 +380,11 @@ reconstruction。
 FM 的 feature mean/std 在正式训练开始前流式遍历有效训练 subset 计算，使用 float64 sum/square sum，
 不会从 `sample_index` 或首个 batch 推断全数据分布；fixed-batch overfit 则显式只统计该固定 batch。
 `datamodule.validation_split` 可绑定独立 held-out split，validation loader 固定顺序且不使用动态
-batching。训练 loader 通过 anydataset map-style `dataloader` 先按 index-level semantic frame cost
-规划 batch，再由 worker 物化 codec Tensor；不缓存已物化 pair，也不依赖归档 batching adapter。验证对
-同一 target 用相同 seed 的独立 generator 计算 with-reference / without-reference：FM 记录 feature MSE，
-RVQ 记录 code error，并记录两者差值作为 reference gain。
+batching。训练 loader 通过 anydataset map-style `dataloader`，先按 manifest audio duration 推导的
+index-level frame proxy 规划 batch，再由 worker 物化 codec Tensor；planner 不反序列化 codec payload，
+也不缓存已物化 pair 或依赖归档 batching adapter。验证对同一 target 用相同 seed 的独立 generator 计算
+with-reference / without-reference：FM 记录 feature MSE，RVQ 记录 code error，并记录两者差值作为
+reference gain。
 
 当前已完成的闭环包括：
 

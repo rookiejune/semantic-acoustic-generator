@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import math
 import operator
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from os import PathLike
-from typing import Any, TypeVar, cast
+from typing import Any, Protocol, TypeVar, cast, runtime_checkable
 
 from anydataset.types import (
     AudioItem,
     AudioMeta,
     AudioView,
+    Modality,
     Role,
     TextItem,
     TextMeta,
@@ -65,6 +67,16 @@ class _LoadedCell:
 _INFO_CACHE_SIZE = 1024
 _REFERENCE_CACHE_SIZE = 1024
 _T = TypeVar("_T")
+
+
+@runtime_checkable
+class _CostRowDataset(Protocol):
+    def cost_row(self, index: int) -> object: ...
+
+
+@runtime_checkable
+class _CostRow(Protocol):
+    def item(self, ref: tuple[Role, Modality]) -> object: ...
 
 
 class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
@@ -142,6 +154,28 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
     def raw_length(self, index: int) -> int:
         return self.info(index).raw_length
 
+    def duration(self, index: int) -> float:
+        index = _index(index, size=len(self), source="Qwen codec column sample")
+        cells = self.grid.cells
+        if not isinstance(cells, _CostRowDataset):
+            raise TypeError("Qwen codec grid cells must expose metadata-only cost_row().")
+        row = cells.cost_row(self._flat_index(self.text_indices[index]))
+        if not isinstance(row, _CostRow):
+            raise TypeError("Qwen codec cost rows must expose item().")
+        item = row.item(self.grid.audio_ref)
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("Qwen codec cost row is missing audio metadata.")
+        metadata = item[1]
+        if not isinstance(metadata, Mapping):
+            raise TypeError("Qwen codec cost-row audio metadata must be a mapping.")
+        value = metadata.get(AudioMeta.DURATION.value)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("Qwen codec cost-row audio duration must be a number.")
+        duration = float(value)
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("Qwen codec cost-row audio duration must be finite and positive.")
+        return duration
+
     def _sample_info(
         self,
         index: int,
@@ -203,8 +237,10 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
             self._info_cache.popitem(last=False)
 
     def _cell(self, text_index: int) -> Mapping[Any, Any]:
-        flat_index = text_index * len(self.grid.speaker_ids) + self.speaker_index
-        return self.grid.cells[flat_index]
+        return self.grid.cells[self._flat_index(text_index)]
+
+    def _flat_index(self, text_index: int) -> int:
+        return text_index * len(self.grid.speaker_ids) + self.speaker_index
 
 
 class QwenCodecPairDataset(Dataset[QwenCodecPairSample]):
@@ -262,6 +298,15 @@ class QwenCodecPairDataset(Dataset[QwenCodecPairSample]):
             self._reference_indices.move_to_end(index)
             reference = self.source.info(reference_index)
         return max(target.raw_length, reference.raw_length)
+
+    def duration(self, index: int) -> float:
+        index = _index(index, size=len(self), source="Qwen codec pair sample")
+        # The worker may skip duplicate-text candidates; planning only needs a stable proxy.
+        reference_index = (index + 1) % len(self)
+        return max(
+            self.source.duration(index),
+            self.source.duration(reference_index),
+        )
 
     def _cache_reference(self, index: int, reference_index: int) -> None:
         self._reference_indices[index] = reference_index

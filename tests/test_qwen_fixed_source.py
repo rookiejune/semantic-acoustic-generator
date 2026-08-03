@@ -7,6 +7,7 @@ import torch
 from anydataset.dataset.speaker import SpeakerAudioGrid, SpeakerAudioRow
 from anydataset.types import (
     AudioItem,
+    AudioMeta,
     AudioView,
     Modality,
     Role,
@@ -131,7 +132,8 @@ def test_qwen_cross_text_uses_anydataset_cost_batching(
                 torch.ones(4, 1, dtype=torch.long),
             )
             for index in range(4)
-        ]
+        ],
+        frame_rate=2.0,
     )
     monkeypatch.setattr(
         qwen_data.qwen_tts,
@@ -168,6 +170,7 @@ def test_dynamic_batch_planning_does_not_load_qwen_codec_samples(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     accesses: list[int] = []
+    cost_accesses: list[int] = []
     grid = _grid(
         [
             (
@@ -177,7 +180,9 @@ def test_dynamic_batch_planning_does_not_load_qwen_codec_samples(
             )
             for index in range(4)
         ],
+        frame_rate=2.0,
         accesses=accesses,
+        cost_accesses=cost_accesses,
     )
     monkeypatch.setattr(
         qwen_data.qwen_tts,
@@ -200,9 +205,11 @@ def test_dynamic_batch_planning_does_not_load_qwen_codec_samples(
     assert accesses == []
     assert module.dataset is not None
     assert module.dataset.costs[0] == 3
-    assert accesses == [0, 1]
+    assert accesses == []
+    assert cost_accesses == [0, 1]
     assert module.dataset.costs[0] == 3
-    assert accesses == [0, 1]
+    assert accesses == []
+    assert cost_accesses == [0, 1]
 
 
 def test_qwen_column_sample_reads_its_cell_once(
@@ -303,9 +310,11 @@ def test_dynamic_batch_cost_cache_is_bounded_by_planning_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     accesses: list[int] = []
+    cost_accesses: list[int] = []
     grid = _grid(
         [(f"text {index}", torch.ones(index + 1, 1), torch.ones(4, 1)) for index in range(3)],
         accesses=accesses,
+        cost_accesses=cost_accesses,
     )
     monkeypatch.setattr(
         qwen_data.qwen_tts,
@@ -328,11 +337,43 @@ def test_dynamic_batch_cost_cache_is_bounded_by_planning_window(
     costs = module.dataset.costs
     assert costs[0] == 1
     assert costs[0] == 1
-    assert accesses == [0]
+    assert accesses == []
+    assert cost_accesses == [0]
     assert costs[1] == 2
     assert costs[0] == 1
-    assert accesses == [0, 1]
+    assert accesses == []
+    assert cost_accesses == [0, 1, 0]
     assert tuple(vars(costs)["_cache"]) == (0,)
+
+
+def test_dynamic_batch_duration_proxy_counts_at_least_one_frame(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grid = _grid(
+        [("short text", torch.ones(1, 1), torch.ones(4, 1))],
+        frame_rate=200.0,
+    )
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    data = DataConfig(
+        source="qwen_fixed_speaker",
+        root=str(tmp_path / "prepared"),
+        batch_size=1,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        batching=BatchingConfig(planning_window=1),
+    )
+    module = _module(data, tmp_path, frame_rate=50.0)
+
+    module.setup()
+
+    assert module.dataset is not None
+    assert module.dataset.costs[0] == 1
 
 
 def test_dynamic_batch_budget_does_not_create_hard_duration_limit(
@@ -346,7 +387,8 @@ def test_dynamic_batch_budget_does_not_create_hard_duration_limit(
                 torch.ones(4, 1, dtype=torch.long),
                 torch.ones(4, 1, dtype=torch.long),
             )
-        ]
+        ],
+        frame_rate=1.0,
     )
     monkeypatch.setattr(
         qwen_data.qwen_tts,
@@ -640,7 +682,9 @@ def _module(data: DataConfig, tmp_path, *, frame_rate: float = 50.0) -> DataModu
 def _grid(
     values: list[tuple[str, torch.Tensor, torch.Tensor]],
     *,
+    frame_rate: float = 50.0,
     accesses: list[int] | None = None,
+    cost_accesses: list[int] | None = None,
 ) -> SpeakerAudioGrid:
     cells = [
         {
@@ -654,12 +698,21 @@ def _grid(
                         "semantic": semantic,
                         "acoustic": acoustic,
                     }
-                }
+                },
+                meta={
+                    AudioMeta.DURATION: float(semantic.size(0)) / frame_rate,
+                    AudioMeta.SPEAKER_ID: "vivian",
+                },
             ),
         }
         for index, (text, semantic, acoustic) in enumerate(values)
     ]
-    dataset = cells if accesses is None else _TrackingCells(cells, accesses)
+    dataset = _TrackingCells(
+        cells,
+        accesses=accesses,
+        cost_accesses=cost_accesses,
+        durations=tuple(float(semantic.size(0)) / frame_rate for _, semantic, _ in values),
+    )
     return SpeakerAudioGrid(
         dataset,
         ("vivian",),
@@ -670,13 +723,38 @@ def _grid(
 
 
 class _TrackingCells:
-    def __init__(self, cells, accesses: list[int]) -> None:
+    def __init__(
+        self,
+        cells,
+        *,
+        accesses: list[int] | None,
+        cost_accesses: list[int] | None,
+        durations: tuple[float, ...],
+    ) -> None:
         self.cells = cells
         self.accesses = accesses
+        self.cost_accesses = cost_accesses
+        self.durations = durations
 
     def __len__(self) -> int:
         return len(self.cells)
 
     def __getitem__(self, index: int):
-        self.accesses.append(index)
+        if self.accesses is not None:
+            self.accesses.append(index)
         return self.cells[index]
+
+    def cost_row(self, index: int):
+        if self.cost_accesses is not None:
+            self.cost_accesses.append(index)
+        return _CostRow(self.durations[index])
+
+
+class _CostRow:
+    def __init__(self, duration: float) -> None:
+        self.duration = duration
+
+    def item(self, ref: tuple[Role, Modality]):
+        if ref != (Role.DEFAULT, Modality.AUDIO):
+            return None
+        return ref, {AudioMeta.DURATION.value: self.duration}

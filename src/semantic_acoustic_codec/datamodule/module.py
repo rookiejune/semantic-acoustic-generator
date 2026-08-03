@@ -167,8 +167,8 @@ class _PreparedDataset(MapStyleABC):
         return self.source[self.indexes[index]]
 
 
-class _RawLengthCosts(Sequence[int]):
-    """Compute planner costs on first access without loading samples during setup."""
+class _DurationCosts(Sequence[int]):
+    """Compute duration-based planner costs without loading sample payloads."""
 
     def __init__(
         self,
@@ -178,6 +178,7 @@ class _RawLengthCosts(Sequence[int]):
         adapter: SourceAdapter,
         max_frames: int | None,
         batch_frames: int,
+        frame_rate: float,
         truncate: bool,
         cache_size: int,
     ) -> None:
@@ -186,6 +187,7 @@ class _RawLengthCosts(Sequence[int]):
         self.adapter = adapter
         self.max_frames = max_frames
         self.batch_frames = batch_frames
+        self.frame_rate = frame_rate
         self.truncate = truncate
         self.cache_size = cache_size
         self._cache: OrderedDict[int, int] = OrderedDict()
@@ -211,7 +213,8 @@ class _RawLengthCosts(Sequence[int]):
         if cached is not None:
             self._cache.move_to_end(resolved)
             return cached
-        frames = self.adapter.raw_length(self.source, self.indexes[resolved])
+        duration = self.adapter.duration(self.source, self.indexes[resolved])
+        frames = _planning_frames(duration, self.frame_rate)
         if self.truncate and self.max_frames is not None:
             frames = min(frames, self.max_frames)
         frames = min(frames, self.batch_frames)
@@ -305,12 +308,13 @@ class DataModule(pl.LightningDataModule):
             if batch_frames is None:
                 lazy_costs = (1,) * len(lazy_indexes)
             else:
-                lazy_costs = _RawLengthCosts(
+                lazy_costs = _DurationCosts(
                     source,
                     indexes=lazy_indexes,
                     adapter=self.adapter,
                     max_frames=max_frames,
                     batch_frames=batch_frames,
+                    frame_rate=self.frame_rate,
                     truncate=policy is Overlong.TRUNCATE,
                     cache_size=data.batching.planning_window,
                 )
@@ -625,6 +629,11 @@ def _frames(seconds: float, frame_rate: float) -> int:
     if frames < 1:
         raise ValueError("duration limit must contain at least one codec frame.")
     return frames
+
+
+def _planning_frames(duration: float, frame_rate: float) -> int:
+    _positive_number(frame_rate, name="frame_rate")
+    return max(1, math.ceil(duration * frame_rate))
 
 
 def _positive_number(value: object, *, name: str) -> None:
