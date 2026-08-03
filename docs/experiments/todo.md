@@ -2,19 +2,19 @@
 
 本文只记录未完成事项。完成项应移动到 `docs/experiments/results/` 或由 git 历史保留。
 
-## P0: 008 Staged 10k→50k Reference Probe
+## P0: 009 LongCat FM 50k→200k Continuation
 
-- id: sac-008-10k-reference-probe
+- id: sac-009-longcat-fm-200k
 - state: running
-- entry: `scripts/train.py experiment=001_longcat_fm` and `scripts/train.py experiment=001_bicodec_rvq`; resume clean 10k runs from `checkpoints/last.ckpt` to 50k
-- num_gpus: 2
-- gpu: 2x4090-24GB single-card probes
-- min_vram_gb_per_gpu: 24GB-class until probe completes
+- entry: `jobs/001/01_longcat_dit.sh trainer.max_steps=100000 trainer.ckpt_path=<resume-checkpoint>`; fixed eval 后再决定是否继续到 200k
+- num_gpus: 1
+- gpu: 1x4090-24GB
+- min_vram_gb_per_gpu: 24GB-class
 - preferred_hosts: 144
-- estimated_hours: staged probe
-- monitor: train logs; 10k checkpoint/sample every 1000 steps; watcher resumes clean completions to 50k with checkpoint/sample every 5000 steps; fixed eval curve after completion; manual listening review; reference leakage check
-- ready_gate: code at pushed fixed-eval accessor commit; 0_10000 Qwen cross-text codec views ready; host 144 GPUs 0/1 assigned as independent single-card runs; watcher installed for clean 10k→50k resume
-- task: 跑 LongCat FM 和 BiCodec RVQ 两条 10k-step 单卡 reference probe；若 10k 日志无 Traceback/OOM/Error 且正常完成，则自动从 last checkpoint 在同一卡续跑到 50k；完成后用同一 fixed eval set 汇总曲线，再做人工听评和 reference 泄漏检查。todo 不记录私密输出路径、指标明细或样本内容。
+- estimated_hours: staged longrun
+- monitor: TensorBoard plus train logs; checkpoint/sample every 10000 steps; fixed eval at 100k and 200k
+- ready_gate: before launch, require a resume artifact supplied outside the public repository, a pushed code revision, and one eligible 24GB-class GPU
+- task: 验证 LongCat FM continuation 能否通过后续固定评测的预定义质量门禁；先运行到 100k，仅在门禁通过后再决定是否继续到 200k。
 
 ## P0: 006/007 Fixed Eval Review
 
