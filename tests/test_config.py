@@ -58,6 +58,13 @@ def test_root_has_no_legacy_flat_training_groups() -> None:
     assert config.callback.data_throughput.enabled is True
 
 
+def test_longcat_fm_uses_24gb_single_gpu_batching_defaults() -> None:
+    config = _compose("experiment=001_longcat_fm")
+
+    assert config.datamodule.batch_size == 48
+    assert config.datamodule.batching.max_batch_seconds == 576.0
+
+
 def test_train_config_parses_to_typed_entry_schema() -> None:
     config = parse_train_config(_compose())
 

@@ -11,4 +11,9 @@ defaults:
   - override /trainer: default
   - _self_
 
+datamodule:
+  batch_size: 48
+  batching:
+    max_batch_seconds: 576.0
+
 output_subdir: longcat/dit-8l/cross-text
