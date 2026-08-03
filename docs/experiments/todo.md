@@ -6,13 +6,13 @@
 
 - id: sac-009-longcat-fm-200k
 - state: running
-- entry: `jobs/001/01_longcat_dit.sh trainer.max_steps=100000 trainer.ckpt_path=<resume-checkpoint>`; fixed eval 后再决定是否继续到 200k
+- entry: `jobs/001/01_longcat_dit.sh trainer.max_steps=100000 trainer.ckpt_path=<resume-checkpoint> datamodule.batch_size=48 datamodule.batching.max_batch_seconds=576.0`; fixed eval 后再决定是否继续到 200k
 - num_gpus: 1
 - gpu: 1x4090-24GB
 - min_vram_gb_per_gpu: 24GB-class
 - preferred_hosts: 144
 - estimated_hours: staged longrun
-- monitor: TensorBoard plus train logs; checkpoint/sample every 10000 steps; fixed eval at 100k and 200k
+- monitor: TensorBoard plus train logs and anytrain throughput/memory metrics; checkpoint/sample every 10000 steps; fixed eval at 100k and 200k
 - ready_gate: before launch, require a resume artifact supplied outside the public repository, a pushed code revision, and one eligible 24GB-class GPU
 - task: 验证 LongCat FM continuation 能否通过后续固定评测的预定义质量门禁；先运行到 100k，仅在门禁通过后再决定是否继续到 200k。
 
