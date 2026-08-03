@@ -22,7 +22,7 @@ try:
         SampleLogger,
     )
     from semantic_acoustic_codec.config import DecoderConfig, Route
-    from semantic_acoustic_codec.datamodule import collate_codes
+    from semantic_acoustic_codec.datamodule import collate_codes, single_batch_loader
     from semantic_acoustic_codec.pl_module import (
         CHECKPOINT_METADATA_KEY,
         CHECKPOINT_SCHEMA_VERSION,
@@ -330,6 +330,80 @@ def test_training_module_rejects_non_finite_loss(monkeypatch: pytest.MonkeyPatch
 
     with pytest.raises(FloatingPointError, match="flow training loss is non-finite"):
         module.training_step(batch, 0)
+
+
+def test_training_resume_uses_configured_learning_rate(tmp_path: Path) -> None:
+    backend = FakeCodec()
+    batch = collate_codes(
+        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
+        semantic_pad_id=backend.semantic_codebook.size(0),
+        acoustic_pad_ids=backend.acoustic_codebook_sizes,
+    )
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=10,
+        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+    )
+    original = build_module(
+        backend,
+        config,
+        batch,
+        normalize_features=True,
+        learning_rate=3e-4,
+    )
+    first = pl.Trainer(
+        accelerator="cpu",
+        devices=1,
+        max_steps=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=False,
+    )
+    first.fit(original, train_dataloaders=single_batch_loader(batch))
+    checkpoint_path = tmp_path / "resume.ckpt"
+    first.save_checkpoint(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    assert checkpoint["optimizer_states"][0]["param_groups"][0]["lr"] == pytest.approx(3e-4)
+
+    observed: list[float] = []
+
+    class CaptureLearningRate(pl.Callback):
+        def on_train_start(
+            self,
+            trainer: pl.Trainer,
+            pl_module: pl.LightningModule,
+        ) -> None:
+            del pl_module
+            observed.append(float(trainer.optimizers[0].param_groups[0]["lr"]))
+
+    resumed = build_module(
+        backend,
+        config,
+        batch,
+        normalize_features=True,
+        learning_rate=1e-4,
+    )
+    second = pl.Trainer(
+        accelerator="cpu",
+        devices=1,
+        max_steps=2,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=False,
+        callbacks=[CaptureLearningRate()],
+    )
+    second.fit(
+        resumed,
+        train_dataloaders=single_batch_loader(batch),
+        ckpt_path=checkpoint_path,
+    )
+
+    assert second.global_step == 2
+    assert observed == pytest.approx([1e-4])
+    assert second.optimizers[0].param_groups[0]["lr"] == pytest.approx(1e-4)
 
 
 def test_training_checkpoint_drops_backend_and_requires_support_state() -> None:
@@ -756,6 +830,7 @@ def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
 
     assert [type(callback).__name__ for callback in callbacks] == [
         "ArtifactExport",
+        "LearningRateMonitor",
         "EMACallback",
         "SampleLogger",
         "ModelCheckpoint",

@@ -256,6 +256,20 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
             raise TypeError("semantic-acoustic checkpoint state_dict must be a mapping.")
         if isinstance(state, dict):
             _strip_external_state(state)
+        optimizer_states = checkpoint.get("optimizer_states")
+        if optimizer_states is not None:
+            if not isinstance(optimizer_states, list):
+                raise TypeError("checkpoint optimizer_states must be a list.")
+            for optimizer_state in optimizer_states:
+                if not isinstance(optimizer_state, dict):
+                    raise TypeError("checkpoint optimizer state must be a mapping.")
+                param_groups = optimizer_state.get("param_groups")
+                if not isinstance(param_groups, list):
+                    raise TypeError("checkpoint optimizer param_groups must be a list.")
+                for param_group in param_groups:
+                    if not isinstance(param_group, dict):
+                        raise TypeError("checkpoint optimizer param group must be a mapping.")
+                    param_group["lr"] = self.learning_rate
         required = {f"support.{key}" for key in self.support.state_dict()}
         missing = sorted(key for key in required if key not in state)
         if missing:

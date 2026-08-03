@@ -16,7 +16,7 @@ from anytrain.lightning import (
     PerformanceCallback,
 )
 from lightning import pytorch as pl
-from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.callbacks import Callback, LearningRateMonitor
 
 from semantic_acoustic_codec.backend import load_backend
 from semantic_acoustic_codec.callback import (
@@ -240,7 +240,10 @@ def _build_callbacks(
 ) -> list[Callback]:
     callback_config = config.callback
     performance = callback_config.performance
-    callbacks: list[Callback] = [ArtifactExport(output_dir)]
+    callbacks: list[Callback] = [
+        ArtifactExport(output_dir),
+        LearningRateMonitor(logging_interval="step"),
+    ]
     callbacks.extend(_loss_callbacks(callback_config))
 
     codebook_usage_callback = _codebook_usage_callback(
