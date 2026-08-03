@@ -18,6 +18,9 @@ data_throughput:
   log_every_n_steps: 100
   warmup_steps: 20
   measure_window_steps: 100
+codebook_usage:
+  enabled: true
+  every_n_steps: 100
 loss_summary:
   enabled: true
   window_capacity: 20

@@ -15,7 +15,11 @@ from torch import Tensor
 pytest.importorskip("lightning")
 
 try:
-    from semantic_acoustic_codec.callback import SampleLogConfig, SampleLogger
+    from semantic_acoustic_codec.callback import (
+        CodebookUsageLogger,
+        SampleLogConfig,
+        SampleLogger,
+    )
     from semantic_acoustic_codec.config import DecoderConfig, Route
     from semantic_acoustic_codec.datamodule import collate_codes
     from semantic_acoustic_codec.pl_module import (
@@ -702,6 +706,7 @@ def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
                     "measure_window_steps": 3,
                 },
                 "data_throughput": {"enabled": False},
+                "codebook_usage": {"enabled": False},
                 "loss_summary": {"enabled": False},
                 "loss_time_bucket": {"enabled": False},
                 "checkpoint": {
@@ -729,6 +734,39 @@ def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
         "SampleLogger",
         "ModelCheckpoint",
     ]
+
+
+def test_codebook_usage_logger_logs_target_codebooks() -> None:
+    class _LogModule:
+        def __init__(self) -> None:
+            self.logged: dict[str, Tensor] = {}
+            self.log_kwargs: dict[str, Any] = {}
+
+        def log_dict(self, values: dict[str, Tensor], **kwargs: Any) -> None:
+            self.logged.update(values)
+            self.log_kwargs = kwargs
+
+    module = _LogModule()
+    batch = _paired_batch(FakeCodec())
+    callback = CodebookUsageLogger(every_n_steps=1)
+
+    callback.on_train_batch_end(
+        cast(Any, SimpleNamespace(global_step=0, world_size=1)),
+        cast(Any, module),
+        cast(Any, None),
+        batch,
+        0,
+    )
+
+    assert "codebook/semantic/book_0/usage/perplexity" in module.logged
+    assert "codebook/acoustic/book_0/usage/perplexity" in module.logged
+    assert "codebook/acoustic/book_1/active/ratio" in module.logged
+    assert module.log_kwargs == {
+        "on_step": True,
+        "on_epoch": False,
+        "logger": True,
+        "sync_dist": False,
+    }
 
 
 def test_training_module_adds_repa_loss_with_teacher() -> None:

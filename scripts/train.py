@@ -21,6 +21,7 @@ from lightning.pytorch.callbacks import Callback
 from semantic_acoustic_codec.backend import load_backend
 from semantic_acoustic_codec.callback import (
     ArtifactExport,
+    CodebookUsageLogger,
     SampleLogConfig,
     SampleLogger,
     SemanticFrameUnits,
@@ -247,6 +248,13 @@ def _build_callbacks(
     callbacks: list[Callback] = [ArtifactExport(output_dir)]
     callbacks.extend(_loss_callbacks(callback_config))
 
+    codebook_usage_callback = _codebook_usage_callback(
+        callback_config.get("codebook_usage"),
+        trainer_log_every_n_steps=config.trainer.log_every_n_steps,
+    )
+    if codebook_usage_callback is not None:
+        callbacks.append(codebook_usage_callback)
+
     performance_callback = _performance_callback(
         performance,
         trainer_log_every_n_steps=config.trainer.log_every_n_steps,
@@ -274,6 +282,19 @@ def _build_callbacks(
     if checkpoint_callback is not None:
         callbacks.append(checkpoint_callback)
     return callbacks
+
+
+def _codebook_usage_callback(
+    config: Any,
+    *,
+    trainer_log_every_n_steps: Any,
+) -> Callback | None:
+    if config is not None and not bool(config.get("enabled", True)):
+        return None
+    usage = {} if config is None else config
+    return CodebookUsageLogger(
+        every_n_steps=int(usage.get("every_n_steps", trainer_log_every_n_steps))
+    )
 
 
 def _loss_callbacks(config: Any) -> list[Callback]:
