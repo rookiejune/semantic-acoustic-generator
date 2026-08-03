@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -34,6 +35,7 @@ class SamplingConfig:
     flow_steps: int = 16
     temperature: float = 1.0
     top_p: float = 1.0
+    cfg_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if self.flow_steps < 1:
@@ -42,6 +44,7 @@ class SamplingConfig:
             raise ValueError("temperature must be positive.")
         if not 0 < self.top_p <= 1:
             raise ValueError("top_p must be in (0, 1].")
+        _cfg_scale(self.cfg_scale)
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,7 @@ class SemanticCodecSupport(nn.Module):
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
         output_length: int | None = None,
+        cfg_scale: float | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
         prepared, frame_mask = self._semantic_input(semantic_codes, mask)
@@ -130,6 +134,15 @@ class SemanticCodecSupport(nn.Module):
         )
         if self.route is Route.RVQ:
             raise RuntimeError("RVQ feature conversion requires a codec runtime.")
+        guidance_scale = _cfg_scale(self.sampling.cfg_scale if cfg_scale is None else cfg_scale)
+        unconditional_condition = None
+        if reference_features is not None and guidance_scale != 1.0:
+            unconditional_condition = self.condition(
+                prepared,
+                mask=frame_mask,
+                reference_features=None,
+                reference_mask=None,
+            )
         target_length = self._output_length(output_length)
         target_mask = self._output_mask(frame_mask, target_length)
         features = self.generator.sample_features(
@@ -140,6 +153,8 @@ class SemanticCodecSupport(nn.Module):
             flow_steps=self.sampling.flow_steps,
             temperature=self.sampling.temperature,
             top_p=self.sampling.top_p,
+            unconditional_condition=unconditional_condition,
+            cfg_scale=guidance_scale,
             acoustic_layout=self.acoustic_layout,
             output_length=target_length,
             generator=generator,
@@ -335,6 +350,7 @@ class SemanticCodecRuntime:
         mask: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
+        cfg_scale: float | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
         output_length = self.backend.acoustic_unit_length
@@ -345,6 +361,7 @@ class SemanticCodecRuntime:
                 reference_features=reference_features,
                 reference_mask=reference_mask,
                 output_length=output_length,
+                cfg_scale=cfg_scale,
                 generator=generator,
             )
         codes = self.support.sample_acoustic_codes(
@@ -368,6 +385,7 @@ class SemanticCodecRuntime:
         mask: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
+        cfg_scale: float | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
         prepared, frame_mask = self.support._semantic_input(semantic_codes, mask)
@@ -377,6 +395,7 @@ class SemanticCodecRuntime:
             mask=frame_mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
+            cfg_scale=cfg_scale,
             generator=generator,
         )
         return self.backend.decode_features(prepared, features)
@@ -474,3 +493,12 @@ def _trim_decode_input(semantic: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
     if not torch.equal(mask, expected):
         raise ValueError("waveform decode mask must describe contiguous right padding.")
     return semantic[:, :length].contiguous(), mask[:, :length].contiguous()
+
+
+def _cfg_scale(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("cfg_scale must be a number.")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ValueError("cfg_scale must be finite and non-negative.")
+    return result

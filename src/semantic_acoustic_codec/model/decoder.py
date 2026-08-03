@@ -78,6 +78,8 @@ class CodecUnitGenerator(ABC, nn.Module):
         flow_steps: int,
         temperature: float,
         top_p: float,
+        unconditional_condition: Tensor | None = None,
+        cfg_scale: float = 1.0,
         acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
         output_length: int | None = None,
         generator: torch.Generator | None = None,
@@ -184,6 +186,8 @@ class FMFeatureGenerator(CodecUnitGenerator):
         flow_steps: int,
         temperature: float,
         top_p: float,
+        unconditional_condition: Tensor | None = None,
+        cfg_scale: float = 1.0,
         acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
         output_length: int | None = None,
         generator: torch.Generator | None = None,
@@ -195,10 +199,22 @@ class FMFeatureGenerator(CodecUnitGenerator):
             acoustic_layout=acoustic_layout,
             output_length=output_length,
         )
+        target_unconditional = None
+        if unconditional_condition is not None:
+            target_unconditional, unconditional_mask = self._target_condition(
+                unconditional_condition,
+                mask,
+                acoustic_layout=acoustic_layout,
+                output_length=output_length,
+            )
+            if not torch.equal(target_mask, unconditional_mask):
+                raise ValueError("conditional and unconditional FM masks must match.")
         features = self.core.sample(
             target_condition,
             mask=target_mask,
             steps=flow_steps,
+            unconditional_condition=target_unconditional,
+            guidance_scale=cfg_scale,
             generator=generator,
         )
         return features * feature_std + feature_mean
@@ -363,11 +379,22 @@ class RVQCodeGenerator(CodecUnitGenerator):
         flow_steps: int,
         temperature: float,
         top_p: float,
+        unconditional_condition: Tensor | None = None,
+        cfg_scale: float = 1.0,
         acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
         output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        del feature_mean, feature_std, flow_steps, temperature, top_p, generator
+        del (
+            feature_mean,
+            feature_std,
+            flow_steps,
+            temperature,
+            top_p,
+            unconditional_condition,
+            cfg_scale,
+            generator,
+        )
         raise RuntimeError("RVQ feature conversion requires a codec runtime.")
 
     @torch.no_grad()

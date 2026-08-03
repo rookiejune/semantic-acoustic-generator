@@ -72,6 +72,7 @@ class EvalRuntime:
         mask: torch.Tensor | None = None,
         reference_features: torch.Tensor | None = None,
         reference_mask: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         if generator is None:
@@ -83,6 +84,7 @@ class EvalRuntime:
                 "mask": mask,
                 "reference_features": reference_features,
                 "reference_mask": reference_mask,
+                "cfg_scale": cfg_scale,
             }
         )
         noise = torch.rand(
@@ -116,6 +118,7 @@ def test_eval_artifact_generates_seeded_pair_metrics() -> None:
         batch,
         device=torch.device("cpu"),
         seed=13,
+        cfg_scale=2.5,
     )
 
     assert len(runtime.calls) == 2
@@ -123,6 +126,7 @@ def test_eval_artifact_generates_seeded_pair_metrics() -> None:
     assert torch.equal(runtime.calls[0]["generator_state"], runtime.calls[1]["generator_state"])
     assert runtime.calls[0]["reference_features"] is None
     assert runtime.calls[0]["reference_mask"] is None
+    assert runtime.calls[0]["cfg_scale"] is None
     reference_acoustic = batch.reference_acoustic_codes
     reference_acoustic_mask = batch.reference_acoustic_mask
     assert reference_acoustic is not None
@@ -135,6 +139,7 @@ def test_eval_artifact_generates_seeded_pair_metrics() -> None:
         cast(torch.Tensor, runtime.calls[1]["reference_mask"]),
         reference_acoustic_mask,
     )
+    assert runtime.calls[1]["cfg_scale"] == 2.5
     target = batch.acoustic_codes.float()
     expected_without = float((runtime.generated[0] - target).pow(2).mean())
     expected_with = float((runtime.generated[1] - target).pow(2).mean())
@@ -202,6 +207,7 @@ def test_eval_artifact_main_loads_cross_text_pair(
         overlong="error",
         device="cpu",
         seed=5,
+        cfg_scale=3.0,
         output_json=None,
         include_private_metadata=False,
         without_reference_wav=None,
@@ -242,6 +248,7 @@ def test_eval_artifact_main_loads_cross_text_pair(
     result = json.loads(capsys.readouterr().out)
     assert result["artifact"] == "artifact"
     assert result["data_root"] is None
+    assert result["cfg_scale"] == 3.0
     assert result["pair"]["target_index"] == 0
     assert "target_utterance_id" not in result["pair"]
     assert "reference_utterance_id" not in result["pair"]
@@ -275,6 +282,7 @@ def test_eval_artifact_can_include_private_metadata(
         overlong="error",
         device="cpu",
         seed=5,
+        cfg_scale=1.0,
         output_json=None,
         include_private_metadata=True,
         without_reference_wav=None,

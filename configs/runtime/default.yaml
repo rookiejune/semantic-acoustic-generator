@@ -4,3 +4,4 @@ sampling:
   flow_steps: 16
   temperature: 1.0
   top_p: 1.0
+  cfg_scale: 1.0

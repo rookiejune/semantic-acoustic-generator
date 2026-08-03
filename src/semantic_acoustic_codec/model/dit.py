@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -74,6 +75,8 @@ class DiTDecoder(nn.Module):
         *,
         mask: Tensor | None = None,
         steps: int = 16,
+        unconditional_condition: Tensor | None = None,
+        guidance_scale: float = 1.0,
         generator: torch.Generator | None = None,
     ) -> Tensor:
         if steps < 1:
@@ -82,6 +85,17 @@ class DiTDecoder(nn.Module):
             raise ValueError("condition must have shape [B, F, C].")
         if mask is not None and (mask.shape != condition.shape[:2] or mask.dtype != torch.bool):
             raise ValueError("flow sample mask must be boolean with shape [B, F].")
+        if isinstance(guidance_scale, bool) or not isinstance(guidance_scale, (int, float)):
+            raise TypeError("guidance_scale must be a number.")
+        if not math.isfinite(guidance_scale) or guidance_scale < 0:
+            raise ValueError("guidance_scale must be finite and non-negative.")
+        if unconditional_condition is not None:
+            if unconditional_condition.shape != condition.shape:
+                raise ValueError("unconditional_condition must match condition shape.")
+            if unconditional_condition.device != condition.device:
+                raise ValueError("unconditional_condition must use the same device as condition.")
+            if unconditional_condition.dtype != condition.dtype:
+                raise TypeError("unconditional_condition must use the same dtype as condition.")
         latent = torch.randn(
             (*condition.shape[:2], self.decoder.latent_dim),
             device=condition.device,
@@ -89,10 +103,22 @@ class DiTDecoder(nn.Module):
             generator=generator,
         )
         condition_state = self.decoder.prepare_condition(condition)
+        use_guidance = unconditional_condition is not None and guidance_scale != 1.0
+        unconditional_state = (
+            self.decoder.prepare_condition(unconditional_condition) if use_guidance else None
+        )
         dt = 1.0 / steps
         for index in range(steps):
             t = condition.new_full((condition.size(0),), (index + 0.5) * dt)
             velocity = self.decoder(latent, t, condition_state=condition_state, mask=mask)
+            if unconditional_state is not None:
+                unconditional = self.decoder(
+                    latent,
+                    t,
+                    condition_state=unconditional_state,
+                    mask=mask,
+                )
+                velocity = unconditional + guidance_scale * (velocity - unconditional)
             latent = latent + dt * velocity
             if mask is not None:
                 latent = latent.masked_fill(~mask[..., None], 0)

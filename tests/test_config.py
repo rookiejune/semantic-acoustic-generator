@@ -52,6 +52,7 @@ def test_root_has_no_legacy_flat_training_groups() -> None:
     assert config.seed == 0
     assert config.datamodule.fixed_batch is False
     assert config.pl_module.reference_dropout == 0.5
+    assert config.runtime.sampling.cfg_scale == 1.0
     assert config.callback.checkpoint.enabled is True
     assert config.callback.performance.profile_flops is False
     assert config.callback.data_throughput.enabled is True
@@ -64,6 +65,7 @@ def test_train_config_parses_to_typed_entry_schema() -> None:
     assert config.model.route is Route.FM
     assert config.model.decoder.rvq_predictor is RVQPredictor.MTP
     assert config.datamodule.fixed_batch is False
+    assert config.runtime.sampling.cfg_scale == 1.0
     assert config.output_subdir == "longcat/fm-8l/codec"
 
 

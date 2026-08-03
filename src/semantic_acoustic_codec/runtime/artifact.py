@@ -355,6 +355,7 @@ def _config(data: Mapping[str, Any]) -> SemanticSupportConfig:
             flow_steps=int(sampling["flow_steps"]),
             temperature=float(sampling["temperature"]),
             top_p=float(sampling["top_p"]),
+            cfg_scale=float(sampling.get("cfg_scale", 1.0)),
         ),
         feature_mean=_float_tuple(data.get("feature_mean")),
         feature_std=_float_tuple(data.get("feature_std")),

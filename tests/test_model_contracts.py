@@ -130,6 +130,46 @@ def test_fm_loss_and_sample_shapes() -> None:
     assert torch.equal(sample[1, 2:], torch.zeros_like(sample[1, 2:]))
 
 
+def test_fm_sample_applies_classifier_free_guidance() -> None:
+    class GuidanceProbe(torch.nn.Module):
+        latent_dim = 2
+
+        def prepare_condition(self, condition: torch.Tensor) -> torch.Tensor:
+            return condition
+
+        def forward(
+            self,
+            latent: torch.Tensor,
+            t: torch.Tensor,
+            *,
+            condition_state: torch.Tensor | None = None,
+            mask: torch.Tensor | None = None,
+            validate: bool = True,
+        ) -> torch.Tensor:
+            del latent, t, mask, validate
+            if condition_state is None:
+                raise AssertionError("condition_state is required")
+            return condition_state
+
+    decoder = DiTDecoder(2, 2, layers=1, heads=1, ffn_ratio=2)
+    decoder.decoder = GuidanceProbe()
+    condition = torch.tensor([[[3.0, 5.0], [7.0, 11.0]]])
+    unconditional = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    seed = 37
+
+    sample = decoder.sample(
+        condition,
+        steps=1,
+        unconditional_condition=unconditional,
+        guidance_scale=1.5,
+        generator=torch.Generator().manual_seed(seed),
+    )
+    initial = torch.randn(condition.shape, generator=torch.Generator().manual_seed(seed))
+    expected = initial + unconditional + 1.5 * (condition - unconditional)
+
+    assert torch.allclose(sample, expected)
+
+
 def test_reference_conditioner_uses_explicit_and_null_reference() -> None:
     conditioner = ReferenceConditioner(feature_dim=4, condition_dim=6)
     features = torch.randn(2, 3, 4)

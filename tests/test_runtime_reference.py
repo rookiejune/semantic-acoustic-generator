@@ -62,6 +62,8 @@ class SeededGenerator(nn.Module):
         self.feature_dim = feature_dim
         self.codebook_size = codebook_size
         self.conditions: list[torch.Tensor] = []
+        self.unconditional_conditions: list[torch.Tensor | None] = []
+        self.cfg_scales: list[float] = []
 
     def sample_features(
         self,
@@ -73,6 +75,8 @@ class SeededGenerator(nn.Module):
         flow_steps: int,
         temperature: float,
         top_p: float,
+        unconditional_condition: torch.Tensor | None = None,
+        cfg_scale: float = 1.0,
         acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
         output_length: int | None = None,
         generator: torch.Generator | None = None,
@@ -80,13 +84,23 @@ class SeededGenerator(nn.Module):
         del feature_mean, feature_std, flow_steps, temperature, top_p
         _validate_frame_aligned(condition, mask, acoustic_layout, output_length)
         self.conditions.append(condition.detach().clone())
+        self.unconditional_conditions.append(
+            None
+            if unconditional_condition is None
+            else unconditional_condition.detach().clone()
+        )
+        self.cfg_scales.append(float(cfg_scale))
         noise = torch.randn(
             (*condition.shape[:2], self.feature_dim),
             device=condition.device,
             dtype=condition.dtype,
             generator=generator,
         )
-        return condition[..., : self.feature_dim] + noise
+        base = condition[..., : self.feature_dim]
+        if unconditional_condition is not None:
+            unconditional = unconditional_condition[..., : self.feature_dim]
+            base = unconditional + cfg_scale * (base - unconditional)
+        return base + noise
 
     def sample_acoustic_codes(
         self,
@@ -179,6 +193,38 @@ def test_support_and_runtime_accept_optional_reference() -> None:
     assert not torch.allclose(decoded_without, decoded_with)
 
 
+def test_fm_support_applies_cfg_against_null_reference() -> None:
+    semantic = torch.tensor([[[1], [2], [3]]], dtype=torch.long)
+    semantic_mask = torch.ones(1, 3, dtype=torch.bool)
+    reference = torch.tensor(
+        [[[1.0, 0.0, -1.0, 2.0], [0.0, 2.0, 1.0, -2.0]]],
+    )
+    reference_mask = torch.tensor([[True, True]])
+    support, generator = _support(Route.FM, sampling=SamplingConfig(flow_steps=1, cfg_scale=2.0))
+
+    guided = support.sample_features(
+        semantic,
+        mask=semantic_mask,
+        reference_features=reference,
+        reference_mask=reference_mask,
+        generator=_generator(),
+    )
+    conditional = generator.conditions[-1]
+    unconditional = generator.unconditional_conditions[-1]
+    cfg_scale = generator.cfg_scales[-1]
+    without = support.sample_features(
+        semantic,
+        mask=semantic_mask,
+        reference_features=None,
+        reference_mask=None,
+        generator=_generator(),
+    )
+
+    assert unconditional is not None
+    assert cfg_scale == 2.0
+    assert torch.allclose(guided - without, cfg_scale * (conditional - unconditional))
+
+
 def test_support_acoustic_sampling_accepts_optional_reference() -> None:
     semantic = torch.tensor([[[1], [2], [3]]], dtype=torch.long)
     semantic_mask = torch.ones(1, 3, dtype=torch.bool)
@@ -259,6 +305,7 @@ def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
     assert data["backend"]["frame_rate"] == backend.frame_rate
     assert data["backend"]["semantic_frame_rate"] == backend.semantic_frame_rate
     assert data["config"]["decoder"]["rvq_predictor"] == RVQPredictor.MTP.value
+    assert data["config"]["sampling"]["cfg_scale"] == 1.0
 
     captured: list[SemanticSupportConfig] = []
     original = runtime_semantic.build_support
@@ -272,6 +319,7 @@ def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
 
     assert len(captured) == 1
     assert captured[0].decoder.rvq_predictor is RVQPredictor.MTP
+    assert captured[0].sampling.cfg_scale == 1.0
     assert loaded.acoustic_layout is AcousticLayout.FRAME_ALIGNED
     assert loaded.acoustic_unit_length is None
     assert loaded.state_dict().keys() == support.state_dict().keys()
@@ -304,7 +352,46 @@ def test_schema_seven_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
         load_artifact(tmp_path)
 
 
-def _support(route: Route) -> tuple[SemanticCodecSupport, SeededGenerator]:
+def test_schema_seven_artifact_defaults_missing_cfg_scale(tmp_path, monkeypatch) -> None:
+    backend = FakeBackend()
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=4,
+        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        sampling=SamplingConfig(flow_steps=1),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        acoustic_feature_dim=backend.acoustic_feature_dim,
+        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+    )
+    save_artifact(tmp_path, support, config, backend=backend)
+
+    config_path = tmp_path / "codec.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    del data["config"]["sampling"]["cfg_scale"]
+    config_path.write_text(json.dumps(data), encoding="utf-8")
+
+    captured: list[SemanticSupportConfig] = []
+    original = runtime_semantic.build_support
+
+    def capture(options: SemanticSupportConfig, **kwargs: Any) -> SemanticCodecSupport:
+        captured.append(options)
+        return original(options, **kwargs)
+
+    monkeypatch.setattr(runtime_semantic, "build_support", capture)
+    load_artifact(tmp_path)
+
+    assert len(captured) == 1
+    assert captured[0].sampling.cfg_scale == 1.0
+
+
+def _support(
+    route: Route,
+    *,
+    sampling: SamplingConfig | None = None,
+) -> tuple[SemanticCodecSupport, SeededGenerator]:
     backend = FakeBackend()
     generator = SeededGenerator(backend.acoustic_feature_dim, backend.acoustic_codebook_sizes[0])
     reference = ReferenceConditioner(backend.acoustic_feature_dim, condition_dim=4)
@@ -322,7 +409,7 @@ def _support(route: Route) -> tuple[SemanticCodecSupport, SeededGenerator]:
     support = SemanticCodecSupport(
         modules,
         backend.acoustic_feature_dim,
-        sampling=SamplingConfig(flow_steps=1),
+        sampling=SamplingConfig(flow_steps=1) if sampling is None else sampling,
     )
     return support, generator
 

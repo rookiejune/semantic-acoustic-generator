@@ -58,6 +58,7 @@ def main() -> None:
         batch,
         device=device,
         seed=args.seed,
+        cfg_scale=args.cfg_scale,
     )
     result = _summary(
         audio,
@@ -115,6 +116,12 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--overlong", choices=("error", "filter", "truncate"), default="error")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=1.0,
+        help="Classifier-free guidance scale for with-reference FM sampling.",
+    )
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument(
         "--include-private-metadata",
@@ -155,6 +162,7 @@ def _evaluate(
     *,
     device: torch.device,
     seed: int,
+    cfg_scale: float = 1.0,
 ) -> tuple[dict[str, Tensor], dict[str, float]]:
     if not batch.has_reference or len(batch.metadata) != 1:
         raise ValueError("artifact evaluation requires one cross-text target/reference pair.")
@@ -186,6 +194,7 @@ def _evaluate(
         mask=semantic_mask,
         reference_features=reference_features,
         reference_mask=reference_acoustic_mask,
+        cfg_scale=cfg_scale,
         generator=_generator(device=device, seed=seed),
     )
     without_mse = _feature_mse(without_features, target_features, acoustic_mask)
@@ -251,6 +260,7 @@ def _summary(
         "data_source": str(args.data_source),
         "sample_index": int(args.sample_index),
         "sample_rate": sample_rate,
+        "cfg_scale": float(args.cfg_scale),
         "target_semantic_shape": list(batch.semantic_codes.shape),
         "target_acoustic_shape": list(batch.acoustic_codes.shape),
         "reference_semantic_shape": list(reference_semantic.shape),

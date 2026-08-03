@@ -199,6 +199,7 @@ def _support_config(
             flow_steps=sampling.flow_steps,
             temperature=sampling.temperature,
             top_p=sampling.top_p,
+            cfg_scale=sampling.cfg_scale,
         ),
     )
 
