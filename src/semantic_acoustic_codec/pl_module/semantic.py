@@ -128,6 +128,8 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
             feature_std=self.support.feature_std,
             repa_teacher=self.repa_teacher,
         )
+        if not bool(torch.isfinite(output.loss.detach()).all()):
+            raise FloatingPointError(f"{output.primary} training loss is non-finite.")
 
         live: dict[str, Any] = {
             f"{name}_loss": item.loss.mean() for name, item in output.items.items()

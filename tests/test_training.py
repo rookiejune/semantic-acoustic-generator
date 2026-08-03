@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -304,6 +305,31 @@ def test_training_module_trains_and_exports_artifact(tmp_path) -> None:
         2,
         backend.acoustic_feature_dim,
     )
+
+
+def test_training_module_rejects_non_finite_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = FakeCodec()
+    batch = collate_codes(
+        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
+        semantic_pad_id=backend.semantic_codebook.size(0),
+        acoustic_pad_ids=backend.acoustic_codebook_sizes,
+    )
+    config = SemanticSupportConfig(
+        route=Route.FM,
+        condition_dim=10,
+        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+    )
+    module = build_module(backend, config, batch, normalize_features=True)
+    loss = module.support.generator.loss
+
+    def non_finite_loss(*args: Any, **kwargs: Any):
+        output = loss(*args, **kwargs)
+        return replace(output, loss=output.loss.new_full((), float("nan")))
+
+    monkeypatch.setattr(module.support.generator, "loss", non_finite_loss)
+
+    with pytest.raises(FloatingPointError, match="flow training loss is non-finite"):
+        module.training_step(batch, 0)
 
 
 def test_training_checkpoint_drops_backend_and_requires_support_state() -> None:
