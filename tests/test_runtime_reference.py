@@ -11,6 +11,8 @@ from torch import nn
 import semantic_acoustic_generator.runtime.semantic as runtime_semantic
 from semantic_acoustic_generator.config import (
     DecoderConfig,
+    FeatureAdapter,
+    FMMode,
     Route,
     RVQPredictor,
 )
@@ -58,6 +60,7 @@ def test_sampling_config_rejects_non_finite_fields(field: str, value: float) -> 
         ("seed", True, "seed must be an integer"),
         ("seed", "0", "seed must be an integer"),
         ("sampling", object(), "sampling must be a SamplingConfig"),
+        ("feature_adapter", "none", "feature_adapter must be a FeatureAdapter"),
     ],
 )
 def test_semantic_support_config_rejects_invalid_field_types(
@@ -418,6 +421,7 @@ def test_schema_eight_artifact_roundtrip_preserves_decoder_fields(
     assert data["backend"]["frame_rate"] == backend.frame_rate
     assert data["backend"]["semantic_frame_rate"] == backend.semantic_frame_rate
     assert data["config"]["decoder"]["rvq_predictor"] == RVQPredictor.MTP.value
+    assert data["config"]["feature_adapter"] == FeatureAdapter.NONE.value
     assert data["config"]["sampling"]["cfg_scale"] == 1.0
 
     captured: list[GeneratorConfig] = []
@@ -432,6 +436,7 @@ def test_schema_eight_artifact_roundtrip_preserves_decoder_fields(
 
     assert len(captured) == 1
     assert captured[0].decoder.rvq_predictor is RVQPredictor.MTP
+    assert captured[0].feature_adapter is FeatureAdapter.NONE
     assert captured[0].sampling.cfg_scale == 1.0
     assert loaded.acoustic_layout is AcousticLayout.FRAME_ALIGNED
     assert loaded.acoustic_unit_length is None
@@ -464,6 +469,42 @@ def test_schema_seven_artifact_remains_readable(tmp_path) -> None:
 
     for key, value in support.state_dict().items():
         assert torch.equal(loaded.state_dict()[key], value)
+
+
+def test_early_schema_eight_artifact_defaults_new_fm_fields(tmp_path) -> None:
+    backend = FakeBackend()
+    config = GeneratorConfig(
+        route=Route.FM,
+        condition_dim=4,
+        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        sampling=SamplingConfig(flow_steps=1),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        codec_spec=semantic_acoustic_spec(backend),
+    )
+    save_artifact(tmp_path, support, backend=backend)
+    path = tmp_path / "generator.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    del data["config"]["feature_adapter"]
+    for key in (
+        "fm_mode",
+        "anchor_hidden_dim",
+        "anchor_layers",
+        "anchor_kernel_size",
+        "anchor_cosine_weight",
+        "anchor_factor_weight",
+        "anchor_factor_temperature",
+    ):
+        del data["config"]["decoder"][key]
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = load_artifact(tmp_path)
+
+    assert loaded.config is not None
+    assert loaded.config.feature_adapter is FeatureAdapter.NONE
+    assert loaded.config.decoder.fm_mode is FMMode.FLOW
 
 
 def test_schema_eight_artifact_rejects_missing_decoder_fields(tmp_path) -> None:

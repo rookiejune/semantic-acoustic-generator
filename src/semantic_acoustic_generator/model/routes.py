@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from anytrain.codec import AcousticLayout
 
-from semantic_acoustic_generator.config import DecoderConfig, Initialization, Route
+from semantic_acoustic_generator.config import DecoderConfig, FMMode, Initialization, Route
 from semantic_acoustic_generator.model.condition import ReferenceConditioner, SemanticConditioner
 from semantic_acoustic_generator.model.decoder import (
     AcousticUnitGenerator,
@@ -51,6 +51,8 @@ def build_route(
             raise ValueError("frame-aligned routes must not set acoustic_unit_length.")
         fixed_length = None
     options = DecoderConfig() if decoder is None else decoder
+    if route is not Route.FM and options.fm_mode is not FMMode.FLOW:
+        raise ValueError("fm_mode is only supported by the FM route.")
     conditioner = SemanticConditioner(
         semantic_codebook,
         condition_dim=condition_dim,

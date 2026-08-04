@@ -13,8 +13,10 @@ from anytrain.codec import (
 from torch import Tensor, nn
 
 from semantic_acoustic_generator._tensor import is_signed_integer_dtype
+from semantic_acoustic_generator.backend import adapt_backend
 from semantic_acoustic_generator.config import (
     DecoderConfig,
+    FeatureAdapter,
     Initialization,
     Route,
 )
@@ -63,6 +65,7 @@ class GeneratorConfig:
     initialization: Initialization = Initialization.CODEC
     seed: int = 0
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    feature_adapter: FeatureAdapter = FeatureAdapter.NONE
     feature_mean: tuple[float, ...] | None = None
     feature_std: tuple[float, ...] | None = None
 
@@ -77,8 +80,12 @@ class GeneratorConfig:
         _integer(self.seed, name="seed")
         if not isinstance(self.sampling, SamplingConfig):
             raise TypeError("sampling must be a SamplingConfig.")
+        if not isinstance(self.feature_adapter, FeatureAdapter):
+            raise TypeError("feature_adapter must be a FeatureAdapter.")
         if self.condition_dim <= 0:
             raise ValueError("condition_dim must be positive.")
+        if self.feature_adapter is not FeatureAdapter.NONE and self.route is not Route.FM:
+            raise ValueError("feature_adapter requires the FM route.")
         if (self.feature_mean is None) != (self.feature_std is None):
             raise ValueError("feature_mean and feature_std must be set together.")
         if self.feature_mean is None or self.feature_std is None:
@@ -424,12 +431,17 @@ class GeneratorRuntime:
         backend: SemanticAcousticCodec,
     ) -> None:
         self.support = support
-        self.backend = backend
+        adapter = (
+            FeatureAdapter.NONE
+            if support.config is None
+            else support.config.feature_adapter
+        )
+        self.backend = adapt_backend(backend, adapter)
         metadata = support.artifact_backend_metadata
         if metadata is None:
-            validate_support_metadata(support_metadata(support), backend)
+            validate_support_metadata(support_metadata(support), self.backend)
         else:
-            validate_backend_metadata(metadata, backend)
+            validate_backend_metadata(metadata, self.backend)
 
     @property
     def sample_rate(self) -> int:

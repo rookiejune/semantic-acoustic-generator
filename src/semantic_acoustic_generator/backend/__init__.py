@@ -1,3 +1,7 @@
+from semantic_acoustic_generator.backend.adapter import (
+    LongCatFirstCodebookAdapter,
+    adapt_backend,
+)
 from semantic_acoustic_generator.backend.config import BackendConfig
 from semantic_acoustic_generator.backend.loader import load_backend
 from semantic_acoustic_generator.backend.longcat import (
@@ -11,6 +15,8 @@ from semantic_acoustic_generator.backend.longcat import (
 __all__ = [
     "BackendConfig",
     "LONGCAT_CODEBOOK_SIZES",
+    "LongCatFirstCodebookAdapter",
+    "adapt_backend",
     "batch_codes",
     "batch_samples",
     "codes",

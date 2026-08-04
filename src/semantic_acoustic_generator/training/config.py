@@ -13,6 +13,8 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from semantic_acoustic_generator.backend import BackendConfig
 from semantic_acoustic_generator.config import (
     DecoderConfig,
+    FeatureAdapter,
+    FMMode,
     Initialization,
     Route,
     RVQPredictor,
@@ -38,12 +40,15 @@ class ModelConfig:
     route: Route = Route.FM
     condition_dim: int = 1024
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    feature_adapter: FeatureAdapter = FeatureAdapter.NONE
 
     def __post_init__(self) -> None:
         if isinstance(self.condition_dim, bool) or not isinstance(self.condition_dim, int):
             raise TypeError("model.condition_dim must be an integer.")
         if self.condition_dim <= 0:
             raise ValueError("model.condition_dim must be positive.")
+        if not isinstance(self.feature_adapter, FeatureAdapter):
+            raise TypeError("model.feature_adapter must be a FeatureAdapter.")
 
 
 @dataclass(frozen=True)
@@ -308,6 +313,28 @@ class TrainConfig:
         _validate_output_subdir(self.output_subdir)
         if self.loss.repa_loss_weight > 0 and self.model.route is not Route.FM:
             raise ValueError("REPA requires model.route=fm.")
+        if (
+            self.model.feature_adapter is not FeatureAdapter.NONE
+            and self.model.route is not Route.FM
+        ):
+            raise ValueError("model.feature_adapter requires model.route=fm.")
+        if (
+            self.model.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
+            and self.backend.name != "longcat"
+        ):
+            raise ValueError(
+                "model.feature_adapter=longcat_first_codebook requires backend=longcat."
+            )
+        if (
+            self.model.decoder.fm_mode is not FMMode.FLOW
+            and self.model.feature_adapter is not FeatureAdapter.LONGCAT_FIRST_CODEBOOK
+        ):
+            raise ValueError(
+                "model.decoder.fm_mode=anchor|residual requires "
+                "model.feature_adapter=longcat_first_codebook."
+            )
+        if self.model.route is not Route.FM and self.model.decoder.fm_mode is not FMMode.FLOW:
+            raise ValueError("model.decoder.fm_mode is only supported by model.route=fm.")
 
 
 def parse_train_config(config: DictConfig | TrainConfig) -> TrainConfig:
@@ -343,11 +370,17 @@ def _prepare(config: DictConfig) -> DictConfig:
         route = model.get("route")
         if route is not None:
             model.route = _enum_name(Route, route)
+        feature_adapter = model.get("feature_adapter")
+        if feature_adapter is not None:
+            model.feature_adapter = _enum_name(FeatureAdapter, feature_adapter)
         decoder = model.get("decoder")
         if isinstance(decoder, DictConfig):
             predictor = decoder.get("rvq_predictor")
             if predictor is not None:
                 decoder.rvq_predictor = _enum_name(RVQPredictor, predictor)
+            fm_mode = decoder.get("fm_mode")
+            if fm_mode is not None:
+                decoder.fm_mode = _enum_name(FMMode, fm_mode)
     runtime = result.get("runtime")
     if isinstance(runtime, DictConfig):
         initialization = runtime.get("initialization")

@@ -202,6 +202,7 @@ def test_eval_artifact_main_loads_cross_text_pair(
     backend = EvalBackend(AcousticLayout.FRAME_ALIGNED)
     batch = _pair(AcousticLayout.FRAME_ALIGNED)
     runtime = EvalRuntime(units=batch.acoustic_codes.size(1))
+    runtime.backend = backend
     loaded: dict[str, Any] = {}
     args = argparse.Namespace(
         artifact=tmp_path / "artifact",
@@ -278,6 +279,7 @@ def test_eval_artifact_can_include_private_metadata(
     backend = EvalBackend(AcousticLayout.FRAME_ALIGNED)
     batch = _pair(AcousticLayout.FRAME_ALIGNED)
     runtime = EvalRuntime(units=batch.acoustic_codes.size(1))
+    runtime.backend = backend
     args = argparse.Namespace(
         artifact=tmp_path / "artifact",
         codec="longcat",

@@ -14,6 +14,7 @@ from anytrain.codec import (
 from anytrain.lightning import LightningLogMixin
 from lightning import LightningModule
 
+from semantic_acoustic_generator.backend import LongCatFirstCodebookAdapter, adapt_backend
 from semantic_acoustic_generator.config import Route
 from semantic_acoustic_generator.loss.repa import decode_group_metrics
 from semantic_acoustic_generator.model.decoder import FMFeatureGenerator, RVQCodeGenerator
@@ -161,6 +162,8 @@ class GeneratorModule(LightningLogMixin, LightningModule):
                 feature_mean=self.support.feature_mean,
                 feature_std=self.support.feature_std,
                 repa_teacher=self.repa_teacher,
+                factor_targets=self._factor_targets(batch),
+                factor_codebooks=self._factor_codebooks(),
             )
         else:
             generator = self.support.generator
@@ -487,6 +490,17 @@ class GeneratorModule(LightningLogMixin, LightningModule):
             self.backend, codes, mask, validate=False
         )
 
+    @torch.no_grad()
+    def _factor_targets(self, batch: GeneratorBatch) -> Tensor | None:
+        if not isinstance(self.backend, LongCatFirstCodebookAdapter):
+            return None
+        return self.backend.factor_codes(batch.acoustic_codes)
+
+    def _factor_codebooks(self) -> tuple[Tensor, Tensor] | None:
+        if not isinstance(self.backend, LongCatFirstCodebookAdapter):
+            return None
+        return self.backend.factor_codebooks
+
 
 @torch.no_grad()
 def build_module(
@@ -504,6 +518,7 @@ def build_module(
     finite_loss_check_interval: int = 100,
     repa_teacher: Teacher | None = None,
 ) -> GeneratorModule:
+    backend = adapt_backend(backend, config.feature_adapter)
     if normalize_features and config.route is not Route.RVQ:
         if (feature_mean is None) != (feature_std is None):
             raise ValueError("feature_mean and feature_std must be provided together.")

@@ -257,6 +257,63 @@ class FixedLengthConditioner(nn.Module):
         return cache[:length]
 
 
+class AlignedAnchor(nn.Module):
+    """Predict one acoustic feature per semantic frame from bounded local context."""
+
+    def __init__(
+        self,
+        condition_dim: int,
+        feature_dim: int,
+        *,
+        hidden_dim: int,
+        layers: int,
+        kernel_size: int,
+    ) -> None:
+        super().__init__()
+        if min(condition_dim, feature_dim, hidden_dim, layers) <= 0:
+            raise ValueError("aligned anchor dimensions and layers must be positive.")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("aligned anchor kernel_size must be a positive odd integer.")
+        self.input = nn.Linear(condition_dim, hidden_dim)
+        self.blocks = nn.ModuleList(
+            [_AlignedAnchorBlock(hidden_dim, kernel_size=kernel_size) for _ in range(layers)]
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.output = nn.Linear(hidden_dim, feature_dim)
+
+    def forward(self, condition: Tensor, mask: Tensor) -> Tensor:
+        if condition.dim() != 3 or mask.shape != condition.shape[:2]:
+            raise ValueError("aligned anchor condition and mask must align on [batch, frame].")
+        if mask.dtype != torch.bool:
+            raise TypeError("aligned anchor mask must be boolean.")
+        hidden = self.input(condition).masked_fill(~mask[..., None], 0)
+        for block in self.blocks:
+            hidden = block(hidden, mask)
+        return self.output(self.norm(hidden)).masked_fill(~mask[..., None], 0)
+
+
+class _AlignedAnchorBlock(nn.Module):
+    def __init__(self, hidden_dim: int, *, kernel_size: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.local = nn.Conv1d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=hidden_dim,
+        )
+        self.gate = nn.Linear(hidden_dim, hidden_dim * 2)
+        self.output = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, hidden: Tensor, mask: Tensor) -> Tensor:
+        value = self.norm(hidden).transpose(1, 2).contiguous()
+        value = self.local(value).transpose(1, 2).contiguous()
+        activation, gate = self.gate(value).chunk(2, dim=-1)
+        value = self.output(torch.nn.functional.silu(activation) * gate.sigmoid())
+        return (hidden + value).masked_fill(~mask[..., None], 0)
+
+
 def repeat_condition(condition: Tensor, spans: Tensor, *, frames: int | None) -> Tensor:
     if condition.dim() != 3 or spans.dim() != 2:
         raise ValueError("condition and spans must have shapes [B, T, D] and [B, T].")

@@ -15,8 +15,11 @@ from anytrain.codec import (
 )
 from torch import Tensor
 
+from semantic_acoustic_generator.backend import adapt_backend
 from semantic_acoustic_generator.config import (
     DecoderConfig,
+    FeatureAdapter,
+    FMMode,
     Initialization,
     Route,
     RVQPredictor,
@@ -77,6 +80,7 @@ class AcousticGeneratorSpec:
 
     route: Route
     condition_dim: int
+    feature_adapter: FeatureAdapter
     decoder: DecoderConfig
     backend_name: str
     sample_rate: int
@@ -93,7 +97,10 @@ class AcousticGeneratorSpec:
     sampling: SamplingConfig
 
     def validate_backend(self, backend: SemanticAcousticCodec) -> None:
-        validate_backend_metadata(self.backend_metadata(), backend)
+        validate_backend_metadata(
+            self.backend_metadata(),
+            adapt_backend(backend, self.feature_adapter),
+        )
 
     def validate_acoustic_backend(self, backend: AcousticGeneratorBackend) -> None:
         _validate_acoustic_backend_metadata(self.acoustic_backend_metadata(), backend)
@@ -135,6 +142,7 @@ def save_artifact(
     artifact_config = support.config
     if artifact_config is None:
         raise ValueError("artifact support must expose its construction config.")
+    backend = adapt_backend(backend, artifact_config.feature_adapter)
     _validate_support_runtime_config(support, artifact_config)
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
@@ -177,6 +185,7 @@ def load_generator_artifact(
     spec = AcousticGeneratorSpec(
         route=config.route,
         condition_dim=config.condition_dim,
+        feature_adapter=config.feature_adapter,
         decoder=config.decoder,
         backend_name=_metadata_string(metadata, "name"),
         sample_rate=codec_spec.sample_rate,
@@ -361,9 +370,11 @@ def _load_state(path: Path) -> Mapping[str, Tensor]:
 def _config_dict(config: GeneratorConfig) -> dict[str, object]:
     data = asdict(config)
     data["route"] = config.route.value
+    data["feature_adapter"] = config.feature_adapter.value
     data["initialization"] = config.initialization.value
     decoder = cast(dict[str, object], data["decoder"])
     decoder["rvq_predictor"] = config.decoder.rvq_predictor.value
+    decoder["fm_mode"] = config.decoder.fm_mode.value
     return cast(dict[str, object], data)
 
 
@@ -375,6 +386,14 @@ def _config(data: Mapping[str, object]) -> GeneratorConfig:
     return GeneratorConfig(
         route=Route(_schema_string(data, "route", owner="config")),
         condition_dim=_schema_int(data, "condition_dim", owner="config"),
+        feature_adapter=FeatureAdapter(
+            _schema_optional_string(
+                data,
+                "feature_adapter",
+                owner="config",
+                default=FeatureAdapter.NONE.value,
+            )
+        ),
         decoder=DecoderConfig(
             hidden_dim=_schema_optional_int(decoder, "hidden_dim", owner="decoder"),
             layers=_schema_int(decoder, "layers", owner="decoder"),
@@ -397,6 +416,50 @@ def _config(data: Mapping[str, object]) -> GeneratorConfig:
                 decoder,
                 "repa_loss_weight",
                 owner="decoder",
+            ),
+            fm_mode=FMMode(
+                _schema_optional_string(
+                    decoder,
+                    "fm_mode",
+                    owner="decoder",
+                    default=FMMode.FLOW.value,
+                )
+            ),
+            anchor_hidden_dim=_schema_optional_int_default(
+                decoder,
+                "anchor_hidden_dim",
+                owner="decoder",
+                default=512,
+            ),
+            anchor_layers=_schema_optional_int_default(
+                decoder,
+                "anchor_layers",
+                owner="decoder",
+                default=4,
+            ),
+            anchor_kernel_size=_schema_optional_int_default(
+                decoder,
+                "anchor_kernel_size",
+                owner="decoder",
+                default=3,
+            ),
+            anchor_cosine_weight=_schema_optional_float(
+                decoder,
+                "anchor_cosine_weight",
+                owner="decoder",
+                default=0.1,
+            ),
+            anchor_factor_weight=_schema_optional_float(
+                decoder,
+                "anchor_factor_weight",
+                owner="decoder",
+                default=0.1,
+            ),
+            anchor_factor_temperature=_schema_optional_float(
+                decoder,
+                "anchor_factor_temperature",
+                owner="decoder",
+                default=0.1,
             ),
         ),
         initialization=Initialization(_schema_string(data, "initialization", owner="config")),
@@ -441,6 +504,42 @@ def _schema_string(data: Mapping[str, object], key: str, *, owner: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"generator artifact {owner}.{key} must be a string.")
     return value
+
+
+def _schema_optional_string(
+    data: Mapping[str, object],
+    key: str,
+    *,
+    owner: str,
+    default: str,
+) -> str:
+    if key not in data:
+        return default
+    return _schema_string(data, key, owner=owner)
+
+
+def _schema_optional_int_default(
+    data: Mapping[str, object],
+    key: str,
+    *,
+    owner: str,
+    default: int,
+) -> int:
+    if key not in data:
+        return default
+    return _schema_int(data, key, owner=owner)
+
+
+def _schema_optional_float(
+    data: Mapping[str, object],
+    key: str,
+    *,
+    owner: str,
+    default: float,
+) -> float:
+    if key not in data:
+        return default
+    return _schema_float(data, key, owner=owner)
 
 
 def _schema_int(data: Mapping[str, object], key: str, *, owner: str) -> int:

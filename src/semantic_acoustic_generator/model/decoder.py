@@ -10,13 +10,14 @@ from anytrain.loss import (
     LossItem,
     MaskedCodebookCrossEntropyLoss,
     MaskedCosineAlignmentLoss,
+    MaskedFrameMSELoss,
 )
 from anytrain.module.qwen import QwenMTPCodebookPredictor
 from torch import nn
 
-from semantic_acoustic_generator.config import DecoderConfig, Route, RVQPredictor
+from semantic_acoustic_generator.config import DecoderConfig, FMMode, Route, RVQPredictor
 from semantic_acoustic_generator.loss.flow import FlowLoss, FlowRuntime
-from semantic_acoustic_generator.model.condition import FixedLengthConditioner
+from semantic_acoustic_generator.model.condition import AlignedAnchor, FixedLengthConditioner
 from semantic_acoustic_generator.model.dit import DiTDecoder
 from semantic_acoustic_generator.model.rvq import AcousticRVQDecoder
 
@@ -112,19 +113,42 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         fixed_length: int | None = None,
     ) -> None:
         super().__init__(condition_dim, fixed_length=fixed_length)
-        self.core = DiTDecoder(
-            condition_dim,
-            feature_dim,
-            hidden_dim=config.hidden_dim,
-            layers=config.layers,
-            heads=config.heads,
-            ffn_ratio=config.ffn_ratio,
-            repa_feature_dim=config.repa_feature_dim,
-            repa_student_layer=config.repa_student_layer,
+        self.mode = config.fm_mode
+        self.feature_dim = feature_dim
+        self.core = (
+            None
+            if self.mode is FMMode.ANCHOR
+            else DiTDecoder(
+                condition_dim,
+                feature_dim,
+                hidden_dim=config.hidden_dim,
+                layers=config.layers,
+                heads=config.heads,
+                ffn_ratio=config.ffn_ratio,
+                repa_feature_dim=config.repa_feature_dim,
+                repa_student_layer=config.repa_student_layer,
+            )
+        )
+        self.anchor = (
+            None
+            if self.mode is FMMode.FLOW
+            else AlignedAnchor(
+                condition_dim,
+                feature_dim,
+                hidden_dim=config.anchor_hidden_dim,
+                layers=config.anchor_layers,
+                kernel_size=config.anchor_kernel_size,
+            )
         )
         self.repa_loss_weight = config.repa_loss_weight
+        self.anchor_cosine_weight = config.anchor_cosine_weight
+        self.anchor_factor_weight = config.anchor_factor_weight
+        self.anchor_factor_temperature = config.anchor_factor_temperature
         self.flow_loss = FlowLoss()
         self.repa_loss = MaskedCosineAlignmentLoss()
+        self.anchor_mse_loss = MaskedFrameMSELoss()
+        self.anchor_cosine_loss = MaskedCosineAlignmentLoss()
+        self.anchor_factor_loss = MaskedCodebookCrossEntropyLoss()
         self.flow_runtime: ContinuousFlowRuntime | None = None
 
     def forward(
@@ -135,6 +159,8 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         condition: Tensor,
         mask: Tensor | None = None,
     ) -> Tensor:
+        if self.core is None:
+            raise RuntimeError("fm_mode=anchor does not expose a flow velocity decoder.")
         return self.core(x_t, t, condition=condition, mask=mask)
 
     def forward_with_features(
@@ -145,6 +171,8 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         condition: Tensor,
         mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
+        if self.core is None:
+            raise RuntimeError("fm_mode=anchor does not expose flow representations.")
         return self.core.forward_with_features(x_t, t, condition=condition, mask=mask)
 
     @torch.no_grad()
@@ -178,15 +206,22 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             )
             if not torch.equal(target_mask, unconditional_mask):
                 raise ValueError("conditional and unconditional FM masks must match.")
-        features = self.core.sample(
-            target_condition,
-            mask=target_mask,
-            steps=flow_steps,
-            unconditional_condition=target_unconditional,
-            guidance_scale=cfg_scale,
-            generator=generator,
-        )
-        return features * feature_std + feature_mean
+        anchor = self._anchor(target_condition, target_mask)
+        if self.mode is FMMode.ANCHOR:
+            normalized = anchor
+        else:
+            if self.core is None:
+                raise RuntimeError("flow sampling requires a DiT decoder.")
+            residual = self.core.sample(
+                target_condition,
+                mask=target_mask,
+                steps=flow_steps,
+                unconditional_condition=target_unconditional,
+                guidance_scale=cfg_scale,
+                generator=generator,
+            )
+            normalized = residual if self.mode is FMMode.FLOW else anchor + residual
+        return normalized * feature_std + feature_mean
 
     def loss(
         self,
@@ -197,6 +232,8 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         feature_mean: Tensor,
         feature_std: Tensor,
         repa_teacher: Teacher | None = None,
+        factor_targets: Tensor | None = None,
+        factor_codebooks: tuple[Tensor, Tensor] | None = None,
     ) -> DecoderLoss:
         target_mask = batch.acoustic_mask
         target_condition, _ = self._target_condition(
@@ -224,6 +261,8 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             feature_mean=feature_mean,
             feature_std=feature_std,
             repa_features=repa_features,
+            factor_targets=factor_targets,
+            factor_codebooks=factor_codebooks,
             validate=False,
         )
 
@@ -237,6 +276,8 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         feature_std: Tensor | None = None,
         repa_features: Tensor | None = None,
         flow_runtime: FlowRuntime | None = None,
+        factor_targets: Tensor | None = None,
+        factor_codebooks: tuple[Tensor, Tensor] | None = None,
         validate: bool = True,
         include_details: bool = True,
     ) -> DecoderLoss:
@@ -248,7 +289,23 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             feature_mean,
             feature_std,
         )
+        if self.mode is not FMMode.FLOW:
+            return self._anchor_loss(
+                condition,
+                target,
+                target_features,
+                target_mask,
+                feature_mean=feature_mean,
+                feature_std=feature_std,
+                factor_targets=factor_targets,
+                factor_codebooks=factor_codebooks,
+                flow_runtime=flow_runtime,
+                validate=validate,
+                include_details=include_details,
+            )
         runtime = self._flow_runtime() if flow_runtime is None else flow_runtime
+        if self.core is None:
+            raise RuntimeError("fm_mode=flow requires a DiT decoder.")
         if self.repa_loss_weight <= 0:
             item = self.flow_loss(
                 self.core,
@@ -280,6 +337,91 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             primary="flow",
             scalars={"repa_weight": self.repa_loss_weight},
         )
+
+    def _anchor_loss(
+        self,
+        condition: Tensor,
+        target: Tensor,
+        target_features: Tensor,
+        target_mask: Tensor,
+        *,
+        feature_mean: Tensor | None,
+        feature_std: Tensor | None,
+        factor_targets: Tensor | None,
+        factor_codebooks: tuple[Tensor, Tensor] | None,
+        flow_runtime: FlowRuntime | None,
+        validate: bool,
+        include_details: bool,
+    ) -> DecoderLoss:
+        anchor = self._anchor(condition, target_mask)
+        mean = target_features.new_zeros(1, 1, target_features.size(-1)) if feature_mean is None else feature_mean
+        std = target_features.new_ones(1, 1, target_features.size(-1)) if feature_std is None else feature_std
+        raw_anchor = anchor * std + mean
+        mse = self.anchor_mse_loss(anchor, target, target_mask)
+        cosine = self.anchor_cosine_loss(raw_anchor, target_features, target_mask)
+        if factor_targets is None or factor_codebooks is None:
+            raise ValueError("anchor modes require factor targets and codebooks.")
+        logits = self._factor_logits(raw_anchor, factor_codebooks)
+        factor = self.anchor_factor_loss(
+            logits,
+            factor_targets,
+            target_mask,
+            validate=validate,
+            include_top1=include_details,
+            include_details=include_details,
+        )
+        loss = (
+            mse.loss.mean()
+            + self.anchor_cosine_weight * cosine.loss.mean()
+            + self.anchor_factor_weight * factor.loss.mean()
+        )
+        items = {"anchor_mse": mse, "anchor_cosine": cosine, "anchor_factor": factor}
+        scalars: dict[str, Tensor | float] = {
+            "anchor_cosine_weight": self.anchor_cosine_weight,
+            "anchor_factor_weight": self.anchor_factor_weight,
+        }
+        primary = "anchor_mse"
+        if self.mode is FMMode.RESIDUAL:
+            if self.core is None:
+                raise RuntimeError("fm_mode=residual requires a DiT decoder.")
+            runtime = self._flow_runtime() if flow_runtime is None else flow_runtime
+            flow = self.flow_loss(
+                self.core,
+                condition,
+                target - anchor.detach(),
+                target_mask,
+                runtime,
+                validate=validate,
+                include_details=include_details,
+            )
+            items["flow"] = flow
+            loss = loss + flow.loss.mean()
+            primary = "flow"
+        scalars["total_loss"] = loss.detach()
+        return DecoderLoss(loss=loss, items=items, primary=primary, scalars=scalars)
+
+    def _anchor(self, condition: Tensor, mask: Tensor) -> Tensor:
+        if self.anchor is None:
+            return condition.new_zeros(*condition.shape[:2], self.feature_dim)
+        return self.anchor(condition, mask)
+
+    def _factor_logits(
+        self,
+        features: Tensor,
+        codebooks: tuple[Tensor, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        dims = (codebooks[0].size(-1), codebooks[1].size(-1))
+        if sum(dims) != features.size(-1):
+            raise ValueError("factor codebook dimensions must match anchor features.")
+        split = features.split(dims, dim=-1)
+        return tuple(
+            torch.matmul(
+                torch.nn.functional.normalize(value.float(), dim=-1),
+                torch.nn.functional.normalize(codebook.float(), dim=-1).transpose(0, 1),
+            ).to(dtype=features.dtype)
+            / self.anchor_factor_temperature
+            for value, codebook in zip(split, codebooks, strict=True)
+        )  # type: ignore[return-value]
 
     def _flow_runtime(self) -> ContinuousFlowRuntime:
         if self.flow_runtime is None:

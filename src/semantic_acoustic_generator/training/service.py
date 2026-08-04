@@ -19,7 +19,7 @@ from anytrain.lightning import (
 from lightning import pytorch as pl
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor
 
-from semantic_acoustic_generator.backend import load_backend
+from semantic_acoustic_generator.backend import adapt_backend, load_backend
 from semantic_acoustic_generator.callback import (
     ArtifactExport,
     CodebookUsageLogger,
@@ -136,6 +136,7 @@ def build_session(config: DictConfig | TrainConfig) -> TrainingSession:
     route = config.model.route
     repa_teacher = build_repa_teacher(config, backend, device=device, route=route)
     support_config = build_support_config(config, seed=seed, repa_teacher=repa_teacher)
+    backend = adapt_backend(backend, support_config.feature_adapter)
     ckpt_path = config.trainer.ckpt_path
     normalize_features = config.pl_module.normalize_features
     feature_mean: tuple[float, ...] | None = None
@@ -229,6 +230,7 @@ def build_support_config(
     return GeneratorConfig(
         route=config.model.route,
         condition_dim=config.model.condition_dim,
+        feature_adapter=config.model.feature_adapter,
         decoder=DecoderConfig(
             hidden_dim=decoder.hidden_dim,
             layers=decoder.layers,
@@ -240,6 +242,13 @@ def build_support_config(
             repa_feature_dim=repa_feature_dim,
             repa_student_layer=loss.repa_student_layer,
             repa_loss_weight=loss.repa_loss_weight,
+            fm_mode=decoder.fm_mode,
+            anchor_hidden_dim=decoder.anchor_hidden_dim,
+            anchor_layers=decoder.anchor_layers,
+            anchor_kernel_size=decoder.anchor_kernel_size,
+            anchor_cosine_weight=decoder.anchor_cosine_weight,
+            anchor_factor_weight=decoder.anchor_factor_weight,
+            anchor_factor_temperature=decoder.anchor_factor_temperature,
         ),
         initialization=config.runtime.initialization,
         seed=seed,

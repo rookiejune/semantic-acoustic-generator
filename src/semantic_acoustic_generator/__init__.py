@@ -1,6 +1,6 @@
 """Reference-optional semantic-to-acoustic generation components."""
 
-from semantic_acoustic_generator.config import DecoderConfig, Route
+from semantic_acoustic_generator.config import DecoderConfig, FeatureAdapter, FMMode, Route
 from semantic_acoustic_generator.model import (
     AcousticRVQDecoder,
     AcousticUnitGenerator,
@@ -28,6 +28,8 @@ __all__ = [
     "DecoderConfig",
     "DiTDecoder",
     "FMFeatureGenerator",
+    "FeatureAdapter",
+    "FMMode",
     "RVQCodeGenerator",
     "ReferenceConditioner",
     "Route",

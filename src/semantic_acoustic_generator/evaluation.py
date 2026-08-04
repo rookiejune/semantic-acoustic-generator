@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from anytrain.codec import masked_acoustic_features
+from anytrain.codec import SemanticAcousticCodes, masked_acoustic_features
 from torch import Tensor
 
+from semantic_acoustic_generator.backend.adapter import LongCatFirstCodebookAdapter
 from semantic_acoustic_generator.types import GeneratorBatch
 
 if TYPE_CHECKING:
@@ -25,6 +26,12 @@ class PairedFeatureEvaluation:
     @property
     def reference_gain(self) -> float:
         return self.mse_without_reference - self.mse_with_reference
+
+
+@dataclass(frozen=True)
+class FirstCodebookOracleEvaluation:
+    audio: dict[str, Tensor]
+    metrics: dict[str, object]
 
 
 @torch.no_grad()
@@ -133,8 +140,87 @@ def seeded_generator(device: torch.device | str, seed: int) -> torch.Generator:
     return torch.Generator(device=device).manual_seed(seed)
 
 
+@torch.no_grad()
+def evaluate_first_codebook_oracle(
+    backend: LongCatFirstCodebookAdapter,
+    batch: GeneratorBatch,
+    *,
+    sigmas: tuple[float, ...],
+    seed: int,
+) -> FirstCodebookOracleEvaluation:
+    if batch.semantic_codes.size(0) != 1:
+        raise ValueError("first-codebook oracle requires one sample per batch.")
+    if any(value <= 0 for value in sigmas):
+        raise ValueError("first-codebook oracle sigmas must be positive.")
+    mask = batch.acoustic_mask.to(device=batch.acoustic_codes.device)
+    semantic = batch.semantic_codes.masked_fill(~batch.mask[..., None], 0)
+    acoustic = batch.acoustic_codes.masked_fill(~mask[..., None], 0)
+    target = backend.acoustic_codes_to_features(acoustic)
+    native = backend.native_stage0_features(acoustic)
+    projected = backend.project_features(target)
+    target_factors = backend.factor_codes(acoustic)
+    full_codes = SemanticAcousticCodes(semantic=semantic, acoustic=acoustic)
+    audio = {
+        "full_reconstruction": backend.backend.detokenize(full_codes),
+        "stage0_code_reconstruction": backend.backend.decode_features(semantic, native),
+        "exact_16d_reconstruction": backend.decode_features(semantic, target),
+    }
+    metrics: dict[str, object] = {
+        "native_projection_max_abs": float((native - projected).abs().max().cpu()),
+        "native_projection_mse": float((native.float() - projected.float()).square().mean().cpu()),
+        "exact_snap_max_abs": float((backend.snap_features(target) - target).abs().max().cpu()),
+        "groups": {},
+    }
+    group_metrics = metrics["groups"]
+    if not isinstance(group_metrics, dict):
+        raise RuntimeError("oracle group metrics must be a dict.")
+    scale = torch.cat(
+        tuple(codebook.float().std(dim=0, correction=0) for codebook in backend.factor_codebooks)
+    ).view(1, 1, -1)
+    generator = seeded_generator(target.device, seed)
+    for sigma in sigmas:
+        noise = torch.randn(
+            target.shape,
+            device=target.device,
+            dtype=target.dtype,
+            generator=generator,
+        )
+        raw = target + noise * scale.to(device=target.device, dtype=target.dtype) * sigma
+        raw = raw.masked_fill(~mask.to(device=raw.device)[..., None], 0)
+        snapped = backend.snap_features(raw)
+        key = _sigma_key(sigma)
+        raw_name = f"raw_sigma_{key}"
+        snap_name = f"snap_sigma_{key}"
+        audio[raw_name] = backend.decode_features(semantic, raw)
+        audio[snap_name] = backend.decode_features(semantic, snapped)
+        predicted_factors = backend.features_to_factor_codes(raw)
+        valid = mask.to(device=predicted_factors.device)
+        factor_accuracy = predicted_factors[valid].eq(
+            target_factors.to(device=predicted_factors.device)[valid]
+        ).float().mean(dim=0)
+        group_metrics[raw_name] = {
+            "feature_mse": float((raw.float() - target.float())[valid].square().mean().cpu()),
+            "factor_a_accuracy": float(factor_accuracy[0].cpu()),
+            "factor_b_accuracy": float(factor_accuracy[1].cpu()),
+        }
+        group_metrics[snap_name] = {
+            "feature_mse": float(
+                (snapped.float() - target.float())[valid].square().mean().cpu()
+            ),
+            "factor_a_accuracy": float(factor_accuracy[0].cpu()),
+            "factor_b_accuracy": float(factor_accuracy[1].cpu()),
+        }
+    return FirstCodebookOracleEvaluation(audio=audio, metrics=metrics)
+
+
+def _sigma_key(value: float) -> str:
+    return format(value, ".6g").replace("-", "m").replace(".", "p")
+
+
 __all__ = [
     "PairedFeatureEvaluation",
+    "FirstCodebookOracleEvaluation",
+    "evaluate_first_codebook_oracle",
     "evaluate_feature_pair",
     "masked_feature_mse",
     "reference_acoustic_condition",

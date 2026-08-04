@@ -9,6 +9,8 @@ from omegaconf import DictConfig
 from semantic_acoustic_generator.backend import BackendConfig
 from semantic_acoustic_generator.config import (
     DecoderConfig,
+    FeatureAdapter,
+    FMMode,
     Route,
     RVQPredictor,
     decoder_options,
@@ -126,6 +128,7 @@ def test_train_config_parses_to_typed_entry_schema() -> None:
     assert isinstance(config, TrainConfig)
     assert isinstance(config.backend, BackendConfig)
     assert config.model.route is Route.FM
+    assert config.model.feature_adapter is FeatureAdapter.NONE
     assert config.model.decoder.rvq_predictor is RVQPredictor.MTP
     assert config.datamodule.fixed_batch is False
     assert config.callback.performance.enabled is False
@@ -177,6 +180,54 @@ def test_train_config_rejects_repa_on_rvq_route() -> None:
     )
 
     with pytest.raises(ValueError, match="REPA requires model.route=fm"):
+        parse_train_config(raw)
+
+
+def test_train_config_parses_longcat_first_codebook_adapter() -> None:
+    config = parse_train_config(
+        _compose("model.feature_adapter=longcat_first_codebook")
+    )
+
+    assert config.model.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
+
+
+def test_train_config_parses_first_codebook_anchor_mode() -> None:
+    config = parse_train_config(
+        _compose(
+            "model.feature_adapter=longcat_first_codebook",
+            "model.decoder.fm_mode=anchor",
+            "model.decoder.anchor_hidden_dim=256",
+            "model.decoder.anchor_layers=2",
+        )
+    )
+
+    assert config.model.decoder.fm_mode is FMMode.ANCHOR
+    assert config.model.decoder.anchor_hidden_dim == 256
+    assert config.model.decoder.anchor_layers == 2
+
+
+def test_train_config_rejects_anchor_without_first_codebook_adapter() -> None:
+    with pytest.raises(ValueError, match="requires model.feature_adapter"):
+        parse_train_config(_compose("model.decoder.fm_mode=anchor"))
+
+
+def test_train_config_rejects_feature_adapter_on_rvq_route() -> None:
+    raw = _compose(
+        "model/route=rvq",
+        "model.feature_adapter=longcat_first_codebook",
+    )
+
+    with pytest.raises(ValueError, match="feature_adapter requires model.route=fm"):
+        parse_train_config(raw)
+
+
+def test_train_config_rejects_longcat_adapter_on_other_backend() -> None:
+    raw = _compose(
+        "backend=bicodec",
+        "model.feature_adapter=longcat_first_codebook",
+    )
+
+    with pytest.raises(ValueError, match="requires backend=longcat"):
         parse_train_config(raw)
 
 

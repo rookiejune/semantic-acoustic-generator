@@ -91,6 +91,44 @@ python scripts/train.py experiment=ablation_fm_ema
 CUDA 训练通过 `pl_module.finite_loss_check_interval` 有界延迟检查非有限 loss，并在 epoch 结束和
 checkpoint 保存前强制检查；smoke / overfit 将该值设为 `1` 以获得逐步诊断。
 
+LongCat-FM 可以显式启用第一 acoustic codebook 的低维 feature adapter：
+
+```bash
+python scripts/train.py experiment=overfit \
+  model.feature_adapter=longcat_first_codebook \
+  output_subdir=overfit/longcat/fm-8l-first-codebook
+```
+
+该 adapter 把每帧第一个 `8100=90×90` composite code 拆成两个冻结的 8-D codebook embedding，FM
+因此预测 16-D target；waveform decode 前再通过 LongCat stage-0 的 `out_proj_a/b` 还原为 1024-D
+decoder 输入。默认推理直接解码连续输出；oracle 和 fixed-set evaluator 会额外导出两个 factor 分别按
+cosine nearest-codebook snapping 的对照。默认配置为
+`model.feature_adapter=none`，且 adapter 目前只允许用于 FM；选择会写入 artifact，加载原始 LongCat
+backend 时由 `GeneratorRuntime` 自动恢复。
+
+在第一码本 adapter 上还可以显式选择严格逐帧对齐的 deterministic anchor，或 anchor 加 residual FM：
+
+```bash
+# 单次前向、有限局部上下文的 aligned anchor
+python scripts/train.py experiment=010_longcat_anchor_overfit
+
+# 仅在 anchor 可懂后使用；FM 拟合 stop-gradient anchor 未覆盖的 residual
+python scripts/train.py experiment=010_longcat_anchor_overfit \
+  model.decoder.fm_mode=residual
+```
+
+`model.decoder.fm_mode=flow` 是默认旧路径；`anchor|residual` 必须与
+`model.feature_adapter=longcat_first_codebook` 一起使用。anchor loss 组合 normalized feature MSE、raw
+feature cosine 和两个 90-way factor cosine-CE；reference 在 010 fixed-speaker overfit 中固定 dropout 为 1。
+
+010 的 representation oracle、整段 artifact raw/snap 评估和 Anytrain Whisper/UTMOS 汇总入口分别为：
+
+```text
+jobs/010/01_representation_oracle.sh
+jobs/010/02_anchor_overfit.sh
+jobs/010/03_eval_artifact_set.sh
+```
+
 四条正式路线分别由 `experiment=001_longcat_fm|001_longcat_rvq|001_bicodec_fm|001_bicodec_rvq`
 完整组合，也有对应的 job wrapper：
 
@@ -133,7 +171,9 @@ artifact 目录只包含 `generator.json` 和 `model.ckpt`；当前 schema 为 `
 配置、backend 兼容性 metadata、sampling 和 feature normalization，不包含 codec 实例或 backend decoder。
 `GeneratorRuntime` 负责加载 generator artifact、生成缺失 acoustic units 并调用外部 backend 解码 waveform。
 导出配置只取自 support 的构造配置；字段缺失、类型不精确或包含非有限数值时会直接拒绝，不补默认值，也不
-把字符串或 bool 强转为数值。旧 schema-7 `codec.json` 仍可由显式 legacy reader 加载。
+把字符串或 bool 强转为数值。兼容例外是早期 schema-8 artifact 缺少后加的 `feature_adapter` 和
+anchor 配置时，分别按 `none` 与 `fm_mode=flow` 的默认值读取；旧 schema-7 `codec.json` 仍可由显式
+legacy reader 加载。
 
 同时设置 `callback.performance.enabled=true callback.performance.profile_flops=true` 会通过 anytrain
 对真实 train batch 统计动态 FLOPs，用于短 calibration。该模式有 profiler 开销；生产 timing run

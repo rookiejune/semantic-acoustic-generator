@@ -1,4 +1,5 @@
 condition_dim: 1024
+feature_adapter: none
 decoder:
   hidden_dim: null
   layers: 8
@@ -7,3 +8,10 @@ decoder:
   rvq_predictor: mtp
   mtp_layers: 2
   mtp_heads: 4
+  fm_mode: flow
+  anchor_hidden_dim: 512
+  anchor_layers: 4
+  anchor_kernel_size: 3
+  anchor_cosine_weight: 0.1
+  anchor_factor_weight: 0.1
+  anchor_factor_temperature: 0.1

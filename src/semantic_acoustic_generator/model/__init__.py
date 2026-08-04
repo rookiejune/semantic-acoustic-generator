@@ -1,4 +1,5 @@
 from semantic_acoustic_generator.model.condition import (
+    AlignedAnchor,
     ReferenceConditioner,
     SemanticConditioner,
     matched_random_weight,
@@ -19,6 +20,7 @@ __all__ = [
     "AcousticCodeSampler",
     "AcousticRVQDecoder",
     "AcousticUnitGenerator",
+    "AlignedAnchor",
     "DecoderLoss",
     "DiTDecoder",
     "FMFeatureGenerator",

@@ -53,7 +53,7 @@ def main() -> None:
     runtime = GeneratorRuntime(support, backend)
     audio, metrics = _evaluate(
         runtime,
-        backend,
+        runtime.backend,
         batch,
         device=device,
         seed=args.seed,

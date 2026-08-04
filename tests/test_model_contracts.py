@@ -21,7 +21,7 @@ from anytrain.loss import (
 from anytrain.module.qwen import QwenMTPCodebookPredictor
 
 import semantic_acoustic_generator.model.rvq as rvq_module
-from semantic_acoustic_generator.config import DecoderConfig, Route, RVQPredictor
+from semantic_acoustic_generator.config import DecoderConfig, FMMode, Route, RVQPredictor
 from semantic_acoustic_generator.model import (
     AcousticRVQDecoder,
     DiTDecoder,
@@ -144,6 +144,80 @@ def test_fm_loss_and_sample_shapes() -> None:
     assert loss.loss.shape == (2,)
     assert sample.shape == target.shape
     assert torch.equal(sample[1, 2:], torch.zeros_like(sample[1, 2:]))
+
+
+def test_aligned_anchor_predicts_features_and_factor_losses() -> None:
+    condition = torch.randn(2, 4, 10)
+    target = torch.randn(2, 4, 6)
+    mask = torch.tensor([[True, True, True, True], [True, True, False, False]])
+    generator = FMFeatureGenerator(
+        10,
+        6,
+        DecoderConfig(
+            fm_mode=FMMode.ANCHOR,
+            anchor_hidden_dim=12,
+            anchor_layers=2,
+            anchor_kernel_size=3,
+        ),
+    )
+    labels = torch.randint(0, 5, (2, 4, 2))
+    codebooks = (torch.randn(5, 3), torch.randn(5, 3))
+
+    output = generator.feature_loss_from_condition(
+        condition,
+        mask,
+        target_features=target,
+        factor_targets=labels,
+        factor_codebooks=codebooks,
+    )
+    sample = generator.sample_features(
+        condition,
+        mask,
+        feature_mean=torch.zeros(1, 1, 6),
+        feature_std=torch.ones(1, 1, 6),
+        flow_steps=1,
+    )
+
+    assert output.primary == "anchor_mse"
+    assert set(output.items) == {"anchor_mse", "anchor_cosine", "anchor_factor"}
+    assert output.loss.ndim == 0
+    assert sample.shape == target.shape
+    assert torch.equal(sample[1, 2:], torch.zeros_like(sample[1, 2:]))
+
+
+def test_residual_fm_trains_flow_and_anchor() -> None:
+    condition = torch.randn(1, 3, 4)
+    target = torch.randn(1, 3, 4)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    generator = FMFeatureGenerator(
+        4,
+        4,
+        DecoderConfig(
+            hidden_dim=8,
+            layers=1,
+            heads=1,
+            ffn_ratio=2,
+            fm_mode=FMMode.RESIDUAL,
+            anchor_hidden_dim=8,
+            anchor_layers=1,
+        ),
+    )
+
+    output = generator.feature_loss_from_condition(
+        condition,
+        mask,
+        target_features=target,
+        factor_targets=torch.zeros(1, 3, 2, dtype=torch.long),
+        factor_codebooks=(torch.randn(2, 2), torch.randn(2, 2)),
+    )
+
+    assert output.primary == "flow"
+    assert set(output.items) == {"anchor_mse", "anchor_cosine", "anchor_factor", "flow"}
+    output.loss.backward()
+    assert generator.anchor is not None
+    assert generator.anchor.output.weight.grad is not None
+    assert generator.core is not None
+    assert next(generator.core.parameters()).grad is not None
 
 
 def test_fm_sample_applies_classifier_free_guidance() -> None:

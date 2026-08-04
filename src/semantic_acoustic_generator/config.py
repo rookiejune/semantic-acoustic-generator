@@ -15,6 +15,17 @@ class Route(StrEnum):
     RVQ = auto()
 
 
+class FeatureAdapter(StrEnum):
+    NONE = auto()
+    LONGCAT_FIRST_CODEBOOK = auto()
+
+
+class FMMode(StrEnum):
+    FLOW = auto()
+    ANCHOR = auto()
+    RESIDUAL = auto()
+
+
 class Initialization(StrEnum):
     CODEC = auto()
     RANDOM = auto()
@@ -37,6 +48,13 @@ class DecoderConfig:
     repa_feature_dim: int | None = None
     repa_student_layer: int | None = None
     repa_loss_weight: float = 0.0
+    fm_mode: FMMode = FMMode.FLOW
+    anchor_hidden_dim: int = 512
+    anchor_layers: int = 4
+    anchor_kernel_size: int = 3
+    anchor_cosine_weight: float = 0.1
+    anchor_factor_weight: float = 0.1
+    anchor_factor_temperature: float = 0.1
 
     def __post_init__(self) -> None:
         _optional_int(self.hidden_dim, name="hidden_dim")
@@ -50,6 +68,14 @@ class DecoderConfig:
         _optional_int(self.repa_feature_dim, name="repa_feature_dim")
         _optional_int(self.repa_student_layer, name="repa_student_layer")
         _float(self.repa_loss_weight, name="repa_loss_weight")
+        if not isinstance(self.fm_mode, FMMode):
+            raise TypeError("fm_mode must be an FMMode.")
+        _int(self.anchor_hidden_dim, name="anchor_hidden_dim")
+        _int(self.anchor_layers, name="anchor_layers")
+        _int(self.anchor_kernel_size, name="anchor_kernel_size")
+        _float(self.anchor_cosine_weight, name="anchor_cosine_weight")
+        _float(self.anchor_factor_weight, name="anchor_factor_weight")
+        _float(self.anchor_factor_temperature, name="anchor_factor_temperature")
         if self.layers <= 0 or self.heads <= 0 or self.ffn_ratio <= 0:
             raise ValueError("decoder depth, heads, and FFN ratio must be positive.")
         if self.mtp_layers <= 0 or self.mtp_heads <= 0:
@@ -58,6 +84,16 @@ class DecoderConfig:
             raise ValueError("repa_loss_weight must be non-negative.")
         if self.repa_loss_weight > 0 and self.repa_feature_dim is None:
             raise ValueError("repa_feature_dim is required when repa_loss_weight is positive.")
+        if self.anchor_hidden_dim <= 0 or self.anchor_layers <= 0:
+            raise ValueError("anchor hidden_dim and layers must be positive.")
+        if self.anchor_kernel_size <= 0 or self.anchor_kernel_size % 2 == 0:
+            raise ValueError("anchor_kernel_size must be a positive odd integer.")
+        if self.anchor_cosine_weight < 0 or self.anchor_factor_weight < 0:
+            raise ValueError("anchor loss weights must be non-negative.")
+        if self.anchor_factor_temperature <= 0:
+            raise ValueError("anchor_factor_temperature must be positive.")
+        if self.fm_mode is not FMMode.FLOW and self.repa_loss_weight > 0:
+            raise ValueError("REPA is only supported by fm_mode=flow.")
 
 
 def decoder_options(
@@ -70,6 +106,9 @@ def decoder_options(
     predictor = config.get("rvq_predictor", RVQPredictor.MTP.value)
     if not isinstance(predictor, str):
         raise TypeError("rvq_predictor must be a string.")
+    fm_mode = config.get("fm_mode", FMMode.FLOW.value)
+    if not isinstance(fm_mode, str):
+        raise TypeError("fm_mode must be a string.")
     return DecoderConfig(
         hidden_dim=_optional_int(config.get("hidden_dim"), name="hidden_dim"),
         layers=_int(config["layers"], name="layers"),
@@ -84,6 +123,25 @@ def decoder_options(
             name="repa_student_layer",
         ),
         repa_loss_weight=_float(config.get("repa_loss_weight", 0.0), name="repa_loss_weight"),
+        fm_mode=FMMode(fm_mode),
+        anchor_hidden_dim=_int(config.get("anchor_hidden_dim", 512), name="anchor_hidden_dim"),
+        anchor_layers=_int(config.get("anchor_layers", 4), name="anchor_layers"),
+        anchor_kernel_size=_int(
+            config.get("anchor_kernel_size", 3),
+            name="anchor_kernel_size",
+        ),
+        anchor_cosine_weight=_float(
+            config.get("anchor_cosine_weight", 0.1),
+            name="anchor_cosine_weight",
+        ),
+        anchor_factor_weight=_float(
+            config.get("anchor_factor_weight", 0.1),
+            name="anchor_factor_weight",
+        ),
+        anchor_factor_temperature=_float(
+            config.get("anchor_factor_temperature", 0.1),
+            name="anchor_factor_temperature",
+        ),
     )
 
 
@@ -112,6 +170,8 @@ def _float(value: object, *, name: str) -> float:
 
 __all__ = [
     "DecoderConfig",
+    "FeatureAdapter",
+    "FMMode",
     "Initialization",
     "RVQPredictor",
     "Route",
