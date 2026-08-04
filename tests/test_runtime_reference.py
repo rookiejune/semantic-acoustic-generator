@@ -5,7 +5,7 @@ from typing import Any, cast
 
 import pytest
 import torch
-from anytrain.codec import AcousticLayout, SemanticAcousticCodes
+from anytrain.codec import AcousticLayout, SemanticAcousticCodes, semantic_acoustic_spec
 from torch import nn
 
 import semantic_acoustic_codec.runtime.semantic as runtime_semantic
@@ -405,8 +405,7 @@ def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     )
     save_artifact(tmp_path, support, backend=backend)
 
@@ -451,8 +450,7 @@ def test_schema_seven_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     )
     save_artifact(tmp_path, support, backend=backend)
 
@@ -476,8 +474,7 @@ def test_schema_seven_artifact_rejects_missing_cfg_scale(tmp_path) -> None:
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     )
     save_artifact(tmp_path, support, backend=backend)
 
@@ -515,8 +512,7 @@ def test_schema_seven_artifact_rejects_lossy_numeric_coercion(
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     )
     save_artifact(tmp_path, support, backend=backend)
 
@@ -544,8 +540,7 @@ def test_schema_seven_artifact_rejects_invalid_feature_metadata(tmp_path, value:
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     )
     save_artifact(tmp_path, support, backend=backend)
 
@@ -580,7 +575,7 @@ def _support(
     )
     support = SemanticCodecSupport(
         modules,
-        backend.acoustic_feature_dim,
+        semantic_acoustic_spec(backend),
         sampling=SamplingConfig(flow_steps=1) if sampling is None else sampling,
     )
     return support, generator

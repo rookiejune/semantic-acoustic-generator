@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from anytrain.codec import SemanticAcousticCodecSpec, semantic_acoustic_spec
+
 if TYPE_CHECKING:
     from anytrain.codec import SemanticAcousticCodec
 
@@ -16,14 +18,7 @@ __all__ = [
 
 
 def support_metadata(support: SemanticCodecSupport) -> dict[str, object]:
-    return {
-        "semantic_vocab_size": support.conditioner.semantic_codebook_size,
-        "semantic_embedding_dim": support.conditioner.embedding.embedding_dim,
-        "acoustic_feature_dim": support.acoustic_feature_dim,
-        "acoustic_codebook_sizes": list(support.acoustic_codebook_sizes),
-        "acoustic_layout": support.acoustic_layout.value,
-        "acoustic_unit_length": support.acoustic_unit_length,
-    }
+    return _spec_metadata(support.codec_spec)
 
 
 def validate_backend_metadata(
@@ -48,13 +43,17 @@ def validate_support_metadata(
 
 
 def _expected_support_metadata(backend: SemanticAcousticCodec) -> dict[str, object]:
+    return _spec_metadata(semantic_acoustic_spec(backend))
+
+
+def _spec_metadata(spec: SemanticAcousticCodecSpec) -> dict[str, object]:
     return {
-        "semantic_vocab_size": int(backend.semantic_codebook.size(0)),
-        "semantic_embedding_dim": int(backend.semantic_codebook.size(1)),
-        "acoustic_feature_dim": backend.acoustic_feature_dim,
-        "acoustic_codebook_sizes": list(backend.acoustic_codebook_sizes),
-        "acoustic_layout": backend.acoustic_layout.value,
-        "acoustic_unit_length": backend.acoustic_unit_length,
+        "semantic_vocab_size": spec.semantic_codebook_sizes[0],
+        "semantic_embedding_dim": spec.semantic_embedding_dim,
+        "acoustic_feature_dim": spec.acoustic_feature_dim,
+        "acoustic_codebook_sizes": list(spec.acoustic_codebook_sizes),
+        "acoustic_layout": spec.acoustic_layout.value,
+        "acoustic_unit_length": spec.acoustic_unit_length,
     }
 
 

@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 import torch
-from anytrain.codec import AcousticLayout, SemanticAcousticCodec
+from anytrain.codec import (
+    AcousticLayout,
+    SemanticAcousticCodec,
+    SemanticAcousticCodecSpec,
+)
 from torch import Tensor
 
 from semantic_acoustic_codec.config import (
@@ -166,21 +170,22 @@ def load_generator_artifact(
     if device is not None:
         generator.to(device=device)
     generator.eval()
-    acoustic_feature_dim = _metadata_int(metadata, "acoustic_feature_dim")
+    codec_spec = _codec_spec(metadata)
+    acoustic_feature_dim = codec_spec.acoustic_feature_dim
     spec = AcousticGeneratorSpec(
         route=config.route,
         condition_dim=config.condition_dim,
         decoder=config.decoder,
         backend_name=_metadata_string(metadata, "name"),
-        sample_rate=_metadata_int(metadata, "sample_rate"),
-        frame_rate=_metadata_float(metadata, "frame_rate"),
-        semantic_frame_rate=_metadata_float(metadata, "semantic_frame_rate"),
-        semantic_vocab_size=_metadata_int(metadata, "semantic_vocab_size"),
-        semantic_embedding_dim=_metadata_int(metadata, "semantic_embedding_dim"),
+        sample_rate=codec_spec.sample_rate,
+        frame_rate=codec_spec.frame_rate,
+        semantic_frame_rate=codec_spec.semantic_frame_rate,
+        semantic_vocab_size=codec_spec.semantic_codebook_sizes[0],
+        semantic_embedding_dim=codec_spec.semantic_embedding_dim,
         acoustic_feature_dim=acoustic_feature_dim,
-        acoustic_codebook_sizes=_metadata_sizes(metadata),
-        acoustic_layout=AcousticLayout(_metadata_string(metadata, "acoustic_layout")),
-        acoustic_unit_length=_metadata_optional_int(metadata, "acoustic_unit_length"),
+        acoustic_codebook_sizes=codec_spec.acoustic_codebook_sizes,
+        acoustic_layout=codec_spec.acoustic_layout,
+        acoustic_unit_length=codec_spec.acoustic_unit_length,
         feature_mean=_feature_values(config.feature_mean, acoustic_feature_dim, fill=0.0),
         feature_std=_feature_values(config.feature_std, acoustic_feature_dim, fill=1.0),
         sampling=config.sampling,
@@ -240,16 +245,14 @@ def _load_artifact(
     from semantic_acoustic_codec.runtime.semantic import build_support
 
     checkpoint, backend_data, config = _artifact(path)
+    codec_spec = _codec_spec(backend_data)
     support = build_support(
         config,
         semantic_codebook=torch.zeros(
-            _metadata_int(backend_data, "semantic_vocab_size"),
-            _metadata_int(backend_data, "semantic_embedding_dim"),
+            codec_spec.semantic_codebook_sizes[0],
+            codec_spec.semantic_embedding_dim,
         ),
-        acoustic_feature_dim=_metadata_int(backend_data, "acoustic_feature_dim"),
-        acoustic_codebook_sizes=_metadata_sizes(backend_data),
-        acoustic_layout=AcousticLayout(_metadata_string(backend_data, "acoustic_layout")),
-        acoustic_unit_length=_metadata_optional_int(backend_data, "acoustic_unit_length"),
+        codec_spec=codec_spec,
         artifact_backend_metadata=backend_data,
     )
     state = _load_state(checkpoint)
@@ -288,29 +291,37 @@ def _generator(
     config: SemanticSupportConfig,
     metadata: Mapping[str, object],
 ) -> CodecUnitGenerator:
-    acoustic_feature_dim = _metadata_int(metadata, "acoustic_feature_dim")
-    acoustic_codebook_sizes = _metadata_sizes(metadata)
-    layout = AcousticLayout(_metadata_string(metadata, "acoustic_layout"))
-    fixed_length = (
-        _metadata_optional_int(metadata, "acoustic_unit_length")
-        if layout is AcousticLayout.FIXED_LENGTH
-        else None
-    )
+    codec_spec = _codec_spec(metadata)
+    fixed_length = codec_spec.acoustic_unit_length
     if config.route is Route.FM:
         return FMFeatureGenerator(
             config.condition_dim,
-            acoustic_feature_dim,
+            codec_spec.acoustic_feature_dim,
             config.decoder,
             fixed_length=fixed_length,
         )
     if config.route is Route.RVQ:
         return RVQCodeGenerator(
             config.condition_dim,
-            acoustic_codebook_sizes,
+            codec_spec.acoustic_codebook_sizes,
             config.decoder,
             fixed_length=fixed_length,
         )
     raise AssertionError(f"unsupported route: {config.route}")
+
+
+def _codec_spec(metadata: Mapping[str, object]) -> SemanticAcousticCodecSpec:
+    return SemanticAcousticCodecSpec(
+        sample_rate=_metadata_int(metadata, "sample_rate"),
+        frame_rate=_metadata_float(metadata, "frame_rate"),
+        semantic_frame_rate=_metadata_float(metadata, "semantic_frame_rate"),
+        semantic_codebook_sizes=(_metadata_int(metadata, "semantic_vocab_size"),),
+        semantic_embedding_dim=_metadata_int(metadata, "semantic_embedding_dim"),
+        acoustic_codebook_sizes=_metadata_sizes(metadata),
+        acoustic_feature_dim=_metadata_int(metadata, "acoustic_feature_dim"),
+        acoustic_layout=AcousticLayout(_metadata_string(metadata, "acoustic_layout")),
+        acoustic_unit_length=_metadata_optional_int(metadata, "acoustic_unit_length"),
+    )
 
 
 def _generator_state(state: Mapping[str, Tensor]) -> dict[str, Tensor]:

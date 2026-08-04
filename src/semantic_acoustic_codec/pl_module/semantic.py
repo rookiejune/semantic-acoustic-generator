@@ -6,7 +6,11 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
-from anytrain.codec import SemanticAcousticCodec, masked_acoustic_features
+from anytrain.codec import (
+    SemanticAcousticCodec,
+    masked_acoustic_features,
+    semantic_acoustic_spec,
+)
 from anytrain.lightning import LightningLogMixin
 from lightning import LightningModule
 
@@ -482,10 +486,7 @@ def build_module(
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
-        acoustic_layout=backend.acoustic_layout,
-        acoustic_unit_length=backend.acoustic_unit_length,
+        codec_spec=semantic_acoustic_spec(backend),
     )
     return SemanticCodecModule(
         support,

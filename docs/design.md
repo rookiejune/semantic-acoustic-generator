@@ -38,6 +38,10 @@ LongCat semantic-only reconstruction 的实现细节。
 codec backend contract 直接使用 `anytrain.codec.SemanticAcousticCodec` 和
 `anytrain.codec.load_semantic_acoustic()`，本仓库不再重新定义或转发 codec protocol：
 
+backend 的可移植结构统一通过 `anytrain.codec.SemanticAcousticCodecSpec` 表达；训练构建从真实
+backend 使用 `semantic_acoustic_spec()` 检查得到，artifact load 则从严格 metadata 重建同一 spec。
+spec 只持有码本、feature dim、frame rate 和 acoustic unit layout，不持有 backend 权重或加载策略。
+
 ```python
 class SemanticCodecSupport(nn.Module):
     generator: CodecUnitGenerator

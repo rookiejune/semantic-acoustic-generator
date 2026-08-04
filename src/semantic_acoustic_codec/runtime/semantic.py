@@ -5,7 +5,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import torch
-from anytrain.codec import AcousticLayout, SemanticAcousticCodec
+from anytrain.codec import (
+    AcousticLayout,
+    SemanticAcousticCodec,
+    SemanticAcousticCodecSpec,
+)
 from torch import Tensor, nn
 
 from semantic_acoustic_codec._tensor import is_signed_integer_dtype
@@ -95,41 +99,39 @@ class SemanticCodecSupport(nn.Module):
     def __init__(
         self,
         modules: RouteModules,
-        acoustic_feature_dim: int,
+        codec_spec: SemanticAcousticCodecSpec,
         *,
         config: SemanticSupportConfig | None = None,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        acoustic_unit_length: int | None = None,
         sampling: SamplingConfig | None = None,
         feature_mean: Tensor | None = None,
         feature_std: Tensor | None = None,
         artifact_backend_metadata: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
-        if acoustic_feature_dim <= 0:
-            raise ValueError("acoustic_feature_dim must be positive.")
-        if not isinstance(acoustic_layout, AcousticLayout):
-            raise TypeError("acoustic_layout must be an AcousticLayout.")
-        if acoustic_layout is AcousticLayout.FIXED_LENGTH:
-            if acoustic_unit_length is None or acoustic_unit_length <= 0:
-                raise ValueError("fixed-length acoustic layout requires a positive unit length.")
-        elif acoustic_unit_length is not None:
-            raise ValueError("frame-aligned acoustic layout must not set acoustic_unit_length.")
+        if not isinstance(codec_spec, SemanticAcousticCodecSpec):
+            raise TypeError("codec_spec must be a SemanticAcousticCodecSpec.")
+        if modules.acoustic_codebook_sizes != codec_spec.acoustic_codebook_sizes:
+            raise ValueError("route acoustic codebooks must match codec_spec.")
         self.conditioner = modules.conditioner
         self.reference_conditioner = modules.reference_conditioner
         self.generator = modules.generator
         self.route = modules.route
-        self.acoustic_feature_dim = acoustic_feature_dim
+        self.codec_spec = codec_spec
+        self.acoustic_feature_dim = codec_spec.acoustic_feature_dim
         self.acoustic_codebook_sizes = modules.acoustic_codebook_sizes
-        self.acoustic_layout = acoustic_layout
-        self.acoustic_unit_length = acoustic_unit_length
+        self.acoustic_layout = codec_spec.acoustic_layout
+        self.acoustic_unit_length = codec_spec.acoustic_unit_length
         self.config = config
         self.sampling = SamplingConfig() if sampling is None else sampling
         self.artifact_backend_metadata = (
             None if artifact_backend_metadata is None else dict(artifact_backend_metadata)
         )
-        self.feature_mean = nn.Buffer(_feature_stat(acoustic_feature_dim, feature_mean, fill=0.0))
-        self.feature_std = nn.Buffer(_feature_stat(acoustic_feature_dim, feature_std, fill=1.0))
+        self.feature_mean = nn.Buffer(
+            _feature_stat(codec_spec.acoustic_feature_dim, feature_mean, fill=0.0)
+        )
+        self.feature_std = nn.Buffer(
+            _feature_stat(codec_spec.acoustic_feature_dim, feature_std, fill=1.0)
+        )
 
     @property
     def feature_sampler(self) -> FeatureSampler:
@@ -552,23 +554,21 @@ def build_support(
     config: SemanticSupportConfig,
     *,
     semantic_codebook: Tensor,
-    acoustic_feature_dim: int,
-    acoustic_codebook_sizes: tuple[int, ...],
-    acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-    acoustic_unit_length: int | None = None,
+    codec_spec: SemanticAcousticCodecSpec,
     artifact_backend_metadata: Mapping[str, object] | None = None,
 ) -> SemanticCodecSupport:
+    _validate_semantic_codebook(semantic_codebook, codec_spec)
     modules = build_route(
         config.route,
         semantic_codebook,
-        acoustic_feature_dim,
-        acoustic_codebook_sizes,
+        codec_spec.acoustic_feature_dim,
+        codec_spec.acoustic_codebook_sizes,
         condition_dim=config.condition_dim,
         decoder=config.decoder,
         initialization=config.initialization,
         seed=config.seed,
-        acoustic_layout=acoustic_layout,
-        acoustic_unit_length=acoustic_unit_length,
+        acoustic_layout=codec_spec.acoustic_layout,
+        acoustic_unit_length=codec_spec.acoustic_unit_length,
     )
     mean = (
         None
@@ -582,15 +582,32 @@ def build_support(
     )
     return SemanticCodecSupport(
         modules,
-        acoustic_feature_dim,
+        codec_spec,
         config=config,
-        acoustic_layout=acoustic_layout,
-        acoustic_unit_length=acoustic_unit_length,
         sampling=config.sampling,
         feature_mean=mean,
         feature_std=std,
         artifact_backend_metadata=artifact_backend_metadata,
     )
+
+
+def _validate_semantic_codebook(
+    semantic_codebook: Tensor,
+    codec_spec: SemanticAcousticCodecSpec,
+) -> None:
+    if not isinstance(codec_spec, SemanticAcousticCodecSpec):
+        raise TypeError("codec_spec must be a SemanticAcousticCodecSpec.")
+    if len(codec_spec.semantic_codebook_sizes) != 1:
+        raise ValueError("semantic codec support requires exactly one semantic codebook.")
+    expected = (
+        codec_spec.semantic_codebook_sizes[0],
+        codec_spec.semantic_embedding_dim,
+    )
+    if tuple(semantic_codebook.shape) != expected:
+        raise ValueError(
+            "semantic_codebook must match codec_spec [vocab, embedding]: "
+            f"{tuple(semantic_codebook.shape)} != {expected}."
+        )
 
 
 def _feature_stat(acoustic_feature_dim: int, value: Tensor | None, *, fill: float) -> Tensor:

@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from anytrain.codec import AcousticLayout, SemanticAcousticCodes, masked_acoustic_features
+from anytrain.codec import (
+    AcousticLayout,
+    SemanticAcousticCodes,
+    masked_acoustic_features,
+    semantic_acoustic_spec,
+)
 from anytrain.framework.flow_matching import ContinuousFlowRuntime
 from anytrain.loss import (
     MaskedCodebookCrossEntropyLoss,
@@ -386,8 +391,7 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     ).eval()
     semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
     reference = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
@@ -433,6 +437,7 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     acoustic.spec.validate_acoustic_backend(backend)
     other_semantic = FakeCodec()
     other_semantic.semantic_codebook = torch.randn(11, 9)
+    other_semantic.semantic_codebook_sizes = (11,)
     acoustic.spec.validate_acoustic_backend(other_semantic)
     with pytest.raises(ValueError, match="semantic_vocab_size"):
         acoustic.spec.validate_backend(other_semantic)
@@ -464,8 +469,7 @@ def test_artifact_rejects_runtime_state_that_differs_from_construction_config(tm
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     )
     support.sampling = replace(config.sampling, temperature=0.5)
 
@@ -486,8 +490,7 @@ def test_generator_artifact_ignores_unrelated_state_but_remains_strict(tmp_path)
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     ).eval()
     save_artifact(tmp_path, support, backend=backend)
     checkpoint = tmp_path / "model.ckpt"
@@ -527,8 +530,7 @@ def test_artifact_loads_cpu_state_before_moving_to_target_device(tmp_path, monke
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     )
     save_artifact(tmp_path, support, backend=backend)
     load_options: list[tuple[object, object]] = []
@@ -556,8 +558,7 @@ def test_frame_aligned_decode_trims_right_padding() -> None:
             decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
         ),
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     ).eval()
     runtime = SemanticCodecRuntime(support, backend)
     semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
@@ -578,8 +579,7 @@ def test_decode_rejects_mixed_lengths_and_non_prefix_masks() -> None:
             decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
         ),
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     ).eval()
     runtime = SemanticCodecRuntime(support, backend)
     semantic = torch.tensor([[[1], [2], [8]], [[3], [8], [8]]], dtype=torch.long)

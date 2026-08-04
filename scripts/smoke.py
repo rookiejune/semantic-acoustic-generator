@@ -12,6 +12,7 @@ from anytrain.codec import (
     SemanticAcousticCodes,
     load_semantic_acoustic,
     masked_acoustic_features,
+    semantic_acoustic_spec,
 )
 from anytrain.framework.flow_matching import ContinuousFlowRuntime
 
@@ -248,8 +249,7 @@ def _artifact_smoke(backend: FakeCodec, decoder: DecoderConfig) -> None:
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
-        acoustic_feature_dim=backend.acoustic_feature_dim,
-        acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
+        codec_spec=semantic_acoustic_spec(backend),
     ).eval()
     runtime = SemanticCodecRuntime(support, backend)
     without_features = support.sample_features(
