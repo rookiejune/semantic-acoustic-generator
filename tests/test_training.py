@@ -16,6 +16,7 @@ from torch import Tensor
 pytest.importorskip("lightning")
 
 try:
+    import semantic_acoustic_codec.training.service as training_service
     from semantic_acoustic_codec.callback import (
         CodebookUsageLogger,
         SampleLogConfig,
@@ -36,6 +37,7 @@ try:
         SemanticSupportConfig,
     )
     from semantic_acoustic_codec.runtime.artifact import load_artifact
+    from semantic_acoustic_codec.training import build_callbacks, parse_train_config
     from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
 except TypeError as exc:
     if "SPEAKER_ID" not in str(exc):
@@ -688,12 +690,11 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
     assert all(torch.equal(state, generator_states[0]) for state in generator_states[1:])
 
 
-def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
+def test_training_session_uses_datamodule_when_fixed_batch_is_false(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     omegaconf = pytest.importorskip("omegaconf")
-    from scripts import train
 
     fits: list[dict[str, Any]] = []
     built: list[dict[str, Any]] = []
@@ -747,13 +748,13 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
         checkpoint_path,
     )
 
-    monkeypatch.setattr(train.pl, "seed_everything", lambda *args, **kwargs: None)
-    monkeypatch.setattr(train.pl, "Trainer", TrainerStub)
-    monkeypatch.setattr(train, "load_backend", lambda *args, **kwargs: FakeCodec())
-    monkeypatch.setattr(train, "load_batch", fail_single_batch)
-    monkeypatch.setattr(train, "build_module", build)
-    monkeypatch.setattr(train, "DataModule", DataModuleStub)
-    monkeypatch.setattr(train, "single_batch_loader", fail_single_batch)
+    monkeypatch.setattr(training_service.pl, "seed_everything", lambda *args, **kwargs: None)
+    monkeypatch.setattr(training_service.pl, "Trainer", TrainerStub)
+    monkeypatch.setattr(training_service, "load_backend", lambda *args, **kwargs: FakeCodec())
+    monkeypatch.setattr(training_service, "load_batch", fail_single_batch)
+    monkeypatch.setattr(training_service, "build_module", build)
+    monkeypatch.setattr(training_service, "DataModule", DataModuleStub)
+    monkeypatch.setattr(training_service, "single_batch_loader", fail_single_batch)
 
     config = omegaconf.OmegaConf.create(
         {
@@ -845,7 +846,10 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
         }
     )
 
-    train.run(config)
+    session = training_service.build_session(config)
+    assert isinstance(session, training_service.TrainingSession)
+    assert isinstance(session.data_module, DataModuleStub)
+    session.fit()
 
     assert len(fits) == 1
     assert trainer_configs[0]["max_steps"] == 4
@@ -857,9 +861,14 @@ def test_training_entry_uses_datamodule_when_fixed_batch_is_false(
     assert built[0]["feature_std"] == (0.5, 1.0, 1.5, 2.0)
 
 
+def test_training_script_delegates_to_public_service() -> None:
+    from scripts import train
+
+    assert train.run is training_service.run
+
+
 def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
     omegaconf = pytest.importorskip("omegaconf")
-    from scripts import train
 
     config = omegaconf.OmegaConf.create(
         {
@@ -888,8 +897,8 @@ def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
         }
     )
 
-    callbacks = train._build_callbacks(
-        train.parse_train_config(config),
+    callbacks = build_callbacks(
+        parse_train_config(config),
         output_dir=tmp_path,
         fixed_batch=_paired_batch(FakeCodec()),
     )

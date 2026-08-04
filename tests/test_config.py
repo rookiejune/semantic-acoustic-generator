@@ -6,7 +6,6 @@ import pytest
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig
 
-from scripts._train_config import TrainConfig, parse_train_config
 from semantic_acoustic_codec.backend import BackendConfig
 from semantic_acoustic_codec.config import (
     DecoderConfig,
@@ -14,6 +13,7 @@ from semantic_acoustic_codec.config import (
     RVQPredictor,
     decoder_options,
 )
+from semantic_acoustic_codec.training import TrainConfig, parse_train_config
 
 CONFIG_DIR = Path(__file__).parents[1] / "configs"
 

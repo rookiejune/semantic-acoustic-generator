@@ -25,9 +25,7 @@ Do not use this file for experiment logs, benchmark results, private paths, remo
 
 ## Debt Index
 
-| ID | Type | Area | Problem | Risk | Priority | Status | Next Action | Notes |
-|---|---|---|---|---|---|---|---|---|
-| R002 | Boundary debt | `scripts/train.py` composition | The Hydra entry script builds device/output paths, data config, support config, feature stats, callbacks, checkpoints, trainer, and dataloading branches directly. | Training rules are hard to reuse from jobs/tests and new experiment variants must edit an entry script instead of a service/factory boundary. | P1 | pending | Move behavior-preserving train component construction into `src/semantic_acoustic_codec/` and leave `scripts/train.py` as the thin Hydra entry. | Evidence: `scripts/train.py:40-177` plus manual config conversion in `scripts/train.py:180-285`; README declares `scripts/train.py` as the production entry. Acceptance: `python -m pytest tests/test_config.py tests/test_training.py && python scripts/smoke.py && ruff check . && basedpyright`. |
+No open items.
 
 ## Item Template
 

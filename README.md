@@ -57,9 +57,12 @@ basedpyright
 
 ## 训练
 
-`scripts/train.py` 是 Hydra 训练入口。`configs/backend`、`datamodule`、`model`、`loss`、
-`pl_module`、`runtime` 和 `callback` 对应 `src/semantic_acoustic_codec` 的模块边界；
-`configs/experiment/` 显式组合这些 preset 并持有数据范围与训练预算：
+`scripts/train.py` 是薄 Hydra 入口，只负责配置组合并委托给
+`semantic_acoustic_codec.training.run()`。实际训练组装位于
+`semantic_acoustic_codec.training`：调用方和测试可以用 `build_session()` 构造可检查、可复用的
+`TrainingSession`。`configs/backend`、`datamodule`、`model`、`loss`、`pl_module`、`runtime` 和
+`callback` 对应 `src/semantic_acoustic_codec` 的模块边界；`configs/experiment/` 显式组合这些 preset
+并持有数据范围与训练预算：
 
 ```bash
 # 最小真实 DataModule smoke
@@ -79,7 +82,7 @@ python scripts/train.py experiment=ablation_fm_ema
 ```
 
 `pl_module.ema_decay` 非空时启用 `anytrain.lightning.EMACallback`；sample / artifact 导出使用 EMA
-权重。`loss.repa_loss_weight>0` 时 train 入口构造 `WavLMTeacher`（当前仅 LongCat frame-aligned FM）。
+权重。`loss.repa_loss_weight>0` 时训练服务构造 `WavLMTeacher`（当前仅 LongCat frame-aligned FM）。
 CUDA 训练通过 `pl_module.finite_loss_check_interval` 有界延迟检查非有限 loss，并在 epoch 结束和
 checkpoint 保存前强制检查；smoke / overfit 将该值设为 `1` 以获得逐步诊断。
 

@@ -1,3 +1,5 @@
+"""Strict configuration boundary for semantic codec training."""
+
 from __future__ import annotations
 
 import os
@@ -319,7 +321,7 @@ def parse_train_config(config: DictConfig | TrainConfig) -> TrainConfig:
     return cast(TrainConfig, OmegaConf.to_object(merged))
 
 
-def output_dir(config: TrainConfig) -> Path:
+def resolve_output_dir(config: TrainConfig) -> Path:
     if config.output_dir is not None:
         return Path(config.output_dir).expanduser()
     root = os.environ.get("SEMANTIC_ACOUSTIC_CODEC_TRAIN_ROOT")
@@ -444,3 +446,26 @@ def _ratio(value: object, name: str) -> None:
         raise TypeError(f"{name} must be a number.")
     if not 0 <= value <= 1:
         raise ValueError(f"{name} must be in [0, 1].")
+
+
+__all__ = [
+    "CallbackConfig",
+    "CheckpointCallbackConfig",
+    "CodebookUsageCallbackConfig",
+    "DataModuleConfig",
+    "DataThroughputCallbackConfig",
+    "EMACallbackConfig",
+    "LossConfig",
+    "LossSummaryCallbackConfig",
+    "LossTimeBucketCallbackConfig",
+    "ModelConfig",
+    "PerformanceCallbackConfig",
+    "PLModuleConfig",
+    "RepaTeacherConfig",
+    "RuntimeConfig",
+    "SampleCallbackConfig",
+    "TrainConfig",
+    "TrainerConfig",
+    "parse_train_config",
+    "resolve_output_dir",
+]

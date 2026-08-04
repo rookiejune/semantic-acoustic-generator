@@ -225,8 +225,9 @@ src/semantic_acoustic_codec/
   loss/           # route-specific losses
   pl_module/      # LightningModule and training factories
   callback/       # artifact export and sample/audio logging callbacks
+  training/       # strict train config, component factories and TrainingSession
 scripts/
-  train.py        # production train entry
+  train.py        # thin Hydra entry delegating to semantic_acoustic_codec.training
   smoke.py        # minimal local validation
   eval_artifact.py # one-pair artifact evaluation and WAV export
 configs/
@@ -251,8 +252,13 @@ loss、pl_module、runtime、callback 和 trainer，再覆盖该实验独有的�
 `SamplingConfig` 和 `SemanticSupportConfig` 严格校验枚举、布尔值、整数及有限浮点数，不把字符串或 bool
 静默强转为数值。
 
+`semantic_acoustic_codec.training` 是仓库内可复用的训练服务边界。`parse_train_config()` 负责严格配置
+解析，`build_session()` 组装 backend、data module、support、Lightning module、callbacks 和 trainer，
+并返回持有单次 `fit()` 生命周期的 `TrainingSession`；`run()` 只执行这两个阶段。Hydra 装饰器与命令行
+配置路径只存在于 `scripts/train.py`，因此测试、job 或其他仓库内调用方不需要 import 脚本模块。
+
 `runtime/`、`backend/`、`types.py` 和 `model/` 是 `speech-to-speech` 未来依赖的稳定层；
-`datamodule/`、`pl_module/`、`callback/`、`scripts/` 是本仓库训练实现，不应被
+`datamodule/`、`pl_module/`、`callback/`、`training/` 和 `scripts/` 是本仓库训练实现，不应被
 `speech-to-speech` 直接 import。
 
 codec backend 的 capability 由 anytrain 统一提供；本仓库的 `load_backend(BackendConfig, device)` 是严格
