@@ -29,6 +29,7 @@ def main() -> None:
         utmos=UTMOSEvaluator(
             device=args.device,
             backend_load_options={"trust_repo": True},
+            allow_remote_code=args.allow_utmos_remote_code,
         ),
     )
     private: list[dict[str, Any]] = []
@@ -85,6 +86,7 @@ def main() -> None:
             "language": args.language,
             "temperature": 0.0,
             "device": args.device,
+            "allow_utmos_remote_code": args.allow_utmos_remote_code,
         },
         "groups": groups,
     }
@@ -103,6 +105,11 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--whisper-model", default="large-v3")
     parser.add_argument("--whisper-root", type=Path, default=None)
     parser.add_argument("--language", default="en")
+    parser.add_argument(
+        "--allow-utmos-remote-code",
+        action="store_true",
+        help="Allow the fixed TorchHub UTMOS repository to execute its model-loading code.",
+    )
     return parser.parse_args()
 
 

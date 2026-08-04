@@ -24,4 +24,5 @@ echo '{"event":"job.launch","project":"semantic-acoustic-generator","experiment"
     --manifest "${LONGCAT_FIRST_CODEBOOK_OUTPUT_DIR}/artifact-eval/manifest.private.json" \
     --output-dir "${LONGCAT_FIRST_CODEBOOK_OUTPUT_DIR}/artifact-eval/anytrain-eval" \
     --device cuda \
-    --whisper-root "${ANYTRAIN_WHISPER_ROOT:-${HF_HOME}/whisper}"
+    --whisper-root "${ANYTRAIN_WHISPER_ROOT:-${HF_HOME}/whisper}" \
+    --allow-utmos-remote-code
