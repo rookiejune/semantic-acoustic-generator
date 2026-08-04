@@ -6,8 +6,10 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from os import PathLike
-from typing import Any, Protocol, TypeVar, cast, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
+from anydataset import AnyDataset
+from anydataset.dataset import IndexSelection, MapStyleABC
 from anydataset.types import (
     AudioItem,
     AudioMeta,
@@ -47,7 +49,7 @@ class QwenCodecPairSample:
 
 
 @dataclass(frozen=True)
-class _QwenCodecSampleInfo:
+class _QwenCodecIdentity:
     index: int
     text_index: int
     source_index: int
@@ -55,6 +57,10 @@ class _QwenCodecSampleInfo:
     utterance_id: str
     speaker_id: str
     text: str
+
+
+@dataclass(frozen=True)
+class _QwenCodecSampleInfo(_QwenCodecIdentity):
     raw_length: int
 
 
@@ -66,7 +72,6 @@ class _LoadedCell:
 
 _INFO_CACHE_SIZE = 1024
 _REFERENCE_CACHE_SIZE = 1024
-_T = TypeVar("_T")
 
 
 @runtime_checkable
@@ -77,6 +82,11 @@ class _CostRowDataset(Protocol):
 @runtime_checkable
 class _CostRow(Protocol):
     def item(self, ref: tuple[Role, Modality]) -> object: ...
+
+
+@runtime_checkable
+class _MetadataCellDataset(Protocol):
+    def metadata_cell(self, index: int) -> object: ...
 
 
 class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
@@ -113,6 +123,25 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
         )
         if not self.text_indices:
             raise ValueError(f"Qwen codec grid has no rows for role {role.value!r}.")
+        cells = self.grid.cells
+        if not isinstance(cells, MapStyleABC):
+            raise TypeError(
+                "Qwen codec grid cells must be a MapStyleABC for payload-local ordering."
+            )
+        self._index_order: MapStyleABC = IndexSelection(
+            cells,
+            tuple(self._flat_index(text_index) for text_index in self.text_indices),
+        )
+        self._metadata_cells = (
+            AnyDataset.from_store(
+                cells.spec.path,
+                split=split,
+                views=((self.grid.text_ref[0], self.grid.text_ref[1], TextView.TEXT),),
+            )
+            if isinstance(cells, AnyDataset)
+            else None
+        )
+        self._identity_cache: OrderedDict[int, _QwenCodecIdentity] = OrderedDict()
         self._info_cache: OrderedDict[int, _QwenCodecSampleInfo] = OrderedDict()
 
     def __len__(self) -> int:
@@ -120,6 +149,10 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
 
     def __getitem__(self, index: int) -> QwenCodecSample:
         return self._sample(self._read(index))
+
+    @property
+    def index_order(self) -> MapStyleABC:
+        return self._index_order
 
     def _sample(self, cell: _LoadedCell) -> QwenCodecSample:
         info = cell.info
@@ -142,12 +175,36 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
             return cached
         return self._read(index).info
 
+    def identity(self, index: int) -> _QwenCodecIdentity:
+        index = _index(index, size=len(self), source="Qwen codec column sample")
+        cached = self._identity_cache.get(index)
+        if cached is not None:
+            self._identity_cache.move_to_end(index)
+            return cached
+        text_index = self.text_indices[index]
+        cell = self._metadata_cell(text_index)
+        text = cell.get(self.grid.text_ref)
+        if not isinstance(text, TextItem):
+            raise TypeError("Qwen codec metadata cell must contain a TextItem.")
+        identity = self._sample_identity(index, text_index, text)
+        self._cache_identity(identity)
+        return identity
+
     def _read(self, index: int) -> _LoadedCell:
         index = _index(index, size=len(self), source="Qwen codec column sample")
         text_index = self.text_indices[index]
         text_item, audio_item = self._items(self._cell(text_index))
         codec_view = audio_item.views.get(self.view)
-        info = self._sample_info(index, text_index, text_item, codec_view)
+        loaded_identity = self._sample_identity(index, text_index, text_item)
+        identity = self._identity_cache.get(index)
+        if identity is None:
+            identity = loaded_identity
+            self._cache_identity(identity)
+        else:
+            self._identity_cache.move_to_end(index)
+            if identity != loaded_identity:
+                raise ValueError("Qwen codec metadata identity does not match its payload cell.")
+        info = self._sample_info(identity, codec_view)
         self._cache_info(info)
         return _LoadedCell(info=info, codec_view=codec_view)
 
@@ -178,11 +235,26 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
 
     def _sample_info(
         self,
+        identity: _QwenCodecIdentity,
+        codec_view: object,
+    ) -> _QwenCodecSampleInfo:
+        return _QwenCodecSampleInfo(
+            index=identity.index,
+            text_index=identity.text_index,
+            source_index=identity.source_index,
+            role=identity.role,
+            utterance_id=identity.utterance_id,
+            speaker_id=identity.speaker_id,
+            text=identity.text,
+            raw_length=_raw_length(codec_view, self.codec),
+        )
+
+    def _sample_identity(
+        self,
         index: int,
         text_index: int,
         text_item: TextItem,
-        codec_view: object,
-    ) -> _QwenCodecSampleInfo:
+    ) -> _QwenCodecIdentity:
         row = self.grid.row_specs[text_index]
         source_index = text_item.meta.get(TextMeta.SOURCE_INDEX)
         if isinstance(source_index, bool) or not isinstance(source_index, int):
@@ -192,16 +264,10 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
                 f"Qwen codec text row {text_index} has source index {source_index!r}; "
                 f"expected {row.source_index!r}."
             )
-        actual_speaker = text_item.views.get(TextView.SPEAKERS)
-        if actual_speaker != self.speaker_id:
-            raise ValueError(
-                f"Qwen codec text row {text_index} has speaker {actual_speaker!r}; "
-                f"expected {self.speaker_id!r}."
-            )
         text = text_item.views.get(TextView.TEXT)
         if not isinstance(text, str) or not text:
             raise ValueError("Qwen codec grid text must be a non-empty string.")
-        return _QwenCodecSampleInfo(
+        return _QwenCodecIdentity(
             index=index,
             text_index=text_index,
             source_index=source_index,
@@ -212,13 +278,18 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
             ),
             speaker_id=self.speaker_id,
             text=text,
-            raw_length=_raw_length(codec_view, self.codec),
         )
 
     def _items(self, cell: Mapping[Any, Any]) -> tuple[TextItem, AudioItem]:
         text = cell.get(self.grid.text_ref)
         if not isinstance(text, TextItem):
             raise TypeError("Qwen codec grid text cell must contain a TextItem.")
+        actual_speaker = text.views.get(TextView.SPEAKERS)
+        if actual_speaker != self.speaker_id:
+            raise ValueError(
+                f"Qwen codec text cell has speaker {actual_speaker!r}; "
+                f"expected {self.speaker_id!r}."
+            )
         audio = cell.get(self.grid.audio_ref)
         if not isinstance(audio, AudioItem):
             raise TypeError("Qwen codec grid audio cell must contain an AudioItem.")
@@ -235,6 +306,25 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
         self._info_cache.move_to_end(info.index)
         if len(self._info_cache) > _INFO_CACHE_SIZE:
             self._info_cache.popitem(last=False)
+
+    def _cache_identity(self, identity: _QwenCodecIdentity) -> None:
+        self._identity_cache[identity.index] = identity
+        self._identity_cache.move_to_end(identity.index)
+        if len(self._identity_cache) > _INFO_CACHE_SIZE:
+            self._identity_cache.popitem(last=False)
+
+    def _metadata_cell(self, text_index: int) -> Mapping[Any, Any]:
+        index = self._flat_index(text_index)
+        cells = self.grid.cells
+        if isinstance(cells, _MetadataCellDataset):
+            cell = cells.metadata_cell(index)
+        elif self._metadata_cells is not None:
+            cell = self._metadata_cells[index]
+        else:
+            cell = cells[index]
+        if not isinstance(cell, Mapping):
+            raise TypeError("Qwen codec metadata cell must be a mapping.")
+        return cell
 
     def _cell(self, text_index: int) -> Mapping[Any, Any]:
         return self.grid.cells[self._flat_index(text_index)]
@@ -253,6 +343,7 @@ class QwenCodecPairDataset(Dataset[QwenCodecPairSample]):
         if size < 2:
             raise ValueError("cross-text pairing requires at least two Qwen codec samples.")
         self.size = size
+        self._index_order: MapStyleABC = IndexSelection(source.index_order, range(size))
         self._reference_indices: OrderedDict[int, int] = OrderedDict()
 
     def __len__(self) -> int:
@@ -261,18 +352,8 @@ class QwenCodecPairDataset(Dataset[QwenCodecPairSample]):
     def __getitem__(self, index: int) -> QwenCodecPairSample:
         index = _index(index, size=len(self), source="Qwen codec pair sample")
         target_cell = self.source._read(index)
-        reference_index = self._reference_indices.get(index)
-        if reference_index is None:
-            reference_index, reference_cell = _find_reference(
-                target_cell.info,
-                size=len(self),
-                load=self.source._read,
-                describe=_cell_info,
-            )
-            self._cache_reference(index, reference_index)
-        else:
-            self._reference_indices.move_to_end(index)
-            reference_cell = self.source._read(reference_index)
+        reference_index = self._reference_index(index, target_cell.info)
+        reference_cell = self.source._read(reference_index)
         target = self.source._sample(target_cell)
         reference = self.source._sample(reference_cell)
         return QwenCodecPairSample(
@@ -282,31 +363,38 @@ class QwenCodecPairDataset(Dataset[QwenCodecPairSample]):
             reference=reference,
         )
 
+    @property
+    def index_order(self) -> MapStyleABC:
+        return self._index_order
+
     def raw_length(self, index: int) -> int:
         index = _index(index, size=len(self), source="Qwen codec pair sample")
         target = self.source.info(index)
-        reference_index = self._reference_indices.get(index)
-        if reference_index is None:
-            reference_index, reference = _find_reference(
-                target,
-                size=len(self),
-                load=self.source.info,
-                describe=_info_value,
-            )
-            self._cache_reference(index, reference_index)
-        else:
-            self._reference_indices.move_to_end(index)
-            reference = self.source.info(reference_index)
+        reference_index = self._reference_index(index, target)
+        reference = self.source.info(reference_index)
         return max(target.raw_length, reference.raw_length)
 
     def duration(self, index: int) -> float:
         index = _index(index, size=len(self), source="Qwen codec pair sample")
-        # The worker may skip duplicate-text candidates; planning only needs a stable proxy.
-        reference_index = (index + 1) % len(self)
+        target = self.source.identity(index)
+        reference_index = self._reference_index(index, target)
         return max(
             self.source.duration(index),
             self.source.duration(reference_index),
         )
+
+    def _reference_index(self, index: int, target: _QwenCodecIdentity) -> int:
+        reference_index = self._reference_indices.get(index)
+        if reference_index is None:
+            reference_index = _find_reference(
+                target,
+                size=len(self),
+                load=self.source.identity,
+            )
+            self._cache_reference(index, reference_index)
+        else:
+            self._reference_indices.move_to_end(index)
+        return reference_index
 
     def _cache_reference(self, index: int, reference_index: int) -> None:
         self._reference_indices[index] = reference_index
@@ -364,34 +452,27 @@ def _positive_length(value: int) -> int:
 
 
 def _find_reference(
-    target: _QwenCodecSampleInfo,
+    target: _QwenCodecIdentity,
     *,
     size: int,
-    load: Callable[[int], _T],
-    describe: Callable[[_T], _QwenCodecSampleInfo],
-) -> tuple[int, _T]:
+    load: Callable[[int], _QwenCodecIdentity],
+) -> int:
     for offset in range(1, size):
         reference_index = (target.index + offset) % size
-        value = load(reference_index)
-        if _is_reference_info(target, describe(value)):
-            return reference_index, value
+        reference = load(reference_index)
+        if not isinstance(reference, _QwenCodecIdentity):
+            raise TypeError("Qwen codec reference identity loader returned an invalid value.")
+        if _is_reference_identity(target, reference):
+            return reference_index
     raise ValueError(
         f"Qwen codec sample {target.utterance_id!r} has no same-speaker "
         "reference from a different text row with a different utterance id and text."
     )
 
 
-def _cell_info(value: _LoadedCell) -> _QwenCodecSampleInfo:
-    return value.info
-
-
-def _info_value(value: _QwenCodecSampleInfo) -> _QwenCodecSampleInfo:
-    return value
-
-
-def _is_reference_info(
-    target: _QwenCodecSampleInfo,
-    reference: _QwenCodecSampleInfo,
+def _is_reference_identity(
+    target: _QwenCodecIdentity,
+    reference: _QwenCodecIdentity,
 ) -> bool:
     return (
         reference.speaker_id == target.speaker_id

@@ -502,6 +502,14 @@ def test_paired_reference_dropout_is_sampled_per_row(monkeypatch: pytest.MonkeyP
         normalize_features=True,
         reference_dropout=0.5,
     )
+    convert = backend.acoustic_codes_to_features
+    converted_batches: list[int] = []
+
+    def acoustic_codes_to_features(codes: Tensor) -> Tensor:
+        converted_batches.append(codes.size(0))
+        return convert(codes)
+
+    monkeypatch.setattr(backend, "acoustic_codes_to_features", acoustic_codes_to_features)
     original_rand = torch.rand
     sampled = False
 
@@ -523,6 +531,7 @@ def test_paired_reference_dropout_is_sampled_per_row(monkeypatch: pytest.MonkeyP
         captured["features"] = args[0]
         captured["mask"] = kwargs["mask"]
         captured["use_reference"] = kwargs["use_reference"]
+        captured["row_indices"] = kwargs["row_indices"]
 
     logs: dict[str, Any] = {}
 
@@ -544,15 +553,16 @@ def test_paired_reference_dropout_is_sampled_per_row(monkeypatch: pytest.MonkeyP
     reference_mask = batch.reference_acoustic_mask
     assert reference_codes is not None
     assert reference_mask is not None
-    expected = backend.acoustic_codes_to_features(
-        reference_codes.masked_fill(~reference_mask[..., None], 0)
-    ).masked_fill(~reference_mask[..., None], 0)
+    expected_codes = reference_codes[1:].masked_fill(~reference_mask[1:, ..., None], 0)
+    expected = convert(expected_codes).masked_fill(~reference_mask[1:, ..., None], 0)
     null = module.support.reference_conditioner.null_condition
 
     assert sampled
+    assert converted_batches == [2, 1]
     torch.testing.assert_close(features, expected)
-    assert torch.equal(cast(Tensor, captured["mask"]), reference_mask)
-    assert cast(Tensor, captured["use_reference"]).tolist() == [False, True]
+    assert torch.equal(cast(Tensor, captured["mask"]), reference_mask[1:])
+    assert captured["use_reference"] is None
+    assert cast(Tensor, captured["row_indices"]).tolist() == [1]
     assert float(cast(Tensor, logs["train/reference_fraction"])) == pytest.approx(0.5)
     assert null.grad is not None
 

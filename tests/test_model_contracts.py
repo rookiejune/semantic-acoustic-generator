@@ -31,6 +31,9 @@ from semantic_acoustic_codec.model import (
     SemanticConditioner,
     build_route,
 )
+from semantic_acoustic_codec.model import (
+    condition as condition_module,
+)
 from semantic_acoustic_codec.model.condition import FixedLengthConditioner
 from semantic_acoustic_codec.runtime import (
     SamplingConfig,
@@ -211,10 +214,18 @@ def test_reference_conditioner_uses_explicit_and_null_reference() -> None:
         batch_size=2,
         use_reference=torch.tensor([True, False]),
     )
+    packed = conditioner(
+        features[1:],
+        mask=mask[1:],
+        batch_size=2,
+        row_indices=torch.tensor([1]),
+    )
 
     assert explicit.shape == (2, 1, 6)
     assert null.shape == (2, 1, 6)
     assert torch.equal(mixed[1], null[1])
+    torch.testing.assert_close(packed[1], explicit[1])
+    assert torch.equal(packed[0], null[0])
     assert "null_condition" in conditioner.state_dict()
     assert "default_feature" not in conditioner.state_dict()
 
@@ -300,6 +311,33 @@ def test_fixed_length_conditioner_uses_slot_queries_and_full_semantic_memory() -
     assert memory.grad is not None
     assert bool((memory.grad[0, :2].abs().sum(dim=-1) > 0).all())
     assert torch.equal(memory.grad[0, 2], torch.zeros_like(memory.grad[0, 2]))
+
+
+def test_fixed_length_conditioner_reuses_and_grows_position_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    positions = condition_module._sinusoidal_positions
+
+    def capture_positions(length, dim, *, device, dtype):
+        calls.append(length)
+        return positions(length, dim, device=device, dtype=dtype)
+
+    monkeypatch.setattr(condition_module, "_sinusoidal_positions", capture_positions)
+    conditioner = FixedLengthConditioner(condition_dim=4, slots=3)
+    memory = torch.randn(1, 2, 4)
+    mask = torch.ones(1, 2, dtype=torch.bool)
+
+    first = conditioner(memory, mask, output_length=2)
+    second = conditioner(memory, mask, output_length=2)
+    _ = conditioner(
+        torch.randn(1, 3, 4),
+        torch.ones(1, 3, dtype=torch.bool),
+        output_length=2,
+    )
+
+    torch.testing.assert_close(first, second)
+    assert calls == [2, 4]
 
 
 def test_fm_loss_returns_repa_features_when_configured() -> None:

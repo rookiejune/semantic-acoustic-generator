@@ -338,8 +338,7 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
         return (features - self.support.feature_mean) / self.support.feature_std
 
     def _condition(self, batch: SemanticCodecBatch) -> tuple[Tensor, Tensor]:
-        reference_features = self._reference_features(batch)
-        if reference_features is None:
+        if not batch.has_reference:
             condition = self.support.condition(
                 batch.semantic_codes,
                 mask=batch.mask,
@@ -348,24 +347,41 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
             rows = torch.zeros(batch.semantic_codes.size(0), dtype=torch.bool, device=self.device)
             return condition, rows
 
-        reference_mask = batch.reference.acoustic_mask.to(device=batch.semantic_codes.device)
-        rows = self._reference_rows(batch.semantic_codes.size(0))
+        rows, indices = self._reference_rows(batch.semantic_codes.size(0))
+        if indices.numel() == 0:
+            condition = self.support.condition(
+                batch.semantic_codes,
+                mask=batch.mask,
+                validate=False,
+            )
+            return condition, rows
+
+        reference = batch.reference
+        reference_indices = indices.to(device=reference.acoustic_mask.device)
+        reference_mask = reference.acoustic_mask.index_select(0, reference_indices)
+        reference_mask = reference_mask.to(device=batch.semantic_codes.device)
+        reference_features = self._reference_features(batch, indices=indices)
+        if reference_features is None:
+            raise RuntimeError("paired semantic codec batch is missing reference features.")
         condition = self.support.condition(
             batch.semantic_codes,
             mask=batch.mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
-            use_reference=rows,
+            reference_indices=indices,
             validate=False,
         )
         return condition, rows
 
-    def _reference_rows(self, batch_size: int) -> Tensor:
+    def _reference_rows(self, batch_size: int) -> tuple[Tensor, Tensor]:
         if self.reference_dropout <= 0:
-            return torch.ones(batch_size, dtype=torch.bool, device=self.device)
-        if self.reference_dropout >= 1:
-            return torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-        return torch.rand(batch_size, device=self.device) >= self.reference_dropout
+            rows = torch.ones(batch_size, dtype=torch.bool)
+        elif self.reference_dropout >= 1:
+            rows = torch.zeros(batch_size, dtype=torch.bool)
+        else:
+            rows = torch.rand(batch_size, device="cpu") >= self.reference_dropout
+        indices = rows.nonzero(as_tuple=False).flatten()
+        return rows.to(device=self.device), indices
 
     def _track_finite_training_loss(self, loss: Tensor, *, name: str) -> None:
         finite = torch.isfinite(loss.detach()).all()
@@ -448,13 +464,24 @@ class SemanticCodecModule(LightningLogMixin, LightningModule):
         )
 
     @torch.no_grad()
-    def _reference_features(self, batch: SemanticCodecBatch) -> Tensor | None:
+    def _reference_features(
+        self,
+        batch: SemanticCodecBatch,
+        *,
+        indices: Tensor | None = None,
+    ) -> Tensor | None:
         if not batch.has_reference:
             return None
         reference = batch.reference
-        mask = reference.acoustic_mask.to(device=batch.semantic_codes.device)
+        codes = reference.acoustic_codes
+        mask = reference.acoustic_mask
+        if indices is not None:
+            selected = indices.to(device=codes.device)
+            codes = codes.index_select(0, selected)
+            mask = mask.index_select(0, selected)
+        mask = mask.to(device=batch.semantic_codes.device)
         return masked_acoustic_features(
-            self.backend, reference.acoustic_codes, mask, validate=False
+            self.backend, codes, mask, validate=False
         )
 
 

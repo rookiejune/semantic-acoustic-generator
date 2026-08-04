@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from anydataset.dataset import MapStyleABC
 from anydataset.dataset.speaker import SpeakerAudioGrid, SpeakerAudioRow
 from anydataset.types import (
     AudioItem,
@@ -480,6 +481,120 @@ def test_qwen_pair_sample_count_fences_reference_pool(
     assert accesses == [1, 0]
 
 
+def test_qwen_column_and_pair_preserve_payload_local_index_groups_without_loading(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accesses: list[int] = []
+    shuffle_calls: list[tuple[bool, int, int, int, int]] = []
+    groups = (tuple(range(8)), tuple(range(8, 16)))
+    cells = _GroupedTrackingCells(
+        [{} for _ in range(16)],
+        accesses=accesses,
+        cost_accesses=None,
+        durations=(1.0,) * 16,
+        groups=groups,
+        shuffle_calls=shuffle_calls,
+    )
+    grid = SpeakerAudioGrid(
+        cells,
+        ("alice", "vivian"),
+        row_specs=(
+            SpeakerAudioRow(source_index=0, role=Role.SOURCE),
+            SpeakerAudioRow(source_index=0, role=Role.TARGET),
+            SpeakerAudioRow(source_index=1, role=Role.SOURCE),
+            SpeakerAudioRow(source_index=1, role=Role.TARGET),
+            SpeakerAudioRow(source_index=2, role=Role.SOURCE),
+            SpeakerAudioRow(source_index=2, role=Role.TARGET),
+            SpeakerAudioRow(source_index=3, role=Role.SOURCE),
+            SpeakerAudioRow(source_index=3, role=Role.TARGET),
+        ),
+    )
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+
+    column = qwen_data.QwenCodecColumnDataset(
+        codec="bicodec",
+        root=tmp_path,
+        split="train",
+        role=Role.TARGET,
+        speaker_id="vivian",
+    )
+    pairs = qwen_data.QwenCodecPairDataset(column, sample_count=3)
+    prepared = module_data._PreparedDataset(
+        pairs,
+        indexes=range(3),
+        costs=(1, 1, 1),
+        shuffle_group_samples=3,
+    )
+    column_groups = list(
+        column.index_order._shuffle(
+            shuffle=True,
+            seed=7,
+            epoch=2,
+            num_replicas=1,
+            rank=0,
+        )
+    )
+    pair_groups = list(
+        pairs.index_order._shuffle(
+            shuffle=True,
+            seed=7,
+            epoch=2,
+            num_replicas=1,
+            rank=0,
+        )
+    )
+    prepared_groups = list(
+        prepared._shuffle(
+            shuffle=True,
+            seed=7,
+            epoch=2,
+            num_replicas=1,
+            rank=0,
+        )
+    )
+
+    assert column.index_order.indices == (3, 7, 11, 15)
+    assert column_groups == [[0, 1], [2, 3]]
+    assert pair_groups == [[0, 1], [2]]
+    assert prepared_groups == [(0, 1, 2)]
+    assert shuffle_calls == [
+        (True, 7, 2, 1, 0),
+        (True, 7, 2, 1, 0),
+        (True, 7, 2, 1, 0),
+    ]
+    assert accesses == []
+
+
+def test_qwen_column_rejects_cells_without_anydataset_index_order(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grid = SpeakerAudioGrid(
+        [{}],
+        ("vivian",),
+        row_specs=(SpeakerAudioRow(source_index=0, role=Role.TARGET),),
+    )
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+
+    with pytest.raises(TypeError, match="cells must be a MapStyleABC"):
+        qwen_data.QwenCodecColumnDataset(
+            codec="bicodec",
+            root=tmp_path,
+            split="train",
+            role=Role.TARGET,
+            speaker_id="vivian",
+        )
+
+
 def test_qwen_pair_reads_candidates_once_and_materializes_only_the_pair(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -516,10 +631,46 @@ def test_qwen_pair_reads_candidates_once_and_materializes_only_the_pair(
 
     pair = qwen_data.QwenCodecPairDataset(source)[0]
 
-    assert accesses == [0, 1, 2]
+    assert accesses == [0, 2]
     assert len(materialized) == 2
     assert pair.target.text == "duplicate"
     assert pair.reference.text == "selected"
+
+
+def test_qwen_pair_duration_uses_the_actual_cross_text_reference_without_payload_reads(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accesses: list[int] = []
+    cost_accesses: list[int] = []
+    grid = _grid(
+        [
+            ("duplicate", torch.ones(1, 1), torch.ones(4, 1)),
+            ("duplicate", torch.ones(2, 1), torch.ones(4, 1)),
+            ("selected", torch.ones(8, 1), torch.ones(4, 1)),
+        ],
+        frame_rate=1.0,
+        accesses=accesses,
+        cost_accesses=cost_accesses,
+    )
+    monkeypatch.setattr(
+        qwen_data.qwen_tts,
+        "speaker_grid",
+        lambda **_: SimpleNamespace(load=lambda: grid),
+    )
+    source = qwen_data.QwenCodecColumnDataset(
+        codec="bicodec",
+        root=tmp_path,
+        split="train",
+        role=Role.TARGET,
+        speaker_id="vivian",
+    )
+
+    duration = qwen_data.QwenCodecPairDataset(source).duration(0)
+
+    assert duration == 8.0
+    assert accesses == []
+    assert cost_accesses == [0, 2]
 
 
 def test_datamodule_exposes_deterministic_held_out_split(
@@ -722,7 +873,7 @@ def _grid(
     )
 
 
-class _TrackingCells:
+class _TrackingCells(MapStyleABC):
     def __init__(
         self,
         cells,
@@ -748,6 +899,30 @@ class _TrackingCells:
         if self.cost_accesses is not None:
             self.cost_accesses.append(index)
         return _CostRow(self.durations[index])
+
+    def metadata_cell(self, index: int):
+        return self.cells[index]
+
+
+class _GroupedTrackingCells(_TrackingCells):
+    def __init__(self, *args, groups, shuffle_calls, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.groups = groups
+        self.shuffle_calls = shuffle_calls
+
+    def _shuffle(
+        self,
+        *,
+        shuffle: bool,
+        seed: int,
+        epoch: int,
+        num_replicas: int,
+        rank: int,
+    ):
+        self.shuffle_calls.append((shuffle, seed, epoch, num_replicas, rank))
+        if num_replicas != 1 or rank != 0:
+            raise AssertionError("IndexSelection must request the complete base ordering.")
+        yield from self.groups
 
 
 class _CostRow:

@@ -186,6 +186,7 @@ class SemanticCodecSupport(nn.Module):
             reference_features=reference_features,
             reference_mask=reference_mask,
             use_reference=None,
+            reference_indices=None,
             validate=True,
         )
         if self.route is Route.RVQ:
@@ -199,6 +200,7 @@ class SemanticCodecSupport(nn.Module):
                 reference_features=None,
                 reference_mask=None,
                 use_reference=None,
+                reference_indices=None,
                 validate=False,
             )
         target_length = self._output_length(output_length)
@@ -255,6 +257,7 @@ class SemanticCodecSupport(nn.Module):
             reference_features=reference_features,
             reference_mask=reference_mask,
             use_reference=None,
+            reference_indices=None,
             validate=True,
         )
         target_length = self._output_length(output_length)
@@ -301,6 +304,7 @@ class SemanticCodecSupport(nn.Module):
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
         use_reference: Tensor | None = None,
+        reference_indices: Tensor | None = None,
         validate: bool = True,
     ) -> Tensor:
         prepared, frame_mask = self._semantic_input(semantic_codes, mask, validate=validate)
@@ -311,6 +315,7 @@ class SemanticCodecSupport(nn.Module):
             reference_features=reference_features,
             reference_mask=reference_mask,
             use_reference=use_reference,
+            reference_indices=reference_indices,
             validate=validate,
         )
 
@@ -322,6 +327,7 @@ class SemanticCodecSupport(nn.Module):
         reference_features: Tensor | None,
         reference_mask: Tensor | None,
         use_reference: Tensor | None,
+        reference_indices: Tensor | None,
         validate: bool,
     ) -> Tensor:
         reference = self._reference_condition(
@@ -329,6 +335,7 @@ class SemanticCodecSupport(nn.Module):
             reference_features=reference_features,
             reference_mask=reference_mask,
             use_reference=use_reference,
+            reference_indices=reference_indices,
             validate=validate,
         )
         return (semantic + reference).masked_fill(~frame_mask[..., None], 0)
@@ -340,6 +347,7 @@ class SemanticCodecSupport(nn.Module):
         reference_features: Tensor | None,
         reference_mask: Tensor | None,
         use_reference: Tensor | None,
+        reference_indices: Tensor | None,
         validate: bool,
     ) -> Tensor:
         features = reference_features
@@ -354,11 +362,14 @@ class SemanticCodecSupport(nn.Module):
             features = features.to(device=parameter.device, dtype=parameter.dtype)
         if reference_mask is not None:
             reference_mask = reference_mask.to(device=parameter.device)
+        if reference_indices is not None:
+            reference_indices = reference_indices.to(device=parameter.device)
         return self.reference_conditioner(
             features,
             mask=reference_mask,
             batch_size=batch_size,
             use_reference=use_reference,
+            row_indices=reference_indices,
             validate=validate,
         )
 

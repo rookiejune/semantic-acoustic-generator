@@ -105,6 +105,7 @@ class ReferenceConditioner(nn.Module):
         mask: Tensor | None = None,
         batch_size: int | None = None,
         use_reference: Tensor | None = None,
+        row_indices: Tensor | None = None,
         validate: bool = True,
     ) -> Tensor:
         if features is None:
@@ -112,13 +113,22 @@ class ReferenceConditioner(nn.Module):
                 raise ValueError("batch_size is required for the null reference.")
             if validate and batch_size < 1:
                 raise ValueError("batch_size must be positive for the null reference.")
-            if validate and (mask is not None or use_reference is not None):
+            if validate and (
+                mask is not None or use_reference is not None or row_indices is not None
+            ):
                 raise ValueError("reference mask/presence require explicit reference features.")
             return self.null_condition.view(1, 1, -1).expand(batch_size, 1, -1)
 
         if validate and (features.dim() != 3 or features.size(-1) != self.feature_dim):
             raise ValueError("reference features must have shape [B, F, feature_dim].")
-        if validate and batch_size is not None and features.size(0) != batch_size:
+        if validate and use_reference is not None and row_indices is not None:
+            raise ValueError("use_reference and row_indices are mutually exclusive.")
+        if (
+            validate
+            and row_indices is None
+            and batch_size is not None
+            and features.size(0) != batch_size
+        ):
             raise ValueError("reference batch must match semantic batch.")
         if mask is None:
             mask = torch.ones(features.shape[:2], device=features.device, dtype=torch.bool)
@@ -134,14 +144,35 @@ class ReferenceConditioner(nn.Module):
             and (use_reference.shape != (features.size(0),) or use_reference.dtype != torch.bool)
         ):
             raise ValueError("use_reference must be boolean with shape [B].")
+        if row_indices is not None:
+            if batch_size is None:
+                raise ValueError("batch_size is required with packed reference rows.")
+            if validate and (
+                row_indices.shape != (features.size(0),)
+                or not is_signed_integer_dtype(row_indices.dtype)
+            ):
+                raise ValueError("row_indices must be integer with shape [reference_batch].")
+            if validate and bool(
+                ((row_indices < 0) | (row_indices >= batch_size)).any()
+            ):
+                raise ValueError("row_indices must select rows within batch_size.")
+            if validate and row_indices.unique().numel() != row_indices.numel():
+                raise ValueError("row_indices must not contain duplicates.")
 
         if use_reference is not None:
             use_reference = use_reference.to(device=features.device)
+        if row_indices is not None:
+            row_indices = row_indices.to(device=features.device, dtype=torch.long)
 
         weights = mask[..., None].to(dtype=features.dtype)
         pooled = (features * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
         pooled = self.norm(self.projection(pooled))
         conditioned = pooled[:, None] * torch.tanh(self.gate)[None, None]
+        if row_indices is not None:
+            if batch_size is None:
+                raise RuntimeError("packed reference rows require batch_size.")
+            null = self.null_condition.view(1, 1, -1).expand(batch_size, 1, -1)
+            return null.index_copy(0, row_indices, conditioned)
         if use_reference is None:
             return conditioned
         null = self.null_condition.view(1, 1, -1).expand(features.size(0), 1, -1)
@@ -169,6 +200,7 @@ class FixedLengthConditioner(nn.Module):
         self.query_norm = _norm(condition_dim)
         self.memory_norm = _norm(condition_dim)
         self.output_norm = _norm(condition_dim)
+        self._position_cache: Tensor = torch.empty(0, condition_dim)
 
     def forward(
         self,
@@ -197,12 +229,7 @@ class FixedLengthConditioner(nn.Module):
                 f"fixed-length output_length must be in [1, {self.slots}], got {output_length}."
             )
 
-        positions = _sinusoidal_positions(
-            memory.size(1),
-            self.condition_dim,
-            device=memory.device,
-            dtype=memory.dtype,
-        )
+        positions = self._positions(memory)
         normalized_memory = self.memory_norm(memory + positions[None])
         queries = self.query_norm(self.slot_queries[:output_length].to(dtype=memory.dtype))
         queries = queries[None].expand(memory.size(0), -1, -1)
@@ -212,6 +239,22 @@ class FixedLengthConditioner(nn.Module):
         weights = scores.float().softmax(dim=-1).to(dtype=normalized_memory.dtype)
         context = torch.matmul(weights, normalized_memory)
         return self.output_norm(queries + context)
+
+    def _positions(self, memory: Tensor) -> Tensor:
+        length = memory.size(1)
+        cache = self._position_cache
+        same_type = cache.device == memory.device and cache.dtype == memory.dtype
+        if not same_type or cache.size(0) < length:
+            previous = cache.size(0) if same_type else 0
+            capacity = max(length, max(1, previous * 2))
+            cache = _sinusoidal_positions(
+                capacity,
+                self.condition_dim,
+                device=memory.device,
+                dtype=memory.dtype,
+            )
+            self._position_cache = cache
+        return cache[:length]
 
 
 def repeat_condition(condition: Tensor, spans: Tensor, *, frames: int | None) -> Tensor:

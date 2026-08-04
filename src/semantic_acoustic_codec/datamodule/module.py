@@ -4,12 +4,12 @@ import math
 import operator
 import warnings
 from collections import OrderedDict
-from collections.abc import Sequence, Sized
+from collections.abc import Iterator, Sequence, Sized
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Any, cast, overload
+from typing import Any, Protocol, cast, overload, runtime_checkable
 
-from anydataset.dataset import MapStyleABC
+from anydataset.dataset import IndexSelection, MapStyleABC
 from anydataset.types import Role
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 from lightning import pytorch as pl
@@ -144,6 +144,12 @@ class DataConfig:
         return Overlong(self.overlong)
 
 
+@runtime_checkable
+class _IndexOrderedDataset(Protocol):
+    @property
+    def index_order(self) -> MapStyleABC: ...
+
+
 class _PreparedDataset(MapStyleABC):
     """Expose preplanned source indexes without retaining materialized samples."""
 
@@ -153,18 +159,63 @@ class _PreparedDataset(MapStyleABC):
         *,
         indexes: Sequence[int],
         costs: Sequence[int],
+        shuffle_group_samples: int,
     ) -> None:
         if len(indexes) != len(costs):
             raise ValueError("prepared dataset indexes and costs must have equal length.")
+        if not isinstance(source, _IndexOrderedDataset):
+            raise TypeError("semantic codec source must expose a map-style index_order.")
         self.source = source
         self.indexes = tuple(indexes)
+        self.index_order = IndexSelection(source.index_order, self.indexes)
         self.costs = costs
+        self.shuffle_group_samples = shuffle_group_samples
 
     def __len__(self) -> int:
         return len(self.indexes)
 
     def __getitem__(self, index: int) -> Any:
         return self.source[self.indexes[index]]
+
+    def _shuffle(
+        self,
+        *,
+        shuffle: bool,
+        seed: int,
+        epoch: int,
+        num_replicas: int,
+        rank: int,
+    ) -> Iterator[Sequence[int]]:
+        yield from _coalesce_groups(
+            self.index_order._shuffle(
+                shuffle=shuffle,
+                seed=seed,
+                epoch=epoch,
+                num_replicas=num_replicas,
+                rank=rank,
+            ),
+            minimum=self.shuffle_group_samples,
+        )
+
+
+def _coalesce_groups(
+    groups: Iterator[Sequence[int]],
+    *,
+    minimum: int,
+) -> Iterator[Sequence[int]]:
+    pending: list[int] = []
+    for group in groups:
+        if not group:
+            continue
+        if not pending and len(group) >= minimum:
+            yield group
+            continue
+        pending.extend(group)
+        if len(pending) >= minimum:
+            yield tuple(pending)
+            pending.clear()
+    if pending:
+        yield tuple(pending)
 
 
 class _DurationCosts(Sequence[int]):
@@ -322,6 +373,7 @@ class DataModule(pl.LightningDataModule):
                 source,
                 indexes=lazy_indexes,
                 costs=lazy_costs,
+                shuffle_group_samples=data.batch_size,
             ), 0
 
         indexes: list[int] = []
@@ -346,7 +398,12 @@ class DataModule(pl.LightningDataModule):
                 f"than {max_seconds:g} seconds.",
                 stacklevel=2,
             )
-        return _PreparedDataset(source, indexes=indexes, costs=costs), filtered
+        return _PreparedDataset(
+            source,
+            indexes=indexes,
+            costs=costs,
+            shuffle_group_samples=data.batch_size,
+        ), filtered
 
     def _collate(self, data: DataConfig):
         return partial(
