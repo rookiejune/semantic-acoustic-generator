@@ -16,29 +16,33 @@ from torch import Tensor
 pytest.importorskip("lightning")
 
 try:
-    import semantic_acoustic_codec.training.service as training_service
-    from semantic_acoustic_codec.callback import (
+    import semantic_acoustic_generator.training.service as training_service
+    from semantic_acoustic_generator.callback import (
         CodebookUsageLogger,
         SampleLogConfig,
         SampleLogger,
     )
-    from semantic_acoustic_codec.config import DecoderConfig, Route
-    from semantic_acoustic_codec.datamodule import collate_codes, single_batch_loader
-    from semantic_acoustic_codec.pl_module import (
+    from semantic_acoustic_generator.config import DecoderConfig, Route
+    from semantic_acoustic_generator.datamodule import collate_codes, single_batch_loader
+    from semantic_acoustic_generator.pl_module import (
         CHECKPOINT_METADATA_KEY,
         CHECKPOINT_SCHEMA_VERSION,
         build_module,
         dataset_feature_stats,
         feature_stats,
     )
-    from semantic_acoustic_codec.runtime import (
-        SamplingConfig,
-        SemanticCodecRuntime,
-        SemanticSupportConfig,
+    from semantic_acoustic_generator.pl_module.semantic import (
+        LEGACY_CHECKPOINT_METADATA_KEY,
+        LEGACY_CHECKPOINT_SCHEMA_VERSION,
     )
-    from semantic_acoustic_codec.runtime.artifact import load_artifact
-    from semantic_acoustic_codec.training import build_callbacks, parse_train_config
-    from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
+    from semantic_acoustic_generator.runtime import (
+        GeneratorConfig,
+        GeneratorRuntime,
+        SamplingConfig,
+    )
+    from semantic_acoustic_generator.runtime.artifact import load_artifact
+    from semantic_acoustic_generator.training import build_callbacks, parse_train_config
+    from semantic_acoustic_generator.types import GeneratorBatch, PairMetadata
 except TypeError as exc:
     if "SPEAKER_ID" not in str(exc):
         raise
@@ -143,7 +147,7 @@ class FakeRepaTeacher:
         return torch.ones(mask.shape + (self.feature_dim,), device=semantic_codes.device)
 
 
-def _paired_batch(backend: FakeCodec) -> SemanticCodecBatch:
+def _paired_batch(backend: FakeCodec) -> GeneratorBatch:
     target = collate_codes(
         [
             torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long),
@@ -161,7 +165,7 @@ def _paired_batch(backend: FakeCodec) -> SemanticCodecBatch:
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
     metadata = (
-        SemanticCodecPairMetadata(
+        PairMetadata(
             target_index=0,
             reference_index=2,
             target_text_index=0,
@@ -177,7 +181,7 @@ def _paired_batch(backend: FakeCodec) -> SemanticCodecBatch:
             target_text="target text zero",
             reference_text="reference text zero",
         ),
-        SemanticCodecPairMetadata(
+        PairMetadata(
             target_index=1,
             reference_index=3,
             target_text_index=1,
@@ -194,7 +198,7 @@ def _paired_batch(backend: FakeCodec) -> SemanticCodecBatch:
             reference_text="reference text one",
         ),
     )
-    return SemanticCodecBatch(
+    return GeneratorBatch(
         semantic_codes=target.semantic_codes,
         acoustic_codes=target.acoustic_codes,
         mask=target.mask,
@@ -285,7 +289,7 @@ def test_training_module_trains_and_exports_artifact(tmp_path) -> None:
         semantic_pad_id=backend.semantic_codebook.size(0),
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -316,7 +320,7 @@ def test_training_module_rejects_non_finite_loss(monkeypatch: pytest.MonkeyPatch
         semantic_pad_id=backend.semantic_codebook.size(0),
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -341,7 +345,7 @@ def test_deferred_finite_loss_guard_is_sticky_and_checkpoint_safe() -> None:
         semantic_pad_id=backend.semantic_codebook.size(0),
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -362,7 +366,7 @@ def test_deferred_finite_loss_guard_resets_after_successful_flush() -> None:
         semantic_pad_id=backend.semantic_codebook.size(0),
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -383,7 +387,7 @@ def test_training_resume_uses_configured_learning_rate(tmp_path: Path) -> None:
         semantic_pad_id=backend.semantic_codebook.size(0),
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -457,7 +461,7 @@ def test_training_checkpoint_drops_backend_and_requires_support_state() -> None:
         semantic_pad_id=backend.semantic_codebook.size(0),
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -467,8 +471,13 @@ def test_training_checkpoint_drops_backend_and_requires_support_state() -> None:
 
     assert not any(key.startswith("backend.") for key in checkpoint["state_dict"])
     checkpoint["state_dict"]["backend.probe.weight"] = backend.probe.weight.detach().clone()
+    checkpoint[LEGACY_CHECKPOINT_METADATA_KEY] = {
+        "schema_version": LEGACY_CHECKPOINT_SCHEMA_VERSION,
+        "backend_state": "external",
+    }
     module.on_save_checkpoint(checkpoint)
 
+    assert LEGACY_CHECKPOINT_METADATA_KEY not in checkpoint
     assert checkpoint[CHECKPOINT_METADATA_KEY] == {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "backend_state": "external",
@@ -487,10 +496,34 @@ def test_training_checkpoint_drops_backend_and_requires_support_state() -> None:
         module.on_load_checkpoint(broken)
 
 
+def test_training_checkpoint_loads_legacy_metadata_key() -> None:
+    backend = FakeModuleCodec()
+    batch = collate_codes(
+        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
+        semantic_pad_id=backend.semantic_codebook.size(0),
+        acoustic_pad_ids=backend.acoustic_codebook_sizes,
+    )
+    config = GeneratorConfig(
+        route=Route.FM,
+        condition_dim=10,
+        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+    )
+    module = build_module(backend, config, batch, normalize_features=True)
+    checkpoint = {
+        LEGACY_CHECKPOINT_METADATA_KEY: {
+            "schema_version": LEGACY_CHECKPOINT_SCHEMA_VERSION,
+            "backend_state": "external",
+        },
+        "state_dict": dict(module.state_dict()),
+    }
+
+    module.on_load_checkpoint(checkpoint)
+
+
 def test_paired_reference_dropout_is_sampled_per_row(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = FakeCodec()
     batch = _paired_batch(backend)
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -573,7 +606,7 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
 ) -> None:
     backend = FakeCodec()
     batch = _paired_batch(backend)
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -596,10 +629,10 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
     )
     generators: list[torch.Generator] = []
     generator_states: list[Tensor] = []
-    sample_features = SemanticCodecRuntime.sample_features
+    sample_features = GeneratorRuntime.sample_features
 
     def capture_generators(
-        runtime: SemanticCodecRuntime,
+        runtime: GeneratorRuntime,
         semantic_codes: Tensor,
         *,
         mask: Tensor | None = None,
@@ -621,7 +654,7 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
             generator=generator,
         )
 
-    monkeypatch.setattr(SemanticCodecRuntime, "sample_features", capture_generators)
+    monkeypatch.setattr(GeneratorRuntime, "sample_features", capture_generators)
     callback = SampleLogger(
         tmp_path,
         batch,
@@ -723,7 +756,7 @@ def test_training_session_uses_datamodule_when_fixed_batch_is_false(
         def setup(self, stage: str) -> None:
             self.setup_stages.append(stage)
 
-        def sample_batch(self) -> SemanticCodecBatch:
+        def sample_batch(self) -> GeneratorBatch:
             return fixed_batch
 
         def feature_stats_dataloader(self) -> object:
@@ -962,7 +995,7 @@ def test_training_module_adds_repa_loss_with_teacher() -> None:
         semantic_pad_id=backend.semantic_codebook.size(0),
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(
@@ -998,7 +1031,7 @@ def test_training_module_requires_repa_teacher() -> None:
         semantic_pad_id=backend.semantic_codebook.size(0),
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(
@@ -1060,7 +1093,7 @@ def test_validation_metrics_are_paired_and_deterministic(
     batch = _paired_batch(backend)
     module = build_module(
         backend,
-        SemanticSupportConfig(
+        GeneratorConfig(
             route=Route.FM,
             condition_dim=10,
             decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -1124,7 +1157,7 @@ def test_validation_epoch_metric_is_invariant_to_batch_partition(
     ]
 
     def validation_error(
-        batch: SemanticCodecBatch,
+        batch: GeneratorBatch,
         *,
         reference_features: Tensor | None,
         reference_mask: Tensor | None,
@@ -1135,14 +1168,14 @@ def test_validation_epoch_metric_is_invariant_to_batch_partition(
         mask = batch.acoustic_mask.to(device=error.device)
         return error[mask].mean()
 
-    def collate_batch(batches: list[SemanticCodecBatch]) -> SemanticCodecBatch:
+    def collate_batch(batches: list[GeneratorBatch]) -> GeneratorBatch:
         assert len(batches) == 1
         return batches[0]
 
-    def validate(batches: list[SemanticCodecBatch]) -> float:
+    def validate(batches: list[GeneratorBatch]) -> float:
         module = build_module(
             backend,
-            SemanticSupportConfig(
+            GeneratorConfig(
                 route=Route.FM,
                 condition_dim=10,
                 decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),

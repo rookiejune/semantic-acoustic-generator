@@ -7,16 +7,16 @@ from typing import Any, cast
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
-from semantic_acoustic_codec.callback import SampleLogConfig, SampleLogger
-from semantic_acoustic_codec.config import DecoderConfig, Route
-from semantic_acoustic_codec.datamodule import collate_structured_codes
-from semantic_acoustic_codec.pl_module import build_module
-from semantic_acoustic_codec.runtime import (
-    SemanticCodecRuntime,
-    SemanticSupportConfig,
+from semantic_acoustic_generator.callback import SampleLogConfig, SampleLogger
+from semantic_acoustic_generator.config import DecoderConfig, Route
+from semantic_acoustic_generator.datamodule import collate_structured_codes
+from semantic_acoustic_generator.pl_module import build_module
+from semantic_acoustic_generator.runtime import (
+    GeneratorConfig,
+    GeneratorRuntime,
 )
-from semantic_acoustic_codec.runtime.artifact import load_artifact
-from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
+from semantic_acoustic_generator.runtime.artifact import load_artifact
+from semantic_acoustic_generator.types import GeneratorBatch, PairMetadata
 
 
 class FixedBackend:
@@ -71,7 +71,7 @@ class RecordingFixedBackend(FixedBackend):
         return value[:, None, None].expand(-1, 1, self.acoustic_unit_length * 8).clone()
 
 
-def _batch() -> SemanticCodecBatch:
+def _batch() -> GeneratorBatch:
     values = [
         SemanticAcousticCodes(
             semantic=torch.tensor([[1], [2], [3]], dtype=torch.long),
@@ -90,7 +90,7 @@ def _batch() -> SemanticCodecBatch:
     )
 
 
-def _paired_batch() -> SemanticCodecBatch:
+def _paired_batch() -> GeneratorBatch:
     target = collate_structured_codes(
         [
             SemanticAcousticCodes(
@@ -113,7 +113,7 @@ def _paired_batch() -> SemanticCodecBatch:
         acoustic_pad_ids=(5,),
         acoustic_layout=AcousticLayout.FIXED_LENGTH,
     )
-    metadata = SemanticCodecPairMetadata(
+    metadata = PairMetadata(
         target_index=0,
         reference_index=1,
         target_text_index=0,
@@ -129,7 +129,7 @@ def _paired_batch() -> SemanticCodecBatch:
         target_text="target text",
         reference_text="reference text",
     )
-    return SemanticCodecBatch(
+    return GeneratorBatch(
         semantic_codes=target.semantic_codes,
         acoustic_codes=target.acoustic_codes,
         mask=target.mask,
@@ -148,7 +148,7 @@ def _paired_batch() -> SemanticCodecBatch:
 def test_fixed_layout_fm_trains_and_runtime_uses_acoustic_axis(tmp_path) -> None:
     backend = FixedBackend()
     batch = _batch()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -164,7 +164,7 @@ def test_fixed_layout_fm_trains_and_runtime_uses_acoustic_axis(tmp_path) -> None
     assert loaded.acoustic_layout is AcousticLayout.FIXED_LENGTH
     assert loaded.acoustic_unit_length == backend.acoustic_unit_length
 
-    runtime = SemanticCodecRuntime(loaded, backend)
+    runtime = GeneratorRuntime(loaded, backend)
     encoded = runtime.encode(torch.zeros((1, 1, 16)), 16_000)
     features = runtime.sample_features(
         batch.semantic_codes[:1],
@@ -181,14 +181,14 @@ def test_fixed_layout_fm_trains_and_runtime_uses_acoustic_axis(tmp_path) -> None
 def test_fixed_runtime_masks_semantic_padding_before_backend_decode() -> None:
     backend = FixedBackend()
     batch = _batch()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     support = build_module(backend, config, batch, normalize_features=True).support
 
-    waveform = SemanticCodecRuntime(support, backend).decode(
+    waveform = GeneratorRuntime(support, backend).decode(
         batch.semantic_codes[1:],
         mask=batch.mask[1:],
     )
@@ -199,7 +199,7 @@ def test_fixed_runtime_masks_semantic_padding_before_backend_decode() -> None:
 def test_fixed_sample_logger_emits_reference_token_passthrough(tmp_path) -> None:
     backend = RecordingFixedBackend()
     batch = _paired_batch()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),

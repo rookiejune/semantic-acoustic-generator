@@ -18,12 +18,12 @@ from anydataset.types import (
 )
 from anytrain.codec import AcousticLayout
 
-from semantic_acoustic_codec import datamodule
-from semantic_acoustic_codec.datamodule import BatchingConfig, DataConfig, DataModule
-from semantic_acoustic_codec.datamodule import longcat as longcat_data
-from semantic_acoustic_codec.datamodule import module as module_data
-from semantic_acoustic_codec.datamodule import qwen as qwen_data
-from semantic_acoustic_codec.datamodule.source import DataSource, Overlong
+from semantic_acoustic_generator import datamodule
+from semantic_acoustic_generator.datamodule import BatchingConfig, DataConfig, DataModule
+from semantic_acoustic_generator.datamodule import longcat as longcat_data
+from semantic_acoustic_generator.datamodule import module as module_data
+from semantic_acoustic_generator.datamodule import qwen as qwen_data
+from semantic_acoustic_generator.datamodule.source import DataSource, Overlong
 
 
 def test_data_config_defaults_to_cross_text_grid_column() -> None:

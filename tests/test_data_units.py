@@ -8,12 +8,12 @@ import torch
 from anytrain.codec import AcousticLayout
 from anytrain.lightning.schedule import UnitBatch
 
-from semantic_acoustic_codec.callback import SemanticFrameUnits, UnitThroughputCallback
-from semantic_acoustic_codec.types import SemanticCodecBatch
+from semantic_acoustic_generator.callback import SemanticFrameUnits, UnitThroughputCallback
+from semantic_acoustic_generator.types import GeneratorBatch
 
 
 def test_semantic_frame_units_reports_mask_padding() -> None:
-    batch = SemanticCodecBatch(
+    batch = GeneratorBatch(
         semantic_codes=torch.tensor([[[1], [2], [8]], [[3], [8], [8]]], dtype=torch.long),
         acoustic_codes=torch.tensor([[[1], [1], [5]], [[2], [5], [5]]], dtype=torch.long),
         mask=torch.tensor([[True, True, False], [True, False, False]]),
@@ -155,8 +155,8 @@ class _LogModule:
         self.metrics.append(metrics)
 
 
-def _batch() -> SemanticCodecBatch:
-    return SemanticCodecBatch(
+def _batch() -> GeneratorBatch:
+    return GeneratorBatch(
         semantic_codes=torch.tensor([[[1], [2], [8]], [[3], [8], [8]]], dtype=torch.long),
         acoustic_codes=torch.tensor([[[1], [1], [5]], [[2], [5], [5]]], dtype=torch.long),
         mask=torch.tensor([[True, True, False], [True, False, False]]),

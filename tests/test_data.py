@@ -13,8 +13,8 @@ except TypeError as exc:
         allow_module_level=True,
     )
 
-from semantic_acoustic_codec.backend.longcat import batch_samples, codes, split_codes
-from semantic_acoustic_codec.types import SemanticCodecBatch
+from semantic_acoustic_generator.backend.longcat import batch_samples, codes, split_codes
+from semantic_acoustic_generator.types import GeneratorBatch
 
 
 def sample(value: torch.Tensor):
@@ -44,7 +44,7 @@ def test_collate_pads_right_side_only() -> None:
         acoustic_pad_ids=(11, 12),
     )
 
-    assert isinstance(batch, SemanticCodecBatch)
+    assert isinstance(batch, GeneratorBatch)
     assert batch.semantic_codes.tolist() == [[[1], [4]], [[7], [10]]]
     assert batch.acoustic_codes.tolist() == [[[2, 3], [5, 6]], [[8, 9], [11, 12]]]
     assert batch.mask.tolist() == [[True, True], [True, False]]

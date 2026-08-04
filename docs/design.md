@@ -1,12 +1,22 @@
-# Semantic Acoustic Codec Design
+# Semantic Acoustic Generator Design
 
 ## 目标
 
-本项目实现一个 reference-optional semantic codec：输入音频时只导出语义码；解码时可以只接收
-语义码，也可以额外接收 reference acoustic features。当前训练主线使用 Qwen speaker grid 离线生成的
-LongCat / BiCodec units，并由 `qwen_cross_text` 构造显式 target/reference pair。每个 reference 必须和
-target 属于同一 speaker，同时 sample index、utterance id 和文本均不同；无法配对时在 dataset 构造阶段
-直接报错。
+本项目实现 reference-optional 的 semantic-to-acoustic generator：输入 semantic codes 和可选 reference
+acoustic features，生成外部 codec backend 解码所需的 acoustic features 或 codes。当前训练主线使用 Qwen
+speaker grid 离线生成的 LongCat / BiCodec units，并由 `qwen_cross_text` 构造显式 target/reference pair。
+每个 reference 必须和 target 属于同一 speaker，同时 sample index、utterance id 和文本均不同；无法配对时
+在 dataset 构造阶段直接报错。
+
+ownership 边界如下：
+
+- AnyCodec 持有 codec 本体，包括编码、解码、码本结构、unit layout、backend 权重和加载策略。
+- 本仓库持有 semantic/reference conditioner、FM/RVQ generator、训练目标、数据适配、评估和 generator
+  artifact。
+- `GeneratorRuntime` 只把 generator 与调用方提供的 codec backend 组合起来；它可以暴露端到端
+  waveform 接口，但不因此拥有或实现 codec。
+- 当前实现通过 `anytrain.codec.SemanticAcousticCodec` 和 `SemanticAcousticCodecSpec` 接入 backend；这是
+  现有兼容边界，不改变 codec 本体归 AnyCodec 所有的工程边界。
 
 保留的 LongCat prepared source 按现有约定解释 code layout：
 
@@ -19,13 +29,14 @@ frame-level acoustic features 或 RVQ codebooks；BiCodec backend 的缺失部�
 acoustic / residual units。公共 runtime 稳定 semantic 必需输入与 optional-reference 输入，backend adapter
 和 generator 负责解释各 codec 自己的 side-unit layout。
 
-这个仓库要把 `speech-to-speech` 当前 codec oracle 中可复用的 acoustic decoder 能力沉淀为
-独立包。`speech-to-speech` 之后只依赖本仓库的公开 codec/runtime/model 契约，不再持有
-LongCat semantic-only reconstruction 的实现细节。
+这个仓库把 `speech-to-speech` 旧 codec oracle 中可复用的 acoustic generation 能力沉淀为独立包。
+`speech-to-speech` 只依赖公开的 generator、artifact 和 runtime composition 契约，不再持有 LongCat
+semantic-to-acoustic generation 的实现细节。
 
 ## 非目标
 
 - 不在训练进程内在线合成 TTS 数据；Qwen speaker grid 必须先在 workspace 离线物化。
+- 不实现 codec encoder、decoder、codebook、unit layout 或 backend 权重加载；这些属于 AnyCodec。
 - 不把 `speech-to-speech` 的 token model、generation service 或 task datamodule 搬进本仓库。
 - 不让本仓库 import `speech-to-speech`，避免循环依赖。
 - 不把 acoustic codes 暴露成调用方必须提供的推理输入。
@@ -34,17 +45,17 @@ LongCat semantic-only reconstruction 的实现细节。
 
 ## 顶层契约
 
-公共接口优先稳定在真实 codec backend 和 semantic-only support wrapper 边界，而不是训练脚本边界。
-codec backend contract 直接使用 `anytrain.codec.SemanticAcousticCodec` 和
-`anytrain.codec.load_semantic_acoustic()`，本仓库不再重新定义或转发 codec protocol：
+公共接口优先稳定在 generator 和外部 codec backend 的组合边界，而不是训练脚本边界。当前 codec backend
+contract 直接使用 `anytrain.codec.SemanticAcousticCodec` 和 `anytrain.codec.load_semantic_acoustic()`；
+本仓库不重新定义、转发或宣称拥有 codec protocol：
 
 backend 的可移植结构统一通过 `anytrain.codec.SemanticAcousticCodecSpec` 表达；训练构建从真实
 backend 使用 `semantic_acoustic_spec()` 检查得到，artifact load 则从严格 metadata 重建同一 spec。
 spec 只持有码本、feature dim、frame rate 和 acoustic unit layout，不持有 backend 权重或加载策略。
 
 ```python
-class SemanticCodecSupport(nn.Module):
-    generator: CodecUnitGenerator
+class GeneratorSupport(nn.Module):
+    generator: AcousticUnitGenerator
 
     def sample_features(
         self,
@@ -69,8 +80,8 @@ class SemanticCodecSupport(nn.Module):
     ) -> Tensor: ...
 
 
-class SemanticCodecRuntime:
-    support: SemanticCodecSupport
+class GeneratorRuntime:
+    support: GeneratorSupport
     backend: anytrain.codec.SemanticAcousticCodec
 
     def encode(self, audio: Tensor, sample_rate: int) -> Tensor: ...
@@ -94,8 +105,8 @@ class SemanticCodecRuntime:
     ) -> Tensor: ...
 ```
 
-`SemanticCodecSupport` 不持有 codec backend：FM 路线可直接生成 features，RVQ 路线的 code-to-feature
-转换必须通过 `SemanticCodecRuntime` 完成。`mask` 用于 semantic padding，`output_length` 只适用于
+`GeneratorSupport` 不持有 codec backend：FM 路线可直接生成 features，RVQ 路线的 code-to-feature
+转换必须通过 `GeneratorRuntime` 完成。`mask` 用于 semantic padding，`output_length` 只适用于
 `FIXED_LENGTH` acoustic layout，`generator` 用于固定 seed 的采样对照。waveform decode 只接受每行
 有效长度相同的 batch，mask 必须表示连续的右侧 padding；runtime 会在进入 backend 前裁掉 padding。
 不同长度的请求应先按有效长度分组，或逐行 decode。
@@ -103,7 +114,7 @@ class SemanticCodecRuntime:
 训练侧的公共基类只持有两条路线共有的 target-axis condition 适配；采样和 loss 按实际能力拆分：
 
 ```python
-class CodecUnitGenerator(nn.Module):
+class AcousticUnitGenerator(nn.Module):
     route: Route
 
 
@@ -138,7 +149,7 @@ class AcousticCodeSampler(Protocol):
     ) -> Tensor: ...
 
 
-class FMFeatureGenerator(CodecUnitGenerator):
+class FMFeatureGenerator(AcousticUnitGenerator):
     def feature_loss_from_condition(
         self,
         condition: Tensor,
@@ -155,7 +166,7 @@ class FMFeatureGenerator(CodecUnitGenerator):
 
     def loss(
         self,
-        batch: SemanticCodecBatch,
+        batch: GeneratorBatch,
         condition: Tensor,
         target_features: Tensor,
         *,
@@ -165,7 +176,7 @@ class FMFeatureGenerator(CodecUnitGenerator):
     ) -> DecoderLoss: ...
 
 
-class RVQCodeGenerator(CodecUnitGenerator):
+class RVQCodeGenerator(AcousticUnitGenerator):
     def code_loss_from_condition(
         self,
         condition: Tensor,
@@ -177,16 +188,16 @@ class RVQCodeGenerator(CodecUnitGenerator):
         include_details: bool = True,
     ) -> DecoderLoss: ...
 
-    def loss(self, batch: SemanticCodecBatch, condition: Tensor) -> DecoderLoss: ...
+    def loss(self, batch: GeneratorBatch, condition: Tensor) -> DecoderLoss: ...
 ```
 
 `feature_loss_from_condition()` 和 `code_loss_from_condition()` 是两条训练路线各自的复用边界：FM 只接收
 acoustic features，RVQ 只接收 acoustic code IDs；两者不再通过 nullable target 参数模拟一个万能接口。
-`SemanticCodecSupport` 在 runtime 侧按 `FeatureSampler` / `AcousticCodeSampler` capability 调用，错误路线直接
+`GeneratorSupport` 在 runtime 侧按 `FeatureSampler` / `AcousticCodeSampler` capability 调用，错误路线直接
 报错。`loss(batch, ...)` 只负责把本仓库的 batch 和 layout/mask 规则适配到对应入口。FM objective 统一由
 `loss/flow.py` 的 `FlowLoss` 持有，feature normalization、REPA teacher features 和 flow runtime 都显式传入。
 
-`SemanticCodecBatch` 使用严格结构表达数据：
+`GeneratorBatch` 使用严格结构表达数据：
 
 - `semantic_codes: Tensor`，shape `[B, F, 1]`，signed integer dtype。
 - `acoustic_codes: Tensor`，shape `[B, U, K]`，其中 `U` 可以是 frame 或固定 acoustic slot。
@@ -196,7 +207,7 @@ acoustic features，RVQ 只接收 acoustic code IDs；两者不再通过 nullabl
   `FIXED_LENGTH` 允许 semantic 时间轴和 acoustic slot 轴独立变化。
 - `reference_semantic_codes`、`reference_acoustic_codes`、`reference_mask` 和
   `reference_acoustic_mask`：`qwen_cross_text` batch 中完整保留 cross-text reference side。
-- `metadata: tuple[SemanticCodecPairMetadata, ...]`：逐行记录 target/reference store index、grid
+- `metadata: tuple[PairMetadata, ...]`：逐行记录 target/reference store index、grid
   `text_index`、原始 `source_index`、role、utterance id、speaker id 和文本，并在构造时维护
   same-speaker / cross-text 不变量。
 
@@ -216,11 +227,11 @@ BiCodec RVQ 的 temporal MTP 再沿 32-slot 轴自回归生成；FM 保留为在
 建议源码组织：
 
 ```text
-src/semantic_acoustic_codec/
-  backend/        # strict backend config and anytrain codec loading
+src/semantic_acoustic_generator/
+  backend/        # strict external-backend config and loading adapter
   evaluation.py   # shared seeded with/without-reference feature evaluation
   runtime/        # codec-free support, codec runtime composition and artifact loader
-  types.py        # SemanticCodecBatch and other cross-backend training contracts
+  types.py        # GeneratorBatch and other cross-backend training contracts
   datamodule/     # source adapters, paired Qwen data, batching and Lightning data modules
   model/
     condition.py  # semantic embedding, BPE span repeat, linear projection
@@ -231,7 +242,7 @@ src/semantic_acoustic_codec/
   callback/       # artifact export and sample/audio logging callbacks
   training/       # strict train config, component factories and TrainingSession
 scripts/
-  train.py        # thin Hydra entry delegating to semantic_acoustic_codec.training
+  train.py        # thin Hydra entry delegating to semantic_acoustic_generator.training
   smoke.py        # minimal local validation
   eval_artifact.py # one-pair artifact evaluation and WAV export
 configs/
@@ -253,17 +264,17 @@ Hydra 配置按源码模块命名空间组织；入口不维护 `data`、`optimi
 `train.yaml` 提供生产默认组合，`experiment/` 中的每个文件显式选择 backend、datamodule、model route、
 loss、pl_module、runtime、callback 和 trainer，再覆盖该实验独有的数据范围、预算和输出目录。
 外部 Hydra/JSON 输入只在边界解析一次，随后使用 frozen dataclass；`BackendConfig`、`DecoderConfig`、
-`SamplingConfig` 和 `SemanticSupportConfig` 严格校验枚举、布尔值、整数及有限浮点数，不把字符串或 bool
+`SamplingConfig` 和 `GeneratorConfig` 严格校验枚举、布尔值、整数及有限浮点数，不把字符串或 bool
 静默强转为数值。
 
-`semantic_acoustic_codec.training` 是仓库内可复用的训练服务边界。`parse_train_config()` 负责严格配置
+`semantic_acoustic_generator.training` 是仓库内可复用的训练服务边界。`parse_train_config()` 负责严格配置
 解析，`build_session()` 组装 backend、data module、support、Lightning module、callbacks 和 trainer，
 并返回持有单次 `fit()` 生命周期的 `TrainingSession`；`run()` 只执行这两个阶段。Hydra 装饰器与命令行
 配置路径只存在于 `scripts/train.py`，因此测试、job 或其他仓库内调用方不需要 import 脚本模块。
 
-`runtime/`、`backend/`、`types.py` 和 `model/` 是 `speech-to-speech` 未来依赖的稳定层；
-`datamodule/`、`pl_module/`、`callback/`、`training/` 和 `scripts/` 是本仓库训练实现，不应被
-`speech-to-speech` 直接 import。
+`runtime/`、`types.py` 和 `model/` 是 `speech-to-speech` 未来依赖的稳定层；`backend/` 只是外部 codec 的
+配置和加载适配层，不是 codec 实现。`datamodule/`、`pl_module/`、`callback/`、`training/` 和 `scripts/`
+是本仓库训练实现，不应被 `speech-to-speech` 直接 import。
 
 codec backend 的 capability 由 anytrain 统一提供；本仓库的 `load_backend(BackendConfig, device)` 是严格
 配置边界：普通 backend 转交 `anytrain.codec.load_semantic_acoustic()`，BiCodec 则显式传递其模型目录、
@@ -275,7 +286,7 @@ acoustic units 的训练适配属于本仓库的 batch/generator contract，不�
 模型内部优先复用已有通用模块，不先为本仓库重写 Transformer、attention、cache、MTP 或 codebook AR
 基础结构。当前 RVQ 路线明确复用 anytrain 的 Qwen/Qwen3 model builder，以 temporal backbone 处理
 acoustic unit 轴的 causal dependency，并以 MTP backbone 处理 unit 内 codebook dependency；本仓库只负责
-codec 语义、condition、head、loss 和 runtime 组合。
+generation 语义、condition、head、loss 和 runtime 组合。
 
 后续如果需要优化 RVQ 的专用结构，应先用当前 Qwen 路线跑通质量/效率闭环，再单独设计和验证替代模块；
 不要在 P0/P1 阶段为了“看起来更小”引入自定义基础网络。
@@ -348,19 +359,19 @@ reference 支路；target semantic memory 不做 pooling。无 reference 或逐�
 semantic-only 主线包含两个跨仓库阶段，不等同于 `speech-to-speech` 的 Stage 0-4 数据/任务日程：
 
 ```text
-Phase A: semantic codes -> SAC conditioner -> CodecUnitGenerator -> acoustic target
+Phase A: semantic codes -> generator conditioner -> AcousticUnitGenerator -> acoustic target
 Phase B: aligned S2S hidden state -> HiddenConditionAdapter -> initialized generator -> acoustic target
 ```
 
-Phase A 由本仓库训练完整的 `SemanticCodecSupport`。Phase B 只复用其中的 generator、decoder 配置、
+Phase A 由本仓库训练完整的 `GeneratorSupport`。Phase B 只复用其中的 generator、decoder 配置、
 condition dimension、feature normalization 和 acoustic backend metadata；semantic conditioner 与 reference
 conditioner 不进入 S2S model。S2S 自己拥有 hidden-state 对齐和 `LayerNorm + Linear` adapter，本仓库不读取
 Qwen hidden state，也不 import S2S。
 
 同一 artifact 因此有两个显式加载视图：
 
-- `load_artifact()` 返回完整 `SemanticCodecSupport`，用于 semantic-only waveform runtime；
-  `SemanticCodecRuntime` 对 semantic vocab/embedding 与 acoustic metadata 做完整 backend 校验。
+- `load_artifact()` 返回完整 `GeneratorSupport`，用于 semantic-only waveform runtime；
+  `GeneratorRuntime` 对 semantic vocab/embedding 与 acoustic metadata 做完整 backend 校验。
 - `load_generator_artifact()` 返回 `AcousticGeneratorArtifact(generator, spec)`，用于外部 condition producer；
   `validate_acoustic_backend()` 只校验 acoustic feature dimension、codebook sizes、layout 与 unit length。
 
@@ -369,20 +380,21 @@ Qwen hidden state，也不 import S2S。
 metadata 仍必须严格匹配，不能由调用方静默覆盖。
 
 `save_artifact(path, support, backend=...)` 只从 `support.config` 序列化构造配置，不接受第二份调用方 config。
-schema 7 的已声明字段必须完整且类型精确；loader 不补默认值、不做字符串/布尔数值强转，并先在 CPU 上以
-`weights_only=True` 加载 state dict，再把已构造模块移动到目标设备。
+schema 8 的 `generator.json` 字段必须完整且类型精确；loader 不补默认值、不做字符串/布尔数值强转，并先在
+CPU 上以 `weights_only=True` 加载 state dict，再把已构造模块移动到目标设备。旧 schema 7
+`codec.json` 仅通过显式 legacy reader 加载，新 writer 不再生成旧文件名。
 
 ## 缺失 unit 生成
 
 用户侧 runtime 的唯一必需输入是 semantic codes；`decode()`、`sample_features()` 和
 `sample_acoustic_codes()` 额外接受可选的 `reference_features/reference_mask`。LongCat 的 acoustic
 features / RVQ codes、BiCodec 的 semantic 外 global / acoustic / residual units，都属于缺失 codec units，
-必须由 `CodecUnitGenerator` 在 runtime 内部生成，不能成为调用方必须传入的 target 输入。
+必须由 `AcousticUnitGenerator` 在 runtime 内部生成，不能成为调用方必须传入的 target 输入。
 
 训练时可以使用 target side units 构造 backend feature、loss target 或 condition dropout；这些只属于
 `datamodule/`、`pl_module/` 和 `model/` 的训练内部契约。推理 artifact 必须保存生成缺失 units 所需的
-模型权重、normalization 和 backend compatibility metadata。`SemanticCodecSupport` 本身不持有 codec；
-加载后由 `SemanticCodecRuntime(support, backend).decode(semantic_codes)` 完成端到端 waveform
+模型权重、normalization 和 backend compatibility metadata。`GeneratorSupport` 本身不持有 codec；
+加载后由 `GeneratorRuntime(support, backend).decode(semantic_codes)` 完成端到端 waveform
 reconstruction。
 
 ## 训练与验收
@@ -425,11 +437,12 @@ RVQ 32-slot generation、held-out fixed eval 和 reference leakage 检查以
 
 迁移目标是：
 
-- `semantic-acoustic-codec` 消费 anytrain 提供的 LongCat/BiCodec backend、拥有 codec-free `SemanticCodecSupport`、
-  FM/RVQ unit generator、sampling 和 `SemanticCodecRuntime.decode(semantic_codes)` 实现。
+- `semantic-acoustic-generator` 消费外部 LongCat/BiCodec backend，拥有 codec-free
+  `GeneratorSupport`、FM/RVQ unit generator、sampling 和 runtime composition。
+- AnyCodec 拥有 codec encoder/decoder、codebook、unit layout、backend 权重和加载契约。
 - `speech-to-speech` 拥有 text/audio token model、task datamodule、generation service 和
   evaluation。
-- `speech-to-speech` 只通过公开 `SemanticCodecSupport`、anytrain 的
+- `speech-to-speech` 只通过公开 `GeneratorSupport`、anytrain 的
   `SemanticAcousticCodec`、route-specific sampler capability、`AcousticGeneratorArtifact` 和 artifact loading API
   依赖本仓库。
 
@@ -438,7 +451,7 @@ RVQ 32-slot generation、held-out fixed eval 和 reference leakage 检查以
 - 本仓库不 import `speech_to_speech`。
 - 可复用的 oracle model、Flow/RVQ decoder 和 condition 初始化逻辑从 `speech-to-speech` 迁移或复制到
   本仓库后，`speech-to-speech` 再删除本地重复实现。
-- generation 中 semantic-only decode 使用 `SemanticCodecRuntime(support, backend).decode(...)`；训练只用
+- generation 中 semantic-only decode 使用 `GeneratorRuntime(support, backend).decode(...)`；训练只用
   backend 将 prepared acoustic codes 转成 target/reference features，support 不持有 backend。
 - checkpoints 使用稳定前缀区分 semantic condition、unit generator 和 support wrapper，不依赖调用方包名。
 

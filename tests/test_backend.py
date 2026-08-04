@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 
-import semantic_acoustic_codec.backend.loader as backend_loader
-from semantic_acoustic_codec.backend import BackendConfig, load_backend
+import semantic_acoustic_generator.backend.loader as backend_loader
+from semantic_acoustic_generator.backend import BackendConfig, load_backend
 
 
 def test_load_backend_passes_bicodec_loading_config(

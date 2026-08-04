@@ -4,12 +4,17 @@ import pytest
 import torch
 from anytrain.codec import AcousticLayout
 
-from semantic_acoustic_codec.rl import SACCandidate, SACRewardBatch, SACRLAdapter, SACRollout
-from semantic_acoustic_codec.types import SemanticCodecBatch
+from semantic_acoustic_generator.rl import (
+    GeneratorCandidate,
+    GeneratorRewardBatch,
+    GeneratorRLAdapter,
+    GeneratorRollout,
+)
+from semantic_acoustic_generator.types import GeneratorBatch
 
 
 def test_sac_reward_batch_and_grpo_contract() -> None:
-    adapter = SACRLAdapter()
+    adapter = GeneratorRLAdapter()
     rollout = _rollout(batch_size=2, group_size=2)
     rewards = torch.tensor([[1.0, 2.0], [0.5, 1.5]])
 
@@ -32,8 +37,8 @@ def test_sac_reward_batch_and_grpo_contract() -> None:
 
 
 def test_sac_continuous_and_neighbor_contracts() -> None:
-    adapter = SACRLAdapter()
-    reward_batch = SACRewardBatch(rewards=torch.ones(2, 3))
+    adapter = GeneratorRLAdapter()
+    reward_batch = GeneratorRewardBatch(rewards=torch.ones(2, 3))
     steps = torch.zeros(2, 3, 4)
     step_mask = torch.ones(2, 3, 4, dtype=torch.bool)
 
@@ -61,7 +66,7 @@ def test_sac_continuous_and_neighbor_contracts() -> None:
 
 
 def test_sac_score_requires_external_rewards() -> None:
-    adapter = SACRLAdapter()
+    adapter = GeneratorRLAdapter()
 
     with pytest.raises(ValueError, match="task-specific"):
         adapter.score(_rollout(batch_size=1, group_size=1))
@@ -103,7 +108,7 @@ def test_sac_rollout_decodes_variable_length_rows_individually() -> None:
             self.decode_shapes.append((semantic_codes.size(0), int(mask.sum().item())))
             return features.sum(dim=-1).unsqueeze(1)
 
-    batch = SemanticCodecBatch(
+    batch = GeneratorBatch(
         semantic_codes=torch.tensor([[[1], [2], [3]], [[4], [8], [8]]], dtype=torch.long),
         acoustic_codes=torch.tensor([[[1], [1], [1]], [[2], [5], [5]]], dtype=torch.long),
         mask=torch.tensor([[True, True, True], [True, False, False]]),
@@ -113,7 +118,7 @@ def test_sac_rollout_decodes_variable_length_rows_individually() -> None:
         acoustic_layout=AcousticLayout.FRAME_ALIGNED,
     )
     runtime = Runtime()
-    adapter = SACRLAdapter(runtime)  # type: ignore[arg-type]
+    adapter = GeneratorRLAdapter(runtime)  # type: ignore[arg-type]
 
     rollout = adapter.rollout(batch)
 
@@ -121,12 +126,12 @@ def test_sac_rollout_decodes_variable_length_rows_individually() -> None:
     assert runtime.decode_shapes == [(1, 3), (1, 1)]
 
 
-def _rollout(*, batch_size: int, group_size: int) -> SACRollout:
+def _rollout(*, batch_size: int, group_size: int) -> GeneratorRollout:
     candidates = []
     for sample_id in range(batch_size):
         for candidate_id in range(group_size):
             candidates.append(
-                SACCandidate(
+                GeneratorCandidate(
                     sample_id=sample_id,
                     group_id=sample_id,
                     candidate_id=candidate_id,
@@ -134,4 +139,4 @@ def _rollout(*, batch_size: int, group_size: int) -> SACRollout:
                     semantic_mask=torch.ones(1, 4, dtype=torch.bool),
                 )
             )
-    return SACRollout(tuple(candidates), batch_size=batch_size, group_size=group_size)
+    return GeneratorRollout(tuple(candidates), batch_size=batch_size, group_size=group_size)

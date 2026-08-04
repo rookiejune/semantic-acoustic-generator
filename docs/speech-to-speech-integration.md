@@ -1,7 +1,7 @@
 # speech-to-speech 集成边界
 
-`semantic-acoustic-codec` 后续应作为 `speech-to-speech` 的下游依赖，而不是把新 codec 逻辑继续放在
-`speech-to-speech` 内部。本页定义依赖方向和迁移边界。
+`semantic-acoustic-generator` 作为 `speech-to-speech` 的下游依赖，提供 semantic-to-acoustic generation，
+而不是承接 codec 本体。本页定义依赖方向和迁移边界。
 
 ## 1. 依赖方向
 
@@ -9,19 +9,21 @@
 
 ```text
 speech-to-speech
-    -> semantic-acoustic-codec
+    -> semantic-acoustic-generator
+        -> AnyCodec-compatible codec backend
         -> anytrain / anydataset / workspace training entry
 ```
 
 禁止方向：
 
 ```text
-semantic-acoustic-codec -> speech-to-speech
+semantic-acoustic-generator -> speech-to-speech
 ```
 
 原因：
 
-- reference-optional semantic codec 是通用音频 codec 能力，不应绑定某个 S2S token model。
+- reference-optional semantic-to-acoustic generation 不应绑定某个 S2S token model。
+- codec encoder/decoder、码本结构、unit layout 和 backend 权重归 AnyCodec，不由本仓库复制或重新封装。
 - `speech-to-speech` 只通过公开 artifact API 消费完整 semantic support 或可复用 generator，不需要知道
   本仓库的 backend feature distillation 细节。
 - 避免两个仓库互相 import 模型、runtime singleton 或 Hydra schema。
@@ -31,38 +33,39 @@ semantic-acoustic-codec -> speech-to-speech
 `speech-to-speech` 保留负责数据和 token layout 的 backend capability，并按 capability 选择解码路径：
 
 ```python
-frame_codec.decode(full_codes)         # FrameCodec path
-semantic_runtime.decode(semantic_codes)  # SemanticAcousticCodec + SAC artifact
+frame_codec.decode(full_codes)           # FrameCodec path
+semantic_runtime.decode(semantic_codes)  # external codec + generator artifact
 ```
 
 接入 `SemanticAcousticCodec` 时，`speech-to-speech` 应选择 acoustic side channel 为 none 的组合：
 
 ```text
-semantic audio tokens -> SemanticCodecRuntime.decode(semantic_codes) -> waveform
+semantic audio tokens -> GeneratorRuntime.decode(semantic_codes) -> waveform
 ```
 
 `FrameCodec` 不接收 semantic-only codes；需要完整 codebook 展开时使用
 `FULL_CODEC_SEQUENCE`，由 frame backend 自己执行 `decode(full_codes)`。
 
-structured path 中 S2S token model 只预测 semantic audio tokens，waveform reconstruction 由本仓库
-checkpoint 完成；FrameCodec path 则预测完整展开后的 frame/codebook token 序列。
+structured path 中 S2S token model 只预测 semantic audio tokens；本仓库 artifact 生成 acoustic side units，
+再由外部 codec backend 完成 waveform reconstruction。FrameCodec path 则预测完整展开后的 frame/codebook
+token 序列。
 
-同一个 SAC artifact 还有一条独立的联合训练用途：
+同一个 generator artifact 还有一条独立的联合训练用途：
 
 ```text
 aligned S2S backbone hidden state
     -> S2S HiddenConditionAdapter
-    -> initialized SAC generator
+    -> initialized semantic-to-acoustic generator
     -> acoustic features/codes
 ```
 
-这条路径使用 `model/acoustic=flow|rvq` 和 `acoustic.init_artifact`。它不调用 SAC semantic conditioner，
-也不使用 `runtime.semantic_codec_artifact`；artifact I/O 与 compatibility validation 位于 S2S composition，
+这条路径使用 `model/acoustic=flow|rvq` 和 `acoustic.init_artifact`。它不调用 artifact 的 semantic conditioner，
+也不使用 `runtime.acoustic_generator_artifact`；artifact I/O 与 compatibility validation 位于 S2S composition，
 model 构造器只接收已经加载好的 `AcousticGeneratorArtifact`。
 
 ### Optional cross-text reference
 
-`SemanticCodecRuntime.decode()` 的 target semantic codes 是必需输入；cross-text reference 是请求级可选输入：
+`GeneratorRuntime.decode()` 的 target semantic codes 是必需输入；cross-text reference 是请求级可选输入：
 
 ```python
 runtime.decode(target_semantic_codes, generator=without_reference_generator)
@@ -85,15 +88,15 @@ reference condition。reference 是可选增强，不得成为 `speech-to-speech
 
 ## 3. 需要从 speech-to-speech 迁出的能力
 
-当前 `speech-to-speech` 的 codec oracle 已经有可参考实现，但它是 screening experiment，不是
-独立 codec runtime。迁移时只迁出稳定能力，不迁出上层任务逻辑：
+当前 `speech-to-speech` 的 codec oracle 已经有可参考实现，但它是 screening experiment，不是独立
+generator runtime。迁移时只迁出稳定的 generation 能力，不迁出上层任务逻辑或 codec 本体：
 
 - semantic embedding initialization；
 - semantic token/frame condition repeat；
-- RVQ acoustic code decoder；
-- FM acoustic feature decoder；
+- RVQ acoustic code generator；
+- FM acoustic feature generator；
 - acoustic feature normalization；
-- LongCat backend feature/decode adapter；
+- generator 侧的 backend feature target/reference adapter；
 - feature/audio logging 的通用部分。
 
 不迁出：
@@ -108,34 +111,37 @@ reference condition。reference 是可选增强，不得成为 `speech-to-speech
 
 从 S2S oracle 拆出的逻辑按复用层级归属：
 
-- `semantic-acoustic-codec`：semantic codebook 初始化、frame-level semantic condition、
-  reference acoustic condition、LongCat backend feature/feature normalization、Flow/RVQ acoustic decoder、
-  `SemanticCodecRuntime.decode(semantic_codes)` artifact runtime 和 codec artifact export/import。
+- AnyCodec：codec encoder/decoder、semantic/acoustic codebook、unit layout、code-to-feature、backend 权重和
+  backend 加载策略。
+- `semantic-acoustic-generator`：semantic codebook initialization adapter、semantic/reference condition、
+  feature normalization、Flow/RVQ acoustic generator、训练与评估，以及 generator artifact export/import 和
+  `GeneratorRuntime.decode(semantic_codes)` 的薄 runtime composition。
 - `anytrain`：不含音频/codec 语义的通用训练积木，例如 sequence DiT backbone、attention backend、
   condition cache、通用 Qwen/MTP codebook predictor、task-agnostic flow matching runtime、MFU/性能统计。
 - `speech-to-speech`：只保留 text/audio token model、task datamodule、joint S2S training stage、
   generation service、S2S-specific evaluation/logger，以及 FrameCodec 的 full-code 展开适配。
 
-判断规则是：只要需要解释 LongCat code layout、semantic/acoustic codebook、backend feature、
-artifact schema 或 semantic-only waveform reconstruction，就属于本仓库；只有完全不依赖这些领域名词、
-能被其它训练任务直接组合的模块，才考虑进入 `anytrain`。`anytrain` 是共享 `third_party` 组件，
-迁移前需要先以独立 PR/commit 明确通用契约和测试，不能从本仓库直接复制 project-specific API。
+判断规则是：定义或解释原始 codec layout、codebook、code-to-feature、waveform decode 或 backend 权重加载的
+逻辑属于 AnyCodec；根据 semantic/reference condition 预测缺失 acoustic units，并训练、评估或加载该生成器
+的逻辑属于本仓库；完全不依赖音频/codec 领域语义、能被其它任务直接组合的模块才考虑进入 `anytrain`。
+`anytrain` 是共享 `third_party` 组件，迁移前需要先以独立 PR/commit 明确通用契约和测试，不能从本仓库
+直接复制 project-specific API。
 
 ## 5. Artifact 的两种用途
 
-本仓库应产出一个可独立加载的 runtime artifact：
+本仓库应产出一个可独立加载的 generator artifact：
 
 ```text
 checkpoint_dir/
     model.ckpt
-    codec.json
+    generator.json
 ```
 
-当前 artifact schema 为 `7`。`codec.json` 的顶层结构为：
+当前 artifact schema 为 `8`，manifest 使用 generator-owned 的 `generator.json`。其顶层结构为：
 
 ```json
 {
-  "schema_version": 7,
+  "schema_version": 8,
   "config": {"route": "fm", "...": "..."},
   "backend": {"...": "..."},
   "checkpoint": "model.ckpt"
@@ -154,7 +160,7 @@ checkpoint_dir/
 训练目录中的 `sample_metrics.json`、TensorBoard events 和周期 checkpoint 属于训练产物，不是 runtime
 artifact 的必需文件。
 
-artifact 保存生成时的 backend identity 和 rate metadata；`SemanticCodecRuntime` 将其与绑定的 anytrain
+artifact 保存生成时的 backend identity 和 rate metadata；`GeneratorRuntime` 将其与绑定的 anytrain
 backend 严格校验。artifact 不复制 codec 实例或 backend decoder。
 
 semantic-only waveform runtime 指向完整 support artifact：
@@ -162,29 +168,31 @@ semantic-only waveform runtime 指向完整 support artifact：
 ```yaml
 runtime:
   codec: longcat
-  semantic_codec_artifact: /path/to/semantic-acoustic-codec/checkpoint_dir
+  acoustic_generator_artifact: /path/to/semantic-acoustic-generator/checkpoint_dir
 model/acoustic: none
 ```
 
-字段由当前 `speech-to-speech` runtime schema 持有；S2S 不重建本仓库模型配置，只加载 artifact。
+旧字段 `semantic_codec_artifact` 只在 `speech-to-speech` 的外部配置解析边界通过带 warning 和冲突检查的
+legacy migration 接受；内部统一为 `acoustic_generator_artifact`。S2S 不重建本仓库模型配置，只加载
+artifact。
 
 联合训练初始化则把路径放在 acoustic composition：
 
 ```yaml
 model/acoustic: flow  # 或 rvq
 acoustic:
-  init_artifact: /path/to/semantic-acoustic-codec/checkpoint_dir
+  init_artifact: /path/to/semantic-acoustic-generator/checkpoint_dir
 ```
 
 两者不能混为同一配置语义：
 
-- `runtime.semantic_codec_artifact` 是推理期完整 support，要求 `model/acoustic=none`，并严格校验 semantic
+- `runtime.acoustic_generator_artifact` 是推理期完整 support，要求 `model/acoustic=none`，并严格校验 semantic
   与 acoustic backend metadata。
 - `acoustic.init_artifact` 是训练开始时的一次性 generator 初始化，要求 Flow/RVQ route 与 decoder topology
   匹配，只以 acoustic metadata 约束目标 backend；artifact 的 semantic vocab/embedding 仅作为来源记录。
 
 当前联合初始化只支持 `FRAME_ALIGNED`。Flow 迁移 decoder 权重与 feature normalization；RVQ 只支持
-`codebook_ar` generator，SAC 默认的 `MTP` artifact 会被显式拒绝。fixed-length condition 如何从 S2S
+`codebook_ar` generator，本仓库默认的 `MTP` artifact 会被显式拒绝。fixed-length condition 如何从 S2S
 hidden sequence 映射到 acoustic slots 仍需单独设计，不能通过 repeat 或静默截断兼容。
 
 ## 6. 两阶段训练与推理期差异
@@ -194,7 +202,7 @@ hidden sequence 映射到 acoustic slots 仍需单独设计，不能通过 repea
 ```text
 semantic codes + backend acoustic codes
     -> backend acoustic features
-    -> train decoder
+    -> train semantic-to-acoustic generator
 ```
 
 S2S 联合训练期：
@@ -207,14 +215,14 @@ semantic token objective -> aligned causal backbone hidden state
 ```
 
 这两个训练阶段只通过 artifact 中的 generator contract 衔接。Phase A 的 semantic/reference conditioner
-不注册到 S2S model；Phase B 的 hidden adapter 也不写回 SAC artifact。
+不注册到 S2S model；Phase B 的 hidden adapter 也不写回 generator artifact。
 
 `speech-to-speech` 推理期：
 
 ```text
 generated semantic tokens
     -> semantic codes
-    -> SemanticCodecRuntime.decode(reference_features=optional)
+    -> GeneratorRuntime.decode(reference_features=optional)
     -> waveform
 ```
 

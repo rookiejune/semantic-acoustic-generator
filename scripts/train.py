@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import hydra
 
-from semantic_acoustic_codec.training import run
+from semantic_acoustic_generator.training import run
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig

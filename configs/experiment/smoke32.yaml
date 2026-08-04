@@ -17,7 +17,7 @@ defaults:
 output_subdir: smoke32/${backend.name}/${model.route}
 
 datamodule:
-  root: ${oc.env:DYNAMIC_HOME}/debug/semantic-acoustic-codec/qwen-fixed-speaker-codec-32
+  root: ${oc.env:DYNAMIC_HOME}/debug/semantic-acoustic-generator/qwen-fixed-speaker-codec-32
   split: train
   sample_index: 0
   sample_limit: 32

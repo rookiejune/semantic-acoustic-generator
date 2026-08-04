@@ -20,9 +20,9 @@ from anytrain.loss import (
 )
 from anytrain.module.qwen import QwenMTPCodebookPredictor
 
-import semantic_acoustic_codec.model.rvq as rvq_module
-from semantic_acoustic_codec.config import DecoderConfig, Route, RVQPredictor
-from semantic_acoustic_codec.model import (
+import semantic_acoustic_generator.model.rvq as rvq_module
+from semantic_acoustic_generator.config import DecoderConfig, Route, RVQPredictor
+from semantic_acoustic_generator.model import (
     AcousticRVQDecoder,
     DiTDecoder,
     FMFeatureGenerator,
@@ -31,22 +31,22 @@ from semantic_acoustic_codec.model import (
     SemanticConditioner,
     build_route,
 )
-from semantic_acoustic_codec.model import (
+from semantic_acoustic_generator.model import (
     condition as condition_module,
 )
-from semantic_acoustic_codec.model.condition import FixedLengthConditioner
-from semantic_acoustic_codec.runtime import (
+from semantic_acoustic_generator.model.condition import FixedLengthConditioner
+from semantic_acoustic_generator.runtime import (
+    GeneratorConfig,
+    GeneratorRuntime,
     SamplingConfig,
-    SemanticCodecRuntime,
-    SemanticSupportConfig,
     build_support,
 )
-from semantic_acoustic_codec.runtime.artifact import (
+from semantic_acoustic_generator.runtime.artifact import (
     load_artifact,
     load_generator_artifact,
     save_artifact,
 )
-from semantic_acoustic_codec.types import SemanticCodecBatch
+from semantic_acoustic_generator.types import GeneratorBatch
 
 
 class FakeCodec:
@@ -421,7 +421,7 @@ def test_build_route_and_masked_acoustic_features() -> None:
 
 def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     backend = FakeCodec()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -444,7 +444,7 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
         reference_features=masked_acoustic_features(backend, reference, mask),
         reference_mask=mask,
     )
-    runtime = SemanticCodecRuntime(support, backend)
+    runtime = GeneratorRuntime(support, backend)
     waveform = runtime.decode(semantic, mask=mask, generator=torch.Generator().manual_seed(1))
     save_artifact(tmp_path, support, backend=backend)
     loaded = load_artifact(tmp_path)
@@ -496,7 +496,7 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
 
 def test_artifact_rejects_runtime_state_that_differs_from_construction_config(tmp_path) -> None:
     backend = FakeCodec()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -514,13 +514,13 @@ def test_artifact_rejects_runtime_state_that_differs_from_construction_config(tm
     with pytest.raises(ValueError, match="support sampling"):
         save_artifact(tmp_path, support, backend=backend)
 
-    assert not (tmp_path / "codec.json").exists()
+    assert not (tmp_path / "generator.json").exists()
     assert not (tmp_path / "model.ckpt").exists()
 
 
 def test_generator_artifact_ignores_unrelated_state_but_remains_strict(tmp_path) -> None:
     backend = FakeCodec()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -560,7 +560,7 @@ def test_generator_artifact_ignores_unrelated_state_but_remains_strict(tmp_path)
 
 def test_artifact_loads_cpu_state_before_moving_to_target_device(tmp_path, monkeypatch) -> None:
     backend = FakeCodec()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -590,7 +590,7 @@ def test_artifact_loads_cpu_state_before_moving_to_target_device(tmp_path, monke
 def test_frame_aligned_decode_trims_right_padding() -> None:
     backend = FakeCodec()
     support = build_support(
-        SemanticSupportConfig(
+        GeneratorConfig(
             route=Route.FM,
             condition_dim=10,
             decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -598,7 +598,7 @@ def test_frame_aligned_decode_trims_right_padding() -> None:
         semantic_codebook=backend.semantic_codebook,
         codec_spec=semantic_acoustic_spec(backend),
     ).eval()
-    runtime = SemanticCodecRuntime(support, backend)
+    runtime = GeneratorRuntime(support, backend)
     semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
     features = torch.randn(1, 3, backend.acoustic_feature_dim)
     mask = torch.tensor([[True, True, False]])
@@ -611,7 +611,7 @@ def test_frame_aligned_decode_trims_right_padding() -> None:
 def test_decode_rejects_mixed_lengths_and_non_prefix_masks() -> None:
     backend = FakeCodec()
     support = build_support(
-        SemanticSupportConfig(
+        GeneratorConfig(
             route=Route.FM,
             condition_dim=10,
             decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
@@ -619,7 +619,7 @@ def test_decode_rejects_mixed_lengths_and_non_prefix_masks() -> None:
         semantic_codebook=backend.semantic_codebook,
         codec_spec=semantic_acoustic_spec(backend),
     ).eval()
-    runtime = SemanticCodecRuntime(support, backend)
+    runtime = GeneratorRuntime(support, backend)
     semantic = torch.tensor([[[1], [2], [8]], [[3], [8], [8]]], dtype=torch.long)
 
     with pytest.raises(ValueError, match="equal valid semantic lengths"):
@@ -823,7 +823,7 @@ def test_fixed_length_rvq_rejects_codebook_ar_and_uses_mtp_slot_axis() -> None:
         fixed_length=slots,
     )
     acoustic = torch.arange(slots).remainder(5).view(1, -1, 1)
-    batch = SemanticCodecBatch(
+    batch = GeneratorBatch(
         semantic_codes=torch.tensor([[[1], [2], [3], [4], [8]]]),
         acoustic_codes=acoustic,
         mask=semantic_mask,
@@ -989,8 +989,8 @@ def _has_qwen3_builder() -> bool:
 
 def _batch(
     semantic: torch.Tensor, acoustic: torch.Tensor, mask: torch.Tensor
-) -> SemanticCodecBatch:
-    return SemanticCodecBatch(
+) -> GeneratorBatch:
+    return GeneratorBatch(
         semantic_codes=semantic,
         acoustic_codes=acoustic,
         mask=mask,

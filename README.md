@@ -1,15 +1,19 @@
-# semantic-acoustic-codec
+# semantic-acoustic-generator
 
-`semantic-acoustic-codec` 提供从 semantic codes 重建波形的 reference-optional codec 组件。训练主线消费
-workspace 离线生成的 Qwen speaker grid codec units；`qwen_cross_text` 为每个 target 选择同 speaker、不同
-utterance 和不同文本的 reference。推理可以只使用 semantic codes 和 learned null condition，也可以额外
-提供 reference acoustic features。
+`semantic-acoustic-generator` 是 reference-optional 的 semantic-to-acoustic 生成扩展：输入 semantic
+codes 和可选 reference acoustic features，生成外部 codec backend 解码所需的 acoustic features 或 codes。
+codec 的编码、解码、码本结构和 backend 实现不属于本仓库；主力实现由 AnyCodec 持有，当前代码通过
+`anytrain.codec.SemanticAcousticCodec` 契约接入 LongCat / BiCodec。
+
+训练主线消费 workspace 离线生成的 Qwen speaker grid codec units；`qwen_cross_text` 为每个 target 选择同
+speaker、不同 utterance 和不同文本的 reference。推理可以只使用 semantic codes 和 learned null
+condition，也可以额外提供 reference acoustic features。
 
 仓库边界：
 
-- 消费 anytrain 的 LongCat / BiCodec backend，暴露 codec-free support、runtime 和训练组件。
+- 不实现或封装新的 codec；只消费外部 backend 契约，并提供薄 runtime composition。
 - 支持 FM 与 RVQ 两条 generator 路线；BiCodec RVQ 通过 temporal MTP 沿 32-slot 轴生成。
-- 提供固定 pair 的 with-reference / without-reference 日志和 artifact 导出。
+- 持有 generator 的数据适配、训练、with-reference / without-reference 评估和 artifact 导出。
 - 不依赖 `speech-to-speech`；下游由 `speech-to-speech` 依赖本仓库。
 
 设计与边界见 [docs/design.md](docs/design.md) 和
@@ -27,7 +31,8 @@ python -m pip install -e ".[train,rvq,test]"
 
 真实训练还需要 workspace 已准备好的 codec 数据，以及 `anytrain`、`anydataset` 和 workspace 的运行环境。
 job wrapper 会通过 [jobs/env.sh](jobs/env.sh) 设置 `PYTHONPATH` 和训练输出根目录；使用 wrapper 前请设置
-`DYNAMIC_HOME`，或直接设置 `SEMANTIC_ACOUSTIC_CODEC_TRAIN_ROOT`。
+`DYNAMIC_HOME`，或直接设置 `SEMANTIC_ACOUSTIC_GENERATOR_TRAIN_ROOT`。Python import、环境变量、job 标识和
+新 artifact 均使用 generator 命名；旧 schema-7 artifact 和 checkpoint metadata 仅通过显式 reader 兼容。
 
 ## 快速验证
 
@@ -58,10 +63,10 @@ basedpyright
 ## 训练
 
 `scripts/train.py` 是薄 Hydra 入口，只负责配置组合并委托给
-`semantic_acoustic_codec.training.run()`。实际训练组装位于
-`semantic_acoustic_codec.training`：调用方和测试可以用 `build_session()` 构造可检查、可复用的
+`semantic_acoustic_generator.training.run()`。实际训练组装位于
+`semantic_acoustic_generator.training`：调用方和测试可以用 `build_session()` 构造可检查、可复用的
 `TrainingSession`。`configs/backend`、`datamodule`、`model`、`loss`、`pl_module`、`runtime` 和
-`callback` 对应 `src/semantic_acoustic_codec` 的模块边界；`configs/experiment/` 显式组合这些 preset
+`callback` 对应 `src/semantic_acoustic_generator` 的模块边界；`configs/experiment/` 显式组合这些 preset
 并持有数据范围与训练预算：
 
 ```bash
@@ -96,7 +101,7 @@ jobs/001/03_bicodec_dit.sh
 jobs/001/04_bicodec_rvq.sh
 ```
 
-训练输出目录默认由 `SEMANTIC_ACOUSTIC_CODEC_TRAIN_ROOT` 和 `output_subdir` 决定，也可以用
+训练输出目录默认由 `SEMANTIC_ACOUSTIC_GENERATOR_TRAIN_ROOT` 和 `output_subdir` 决定，也可以用
 `output_dir=/path/to/output` 覆盖。启用 checkpoint 时，周期 checkpoint 位于
 `<output>/checkpoints/`，训练结束导出的 runtime artifact 位于 `<output>/artifact/`。
 
@@ -119,15 +124,16 @@ python scripts/eval_artifact.py \
   --artifact /path/to/output/artifact \
   --codec longcat \
   --data-root /path/to/prepared/codec-grid \
-  --output-json /tmp/semantic-codec-eval.json \
+  --output-json /tmp/semantic-acoustic-generator-eval.json \
   --without-reference-wav /tmp/without-reference.wav \
   --with-reference-wav /tmp/with-reference.wav
 ```
 
-artifact 目录只包含 `codec.json` 和 `model.ckpt`；当前 schema 为 `7`，`codec.json` 内保存 generator 配置、backend
-兼容性 metadata、sampling 和 feature normalization。`SemanticCodecRuntime` 负责加载 artifact、生成缺失
-acoustic units 并调用 backend 解码 waveform。导出配置只取自 support 的构造配置；schema 7 字段缺失、
-类型不精确或包含非有限数值时会直接拒绝，不补默认值，也不把字符串或 bool 强转为数值。
+artifact 目录只包含 `generator.json` 和 `model.ckpt`；当前 schema 为 `8`。manifest 只保存 generator
+配置、backend 兼容性 metadata、sampling 和 feature normalization，不包含 codec 实例或 backend decoder。
+`GeneratorRuntime` 负责加载 generator artifact、生成缺失 acoustic units 并调用外部 backend 解码 waveform。
+导出配置只取自 support 的构造配置；字段缺失、类型不精确或包含非有限数值时会直接拒绝，不补默认值，也不
+把字符串或 bool 强转为数值。旧 schema-7 `codec.json` 仍可由显式 legacy reader 加载。
 
 同时设置 `callback.performance.enabled=true callback.performance.profile_flops=true` 会通过 anytrain
 对真实 train batch 统计动态 FLOPs，用于短 calibration。该模式有 profiler 开销；生产 timing run
@@ -140,6 +146,8 @@ frame-aligned waveform decode 会裁掉连续的右侧 padding；一个 batch �
 
 ## 当前状态
 
-已完成 single-sample route smoke、32-sample LongCat FM checkpoint/resume smoke，以及一条真实
-`speech-to-speech` semantic-only decode smoke。cross-text 四路线重跑、真实 BiCodec RVQ 32-slot 验证、
-大规模 screening 和 held-out fixed eval 仍在 [实验 TODO](docs/experiments/todo.md) 中。
+已完成 single-sample route smoke、32-sample LongCat FM checkpoint/resume smoke、一条真实
+`speech-to-speech` semantic-only decode smoke，以及 LongCat-FM 100k 数值稳定性门禁和 16-pair held-out
+fixed eval。当前配置不继续到 200k；结论见
+[009 result](docs/experiments/results/009_longcat_fm_numerical_stability.md)。006/007 fixed-eval 人工复核等
+未完成事项仍以 [实验 TODO](docs/experiments/todo.md) 为准。

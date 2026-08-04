@@ -16,22 +16,22 @@ from anytrain.codec import (
 )
 from anytrain.framework.flow_matching import ContinuousFlowRuntime
 
-from semantic_acoustic_codec.config import DecoderConfig, Route
-from semantic_acoustic_codec.datamodule import BatchingConfig, DataConfig, load_batch
-from semantic_acoustic_codec.model import FMFeatureGenerator, RVQCodeGenerator, build_route
-from semantic_acoustic_codec.runtime import (
-    SemanticCodecRuntime,
-    SemanticSupportConfig,
+from semantic_acoustic_generator.config import DecoderConfig, Route
+from semantic_acoustic_generator.datamodule import BatchingConfig, DataConfig, load_batch
+from semantic_acoustic_generator.model import FMFeatureGenerator, RVQCodeGenerator, build_route
+from semantic_acoustic_generator.runtime import (
+    GeneratorConfig,
+    GeneratorRuntime,
     build_support,
 )
-from semantic_acoustic_codec.runtime.artifact import load_artifact, save_artifact
+from semantic_acoustic_generator.runtime.artifact import load_artifact, save_artifact
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from torch import Tensor
 
-    from semantic_acoustic_codec.types import SemanticCodecBatch
+    from semantic_acoustic_generator.types import GeneratorBatch
 
 
 class FakeEncoder:
@@ -100,7 +100,7 @@ def main() -> None:
 
 
 def _args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run semantic-acoustic-codec smoke checks.")
+    parser = argparse.ArgumentParser(description="Run semantic-acoustic-generator smoke checks.")
     parser.add_argument(
         "--routes",
         nargs="+",
@@ -245,13 +245,13 @@ def _artifact_smoke(backend: FakeCodec, decoder: DecoderConfig) -> None:
     semantic, _, mask = _batch()
     _, reference_acoustic, reference_mask = _reference_batch()
     reference_features = masked_acoustic_features(backend, reference_acoustic, reference_mask)
-    config = SemanticSupportConfig(route=Route.FM, condition_dim=12, decoder=decoder)
+    config = GeneratorConfig(route=Route.FM, condition_dim=12, decoder=decoder)
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
         codec_spec=semantic_acoustic_spec(backend),
     ).eval()
-    runtime = SemanticCodecRuntime(support, backend)
+    runtime = GeneratorRuntime(support, backend)
     without_features = support.sample_features(
         semantic,
         mask=mask,
@@ -289,7 +289,7 @@ def _artifact_smoke(backend: FakeCodec, decoder: DecoderConfig) -> None:
     ):
         if waveform.dim() != 3 or not bool(torch.isfinite(waveform).all()):
             raise RuntimeError(f"artifact {name} smoke produced an invalid waveform.")
-    with tempfile.TemporaryDirectory(prefix="semantic-acoustic-codec-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="semantic-acoustic-generator-") as tmp:
         save_artifact(tmp, support, backend=backend)
         loaded = load_artifact(tmp)
         loaded_without = loaded.sample_features(
@@ -370,7 +370,7 @@ def _data_smoke(
     )
 
 
-def _validate_batch(batch: SemanticCodecBatch) -> None:
+def _validate_batch(batch: GeneratorBatch) -> None:
     if batch.semantic_codes.size(0) != 1:
         raise RuntimeError("single-sample data smoke should produce batch size 1.")
     if batch.acoustic_codes.size(-1) < 1:

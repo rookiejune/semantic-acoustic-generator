@@ -1,6 +1,6 @@
 # Refactor Debt
 
-This file tracks runnable but poorly designed code in `semantic-acoustic-codec`.
+This file tracks runnable but poorly designed code in `semantic-acoustic-generator`.
 
 Keep this as an index of unfinished refactor debt. Move completed design notes into nearby `docs/` files or leave them to git history instead of keeping done items here.
 
@@ -25,7 +25,9 @@ Do not use this file for experiment logs, benchmark results, private paths, remo
 
 ## Debt Index
 
-No open items.
+| ID | Priority | Summary |
+|---|---|---|
+| [R001](R001-generator-naming.md) | P1 | Retire legacy codec-owned package and runtime identifiers after active training closes. |
 
 ## Item Template
 

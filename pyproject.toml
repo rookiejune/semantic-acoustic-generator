@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "semantic-acoustic-codec"
+name = "semantic-acoustic-generator"
 version = "0.1.0"
-description = "Reference-optional semantic-to-acoustic codec generation."
+description = "Reference-optional semantic-to-acoustic generation for external codec backends."
 requires-python = ">=3.9"
 dependencies = ["torch>=2.0", "anytrain"]
 

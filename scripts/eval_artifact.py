@@ -11,21 +11,21 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
-from semantic_acoustic_codec.backend import BackendConfig, load_backend
-from semantic_acoustic_codec.datamodule import (
+from semantic_acoustic_generator.backend import BackendConfig, load_backend
+from semantic_acoustic_generator.datamodule import (
     BatchingConfig,
     DataConfig,
     load_batch,
 )
-from semantic_acoustic_codec.evaluation import evaluate_feature_pair
-from semantic_acoustic_codec.runtime import SemanticCodecRuntime
-from semantic_acoustic_codec.runtime.artifact import load_artifact
+from semantic_acoustic_generator.evaluation import evaluate_feature_pair
+from semantic_acoustic_generator.runtime import GeneratorRuntime
+from semantic_acoustic_generator.runtime.artifact import load_artifact
 
 if TYPE_CHECKING:
     from anytrain.codec import SemanticAcousticCodec
     from torch import Tensor
 
-    from semantic_acoustic_codec.types import SemanticCodecBatch
+    from semantic_acoustic_generator.types import GeneratorBatch
 
 
 def main() -> None:
@@ -50,7 +50,7 @@ def main() -> None:
         semantic_pad_id=int(backend.semantic_codebook.size(0)),
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
-    runtime = SemanticCodecRuntime(support, backend)
+    runtime = GeneratorRuntime(support, backend)
     audio, metrics = _evaluate(
         runtime,
         backend,
@@ -122,9 +122,9 @@ def _args() -> argparse.Namespace:
 
 @torch.no_grad()
 def _evaluate(
-    runtime: SemanticCodecRuntime,
+    runtime: GeneratorRuntime,
     backend: SemanticAcousticCodec,
-    batch: SemanticCodecBatch,
+    batch: GeneratorBatch,
     *,
     device: torch.device,
     seed: int,
@@ -192,7 +192,7 @@ def _summary(
     *,
     sample_rate: int,
     args: argparse.Namespace,
-    batch: SemanticCodecBatch,
+    batch: GeneratorBatch,
 ) -> dict[str, Any]:
     reference = batch.reference
     reference_semantic = reference.semantic_codes

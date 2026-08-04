@@ -4,10 +4,10 @@ import pytest
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
-import semantic_acoustic_codec.types as codec_types
-from semantic_acoustic_codec.datamodule import collate_structured_codes
-from semantic_acoustic_codec.pl_module.semantic import SemanticCodecModule
-from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
+import semantic_acoustic_generator.types as codec_types
+from semantic_acoustic_generator.datamodule import collate_structured_codes
+from semantic_acoustic_generator.pl_module.semantic import GeneratorModule
+from semantic_acoustic_generator.types import GeneratorBatch, PairMetadata
 
 
 def test_fixed_length_structured_batch_keeps_independent_axes() -> None:
@@ -64,7 +64,7 @@ def test_fixed_length_batch_requires_shared_target_and_reference_batch_axes() ->
     acoustic_mask = torch.ones(2, 1, dtype=torch.bool)
 
     with pytest.raises(ValueError, match="target semantic and acoustic codes must share"):
-        SemanticCodecBatch(
+        GeneratorBatch(
             semantic_codes=semantic,
             acoustic_codes=acoustic,
             mask=semantic_mask,
@@ -80,7 +80,7 @@ def test_fixed_length_batch_requires_shared_target_and_reference_batch_axes() ->
         acoustic_pad_ids=(200,),
         acoustic_layout=AcousticLayout.FIXED_LENGTH,
     )
-    metadata = SemanticCodecPairMetadata(
+    metadata = PairMetadata(
         target_index=0,
         reference_index=1,
         target_text_index=0,
@@ -97,7 +97,7 @@ def test_fixed_length_batch_requires_shared_target_and_reference_batch_axes() ->
         reference_text="reference text",
     )
     with pytest.raises(ValueError, match="reference semantic and acoustic codes must share"):
-        SemanticCodecBatch(
+        GeneratorBatch(
             semantic_codes=target.semantic_codes,
             acoustic_codes=target.acoustic_codes,
             mask=target.mask,
@@ -127,7 +127,7 @@ def test_reference_batch_requires_complete_units_and_row_metadata() -> None:
     )
 
     with pytest.raises(ValueError, match="must be provided together"):
-        SemanticCodecBatch(
+        GeneratorBatch(
             semantic_codes=target.semantic_codes,
             acoustic_codes=target.acoustic_codes,
             mask=target.mask,
@@ -139,7 +139,7 @@ def test_reference_batch_requires_complete_units_and_row_metadata() -> None:
         )
 
     with pytest.raises(ValueError, match="one item per batch row"):
-        SemanticCodecBatch(
+        GeneratorBatch(
             semantic_codes=target.semantic_codes,
             acoustic_codes=target.acoustic_codes,
             mask=target.mask,
@@ -156,7 +156,7 @@ def test_reference_batch_requires_complete_units_and_row_metadata() -> None:
 
 def test_batch_shape_validation_precedes_codebook_axis_access() -> None:
     with pytest.raises(ValueError, match="acoustic_codes must have shape"):
-        SemanticCodecBatch(
+        GeneratorBatch(
             semantic_codes=torch.tensor([[[1]]], dtype=torch.long),
             acoustic_codes=torch.tensor(1, dtype=torch.long),
             mask=torch.ones(1, 1, dtype=torch.bool),
@@ -239,7 +239,7 @@ def test_dataloader_pin_memory_uses_batch_tensor_transform(
 
     pinned = torch.utils.data._utils.pin_memory.pin_memory(batch)
 
-    assert isinstance(pinned, SemanticCodecBatch)
+    assert isinstance(pinned, GeneratorBatch)
     assert pinned is not batch
     assert pinned.metadata is batch.metadata
     assert pinned.semantic_valid_frames == batch.semantic_valid_frames == 2
@@ -257,16 +257,16 @@ def test_lightning_transfer_requests_non_blocking_batch_move(
     calls: list[tuple[torch.device | str, bool]] = []
 
     def fake_to(
-        self: SemanticCodecBatch,
+        self: GeneratorBatch,
         device: torch.device | str,
         *,
         non_blocking: bool = False,
-    ) -> SemanticCodecBatch:
+    ) -> GeneratorBatch:
         calls.append((device, non_blocking))
         return self
 
-    monkeypatch.setattr(SemanticCodecBatch, "to", fake_to)
-    module = object.__new__(SemanticCodecModule)
+    monkeypatch.setattr(GeneratorBatch, "to", fake_to)
+    module = object.__new__(GeneratorModule)
     device = torch.device("cuda")
 
     moved = module.transfer_batch_to_device(batch, device, dataloader_idx=0)
@@ -275,7 +275,7 @@ def test_lightning_transfer_requests_non_blocking_batch_move(
     assert calls == [(device, True)]
 
 
-def _paired_batch() -> SemanticCodecBatch:
+def _paired_batch() -> GeneratorBatch:
     target = collate_structured_codes(
         [
             SemanticAcousticCodes(
@@ -287,7 +287,7 @@ def _paired_batch() -> SemanticCodecBatch:
         acoustic_pad_ids=(200,),
         acoustic_layout=AcousticLayout.FRAME_ALIGNED,
     )
-    metadata = SemanticCodecPairMetadata(
+    metadata = PairMetadata(
         target_index=0,
         reference_index=1,
         target_text_index=0,
@@ -303,7 +303,7 @@ def _paired_batch() -> SemanticCodecBatch:
         target_text="target text",
         reference_text="reference text",
     )
-    return SemanticCodecBatch(
+    return GeneratorBatch(
         semantic_codes=target.semantic_codes,
         acoustic_codes=target.acoustic_codes,
         mask=target.mask,

@@ -8,23 +8,23 @@ import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes, semantic_acoustic_spec
 from torch import nn
 
-import semantic_acoustic_codec.runtime.semantic as runtime_semantic
-from semantic_acoustic_codec.config import (
+import semantic_acoustic_generator.runtime.semantic as runtime_semantic
+from semantic_acoustic_generator.config import (
     DecoderConfig,
     Route,
     RVQPredictor,
 )
-from semantic_acoustic_codec.model.condition import ReferenceConditioner, SemanticConditioner
-from semantic_acoustic_codec.model.decoder import CodecUnitGenerator
-from semantic_acoustic_codec.model.routes import RouteModules
-from semantic_acoustic_codec.runtime import (
+from semantic_acoustic_generator.model.condition import ReferenceConditioner, SemanticConditioner
+from semantic_acoustic_generator.model.decoder import AcousticUnitGenerator
+from semantic_acoustic_generator.model.routes import RouteModules
+from semantic_acoustic_generator.runtime import (
+    GeneratorConfig,
+    GeneratorRuntime,
+    GeneratorSupport,
     SamplingConfig,
-    SemanticCodecRuntime,
-    SemanticCodecSupport,
-    SemanticSupportConfig,
     build_support,
 )
-from semantic_acoustic_codec.runtime.artifact import load_artifact, save_artifact
+from semantic_acoustic_generator.runtime.artifact import load_artifact, save_artifact
 
 
 @pytest.mark.parametrize("value", [True, "16"])
@@ -69,7 +69,7 @@ def test_semantic_support_config_rejects_invalid_field_types(
     options[field] = value
 
     with pytest.raises(TypeError, match=message):
-        SemanticSupportConfig(**options)  # type: ignore[arg-type]
+        GeneratorConfig(**options)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -95,7 +95,7 @@ def test_semantic_support_config_requires_finite_numeric_feature_stats(
     options[field] = value
 
     with pytest.raises(error, match=field):
-        SemanticSupportConfig(**options)  # type: ignore[arg-type]
+        GeneratorConfig(**options)  # type: ignore[arg-type]
 
 
 class FakeBackend:
@@ -204,7 +204,7 @@ def test_support_and_runtime_accept_optional_reference() -> None:
     )
     reference_mask = torch.tensor([[True, True]])
     support, generator = _support(Route.FM)
-    runtime = SemanticCodecRuntime(support, FakeBackend())
+    runtime = GeneratorRuntime(support, FakeBackend())
 
     support_without = support.sample_features(
         semantic,
@@ -342,7 +342,7 @@ def test_runtime_rvq_sample_features_zeroes_padding_frames() -> None:
             )
 
     support, _ = _support(Route.RVQ)
-    runtime = SemanticCodecRuntime(support, NonZeroPadBackend())
+    runtime = GeneratorRuntime(support, NonZeroPadBackend())
     semantic = torch.tensor([[[1], [2], [0]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
 
@@ -354,11 +354,11 @@ def test_runtime_rvq_sample_features_zeroes_padding_frames() -> None:
 
 
 def test_sampling_prepares_semantic_input_once_per_public_call(monkeypatch) -> None:
-    original = SemanticCodecSupport._semantic_input
+    original = GeneratorSupport._semantic_input
     calls: list[Route] = []
 
     def record_input(
-        self: SemanticCodecSupport,
+        self: GeneratorSupport,
         value: torch.Tensor,
         mask: torch.Tensor | None,
         *,
@@ -367,7 +367,7 @@ def test_sampling_prepares_semantic_input_once_per_public_call(monkeypatch) -> N
         calls.append(self.route)
         return original(self, value, mask, validate=validate)
 
-    monkeypatch.setattr(SemanticCodecSupport, "_semantic_input", record_input)
+    monkeypatch.setattr(GeneratorSupport, "_semantic_input", record_input)
     semantic = torch.tensor([[[1], [2]]], dtype=torch.long)
     mask = torch.ones(1, 2, dtype=torch.bool)
     fm_support, _ = _support(Route.FM)
@@ -376,14 +376,14 @@ def test_sampling_prepares_semantic_input_once_per_public_call(monkeypatch) -> N
     fm_support.sample_features(semantic, mask=mask, generator=_generator())
     assert calls == [Route.FM]
     calls.clear()
-    SemanticCodecRuntime(fm_support, FakeBackend()).decode(
+    GeneratorRuntime(fm_support, FakeBackend()).decode(
         semantic,
         mask=mask,
         generator=_generator(),
     )
     assert calls == [Route.FM]
     calls.clear()
-    SemanticCodecRuntime(rvq_support, FakeBackend()).sample_features(
+    GeneratorRuntime(rvq_support, FakeBackend()).sample_features(
         semantic,
         mask=mask,
         generator=_generator(),
@@ -391,12 +391,12 @@ def test_sampling_prepares_semantic_input_once_per_public_call(monkeypatch) -> N
     assert calls == [Route.RVQ]
 
 
-def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
+def test_schema_eight_artifact_roundtrip_preserves_decoder_fields(
     tmp_path,
     monkeypatch,
 ) -> None:
     backend = FakeBackend()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=4,
         decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
@@ -409,9 +409,10 @@ def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
     )
     save_artifact(tmp_path, support, backend=backend)
 
-    config_path = tmp_path / "codec.json"
+    config_path = tmp_path / "generator.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    assert data["schema_version"] == 7
+    assert data["schema_version"] == 8
+    assert not (tmp_path / "codec.json").exists()
     assert data["backend"]["name"] == backend.name
     assert data["backend"]["sample_rate"] == backend.sample_rate
     assert data["backend"]["frame_rate"] == backend.frame_rate
@@ -419,10 +420,10 @@ def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
     assert data["config"]["decoder"]["rvq_predictor"] == RVQPredictor.MTP.value
     assert data["config"]["sampling"]["cfg_scale"] == 1.0
 
-    captured: list[SemanticSupportConfig] = []
+    captured: list[GeneratorConfig] = []
     original = runtime_semantic.build_support
 
-    def capture(options: SemanticSupportConfig, **kwargs: Any) -> SemanticCodecSupport:
+    def capture(options: GeneratorConfig, **kwargs: Any) -> GeneratorSupport:
         captured.append(options)
         return original(options, **kwargs)
 
@@ -439,9 +440,35 @@ def test_schema_seven_artifact_roundtrip_preserves_decoder_fields(
         assert torch.equal(loaded.state_dict()[key], value)
 
 
-def test_schema_seven_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
+def test_schema_seven_artifact_remains_readable(tmp_path) -> None:
     backend = FakeBackend()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
+        route=Route.FM,
+        condition_dim=4,
+        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        sampling=SamplingConfig(flow_steps=1),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=backend.semantic_codebook,
+        codec_spec=semantic_acoustic_spec(backend),
+    )
+    save_artifact(tmp_path, support, backend=backend)
+    current = tmp_path / "generator.json"
+    data = json.loads(current.read_text(encoding="utf-8"))
+    data["schema_version"] = 7
+    (tmp_path / "codec.json").write_text(json.dumps(data), encoding="utf-8")
+    current.unlink()
+
+    loaded = load_artifact(tmp_path)
+
+    for key, value in support.state_dict().items():
+        assert torch.equal(loaded.state_dict()[key], value)
+
+
+def test_schema_eight_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
+    backend = FakeBackend()
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=4,
         decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
@@ -454,7 +481,7 @@ def test_schema_seven_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
     )
     save_artifact(tmp_path, support, backend=backend)
 
-    config_path = tmp_path / "codec.json"
+    config_path = tmp_path / "generator.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
     del data["config"]["decoder"]["rvq_predictor"]
     config_path.write_text(json.dumps(data), encoding="utf-8")
@@ -463,9 +490,9 @@ def test_schema_seven_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
         load_artifact(tmp_path)
 
 
-def test_schema_seven_artifact_rejects_missing_cfg_scale(tmp_path) -> None:
+def test_schema_eight_artifact_rejects_missing_cfg_scale(tmp_path) -> None:
     backend = FakeBackend()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=4,
         decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
@@ -478,7 +505,7 @@ def test_schema_seven_artifact_rejects_missing_cfg_scale(tmp_path) -> None:
     )
     save_artifact(tmp_path, support, backend=backend)
 
-    config_path = tmp_path / "codec.json"
+    config_path = tmp_path / "generator.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
     del data["config"]["sampling"]["cfg_scale"]
     config_path.write_text(json.dumps(data), encoding="utf-8")
@@ -495,7 +522,7 @@ def test_schema_seven_artifact_rejects_missing_cfg_scale(tmp_path) -> None:
         ("sampling", "temperature", "1.0", "sampling.temperature"),
     ],
 )
-def test_schema_seven_artifact_rejects_lossy_numeric_coercion(
+def test_schema_eight_artifact_rejects_lossy_numeric_coercion(
     tmp_path,
     section: str,
     field: str,
@@ -503,7 +530,7 @@ def test_schema_seven_artifact_rejects_lossy_numeric_coercion(
     message: str,
 ) -> None:
     backend = FakeBackend()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=4,
         decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
@@ -516,7 +543,7 @@ def test_schema_seven_artifact_rejects_lossy_numeric_coercion(
     )
     save_artifact(tmp_path, support, backend=backend)
 
-    config_path = tmp_path / "codec.json"
+    config_path = tmp_path / "generator.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
     target = data["config"] if section == "config" else data["config"][section]
     target[field] = value
@@ -527,9 +554,9 @@ def test_schema_seven_artifact_rejects_lossy_numeric_coercion(
 
 
 @pytest.mark.parametrize("value", [False, "0.0", float("nan")])
-def test_schema_seven_artifact_rejects_invalid_feature_metadata(tmp_path, value: object) -> None:
+def test_schema_eight_artifact_rejects_invalid_feature_metadata(tmp_path, value: object) -> None:
     backend = FakeBackend()
-    config = SemanticSupportConfig(
+    config = GeneratorConfig(
         route=Route.FM,
         condition_dim=4,
         decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
@@ -544,7 +571,7 @@ def test_schema_seven_artifact_rejects_invalid_feature_metadata(tmp_path, value:
     )
     save_artifact(tmp_path, support, backend=backend)
 
-    config_path = tmp_path / "codec.json"
+    config_path = tmp_path / "generator.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
     data["config"]["feature_mean"][0] = value
     config_path.write_text(json.dumps(data), encoding="utf-8")
@@ -558,7 +585,7 @@ def _support(
     route: Route,
     *,
     sampling: SamplingConfig | None = None,
-) -> tuple[SemanticCodecSupport, SeededGenerator]:
+) -> tuple[GeneratorSupport, SeededGenerator]:
     backend = FakeBackend()
     generator = SeededGenerator(backend.acoustic_feature_dim, backend.acoustic_codebook_sizes[0])
     reference = ReferenceConditioner(backend.acoustic_feature_dim, condition_dim=4)
@@ -569,11 +596,11 @@ def _support(
     modules = RouteModules(
         conditioner=SemanticConditioner(backend.semantic_codebook, condition_dim=4),
         reference_conditioner=reference,
-        generator=cast(CodecUnitGenerator, cast(object, generator)),
+        generator=cast(AcousticUnitGenerator, cast(object, generator)),
         route=route,
         acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
     )
-    support = SemanticCodecSupport(
+    support = GeneratorSupport(
         modules,
         semantic_acoustic_spec(backend),
         sampling=SamplingConfig(flow_steps=1) if sampling is None else sampling,

@@ -11,11 +11,11 @@ import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
 from scripts import eval_artifact, smoke
-from semantic_acoustic_codec.backend import BackendConfig
-from semantic_acoustic_codec.config import DecoderConfig
-from semantic_acoustic_codec.evaluation import seeded_generator
-from semantic_acoustic_codec.runtime import SemanticCodecRuntime
-from semantic_acoustic_codec.types import SemanticCodecBatch, SemanticCodecPairMetadata
+from semantic_acoustic_generator.backend import BackendConfig
+from semantic_acoustic_generator.config import DecoderConfig
+from semantic_acoustic_generator.evaluation import seeded_generator
+from semantic_acoustic_generator.runtime import GeneratorRuntime
+from semantic_acoustic_generator.types import GeneratorBatch, PairMetadata
 
 
 class EvalBackend:
@@ -120,7 +120,7 @@ def test_eval_artifact_generates_seeded_pair_metrics() -> None:
     runtime = EvalRuntime(units=batch.acoustic_codes.size(1))
 
     audio, metrics = eval_artifact._evaluate(
-        cast(SemanticCodecRuntime, cast(object, runtime)),
+        cast(GeneratorRuntime, cast(object, runtime)),
         backend,
         batch,
         device=torch.device("cpu"),
@@ -172,7 +172,7 @@ def test_eval_artifact_fixed_layout_adds_reference_passthrough() -> None:
     runtime = EvalRuntime(units=batch.acoustic_codes.size(1))
 
     audio, _ = eval_artifact._evaluate(
-        cast(SemanticCodecRuntime, cast(object, runtime)),
+        cast(GeneratorRuntime, cast(object, runtime)),
         backend,
         batch,
         device=torch.device("cpu"),
@@ -238,7 +238,7 @@ def test_eval_artifact_main_loads_cross_text_pair(
     monkeypatch.setattr(eval_artifact, "load_backend", load_eval_backend)
     monkeypatch.setattr(eval_artifact, "load_artifact", lambda *args, **kwargs: object())
     monkeypatch.setattr(eval_artifact, "load_batch", load_pair)
-    monkeypatch.setattr(eval_artifact, "SemanticCodecRuntime", lambda *args: runtime)
+    monkeypatch.setattr(eval_artifact, "GeneratorRuntime", lambda *args: runtime)
 
     eval_artifact.main()
 
@@ -308,7 +308,7 @@ def test_eval_artifact_can_include_private_metadata(
     monkeypatch.setattr(eval_artifact, "load_backend", load_eval_backend)
     monkeypatch.setattr(eval_artifact, "load_artifact", lambda *args, **kwargs: object())
     monkeypatch.setattr(eval_artifact, "load_batch", lambda *args, **kwargs: batch)
-    monkeypatch.setattr(eval_artifact, "SemanticCodecRuntime", lambda *args: runtime)
+    monkeypatch.setattr(eval_artifact, "GeneratorRuntime", lambda *args: runtime)
 
     eval_artifact.main()
 
@@ -336,7 +336,7 @@ def test_smoke_uses_independent_fake_reference_and_seeded_paths(
     states: list[tuple[int, torch.Generator, torch.Tensor]] = []
     decode_calls: list[tuple[torch.Tensor | None, torch.Tensor | None]] = []
     original_generator = smoke._generator
-    original_decode = SemanticCodecRuntime.decode
+    original_decode = GeneratorRuntime.decode
 
     def generator(seed: int) -> torch.Generator:
         value = original_generator(seed)
@@ -344,7 +344,7 @@ def test_smoke_uses_independent_fake_reference_and_seeded_paths(
         return value
 
     def decode(
-        runtime: SemanticCodecRuntime,
+        runtime: GeneratorRuntime,
         semantic_codes: torch.Tensor,
         *,
         mask: torch.Tensor | None = None,
@@ -363,7 +363,7 @@ def test_smoke_uses_independent_fake_reference_and_seeded_paths(
         )
 
     monkeypatch.setattr(smoke, "_generator", generator)
-    monkeypatch.setattr(SemanticCodecRuntime, "decode", decode)
+    monkeypatch.setattr(GeneratorRuntime, "decode", decode)
     smoke._artifact_smoke(
         smoke.FakeCodec(),
         DecoderConfig(hidden_dim=12, layers=1, heads=2, ffn_ratio=2),
@@ -414,7 +414,7 @@ def test_smoke_real_data_defaults_to_cross_text_and_loads_pair(
     assert torch.equal(backend.feature_inputs[1], reference_acoustic)
 
 
-def _pair(layout: AcousticLayout) -> SemanticCodecBatch:
+def _pair(layout: AcousticLayout) -> GeneratorBatch:
     target_semantic = torch.tensor([[[1], [2]]], dtype=torch.long)
     reference_semantic = torch.tensor([[[3], [4], [5]]], dtype=torch.long)
     if layout is AcousticLayout.FRAME_ALIGNED:
@@ -427,7 +427,7 @@ def _pair(layout: AcousticLayout) -> SemanticCodecBatch:
     target_acoustic_mask = torch.ones(target_acoustic.shape[:2], dtype=torch.bool)
     reference_mask = torch.ones(reference_semantic.shape[:2], dtype=torch.bool)
     reference_acoustic_mask = torch.ones(reference_acoustic.shape[:2], dtype=torch.bool)
-    metadata = SemanticCodecPairMetadata(
+    metadata = PairMetadata(
         target_index=0,
         reference_index=1,
         target_text_index=0,
@@ -443,7 +443,7 @@ def _pair(layout: AcousticLayout) -> SemanticCodecBatch:
         target_text="target text",
         reference_text="reference text",
     )
-    return SemanticCodecBatch(
+    return GeneratorBatch(
         semantic_codes=target_semantic,
         acoustic_codes=target_acoustic,
         mask=target_mask,

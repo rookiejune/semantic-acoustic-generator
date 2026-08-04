@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from semantic_acoustic_codec.loss.repa import (
+from semantic_acoustic_generator.loss.repa import (
     WavLMTeacher,
     _require_prefix_mask,
     _truncate_wavlm_encoder,
