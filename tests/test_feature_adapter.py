@@ -14,6 +14,7 @@ from semantic_acoustic_generator.backend import (
 )
 from semantic_acoustic_generator.config import DecoderConfig, FeatureAdapter, FMMode, Route
 from semantic_acoustic_generator.evaluation import evaluate_first_codebook_oracle
+from semantic_acoustic_generator.pl_module import build_module
 from semantic_acoustic_generator.runtime import GeneratorConfig, GeneratorRuntime, build_support
 from semantic_acoustic_generator.runtime.artifact import (
     load_artifact,
@@ -188,6 +189,53 @@ def test_feature_adapter_is_default_off_and_idempotent() -> None:
     adapted = adapt_backend(backend, FeatureAdapter.LONGCAT_FIRST_CODEBOOK)
     assert isinstance(adapted, LongCatFirstCodebookAdapter)
     assert adapt_backend(adapted, FeatureAdapter.LONGCAT_FIRST_CODEBOOK) is adapted
+
+
+def test_longcat_factor_targets_ignore_padded_code_ids() -> None:
+    backend = _LongCat()
+    adapted = LongCatFirstCodebookAdapter(backend)
+    batch = GeneratorBatch(
+        semantic_codes=torch.tensor([[[1], [2]], [[3], [8]]]),
+        acoustic_codes=torch.tensor(
+            [
+                [[1, 0, 0], [8099, 0, 0]],
+                [[90, 0, 0], [8100, 8100, 8100]],
+            ]
+        ),
+        mask=torch.tensor([[True, True], [True, False]]),
+        semantic_pad_id=8,
+        acoustic_pad_ids=(8100, 8100, 8100),
+        acoustic_mask=torch.tensor([[True, True], [True, False]]),
+        acoustic_layout=AcousticLayout.FRAME_ALIGNED,
+    )
+    config = GeneratorConfig(
+        route=Route.FM,
+        condition_dim=4,
+        feature_adapter=FeatureAdapter.LONGCAT_FIRST_CODEBOOK,
+        decoder=DecoderConfig(
+            hidden_dim=4,
+            layers=1,
+            heads=1,
+            ffn_ratio=2,
+            fm_mode=FMMode.ANCHOR,
+            anchor_hidden_dim=4,
+            anchor_layers=1,
+        ),
+    )
+    module = build_module(adapted, config, batch, normalize_features=True)
+
+    targets = module._factor_targets(batch)
+
+    assert targets is not None
+    assert torch.equal(
+        targets,
+        torch.tensor(
+            [
+                [[0, 1], [89, 89]],
+                [[1, 0], [0, 0]],
+            ]
+        ),
+    )
 
 
 def test_first_codebook_oracle_compares_native_raw_and_snap_paths() -> None:

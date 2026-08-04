@@ -494,7 +494,11 @@ class GeneratorModule(LightningLogMixin, LightningModule):
     def _factor_targets(self, batch: GeneratorBatch) -> Tensor | None:
         if not isinstance(self.backend, LongCatFirstCodebookAdapter):
             return None
-        return self.backend.factor_codes(batch.acoustic_codes)
+        codes = batch.acoustic_codes.masked_fill(
+            ~batch.acoustic_mask[..., None],
+            0,
+        )
+        return self.backend.factor_codes(codes)
 
     def _factor_codebooks(self) -> tuple[Tensor, Tensor] | None:
         if not isinstance(self.backend, LongCatFirstCodebookAdapter):
