@@ -353,11 +353,12 @@ def test_longcat_factor_recurrent_experiment_is_formal_and_frame_aligned() -> No
     assert config.model.feature_codebooks == 2
     assert config.model.decoder.factor_predictor is FactorPredictor.DEPTH_RECURRENT
     assert config.model.decoder.ffn_ratio == 2
-    assert config.datamodule.batch_size == 32
+    assert config.datamodule.sample_limit == 9984
+    assert config.datamodule.batch_size == 96
     assert config.datamodule.batching.enabled is True
-    assert config.datamodule.batching.max_batch_seconds == 384.0
+    assert config.datamodule.batching.max_batch_seconds == 1152.0
     assert config.pl_module.finite_loss_check_interval == 100
-    assert config.pl_module.residual_retarget is True
+    assert config.pl_module.residual_retarget is False
     assert config.callback.performance.enabled is False
     assert config.trainer.max_steps == 20000
 

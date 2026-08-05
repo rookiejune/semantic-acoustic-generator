@@ -326,6 +326,26 @@ def test_longcat_first_codebook_adapter_snaps_each_factor_by_cosine() -> None:
     )
 
 
+def test_longcat_factor_adapter_can_skip_synchronous_value_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapted = LongCatCodebookAdapter(_LongCat(), codebooks=2)
+    codes = torch.tensor([[[1, 2, 0], [8099, 8098, 0]]], dtype=torch.long)
+
+    def fail_any(self: torch.Tensor) -> bool:
+        del self
+        raise AssertionError("factor code validation unexpectedly synchronized")
+
+    monkeypatch.setattr(torch.Tensor, "any", fail_any)
+
+    factors = adapted.factor_codes(codes, validate_values=False)
+
+    assert torch.equal(
+        factors,
+        torch.tensor([[[0, 1, 0, 2], [89, 89, 89, 88]]]),
+    )
+
+
 def test_feature_adapter_is_default_off_and_idempotent() -> None:
     backend = _LongCat()
 

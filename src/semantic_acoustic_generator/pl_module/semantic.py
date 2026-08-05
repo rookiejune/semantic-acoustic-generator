@@ -177,7 +177,11 @@ class GeneratorModule(LightningLogMixin, LightningModule):
                 feature_std=self.support.feature_std,
                 repa_teacher=self.repa_teacher,
                 factor_targets=factor_targets,
-                factor_codebooks=self._factor_codebooks(),
+                factor_codebooks=(
+                    None
+                    if feature_generator.anchor_target is AnchorTarget.FACTOR
+                    else self._factor_codebooks()
+                ),
                 factor_targeter=self._factor_targeter(batch),
                 include_details=self._include_factor_details(feature_generator),
             )
@@ -541,7 +545,7 @@ class GeneratorModule(LightningLogMixin, LightningModule):
             ~batch.acoustic_mask[..., None],
             0,
         )
-        return self.backend.factor_codes(codes)
+        return self.backend.factor_codes(codes, validate_values=False)
 
     def _factor_codebooks(self) -> tuple[Tensor, ...] | None:
         if not isinstance(self.backend, LongCatCodebookAdapter):

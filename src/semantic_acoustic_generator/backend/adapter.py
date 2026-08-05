@@ -190,7 +190,14 @@ class LongCatCodebookAdapter(nn.Module):
         return _ResidualFactorTargeter(self, target)
 
     @torch.no_grad()
-    def factor_codes(self, acoustic_codes: Tensor) -> Tensor:
+    def factor_codes(
+        self,
+        acoustic_codes: Tensor,
+        *,
+        validate_values: bool = True,
+    ) -> Tensor:
+        if not isinstance(validate_values, bool):
+            raise TypeError("validate_values must be a boolean.")
         if acoustic_codes.dim() != 3:
             raise ValueError("acoustic_codes must have shape [batch, time, codebook].")
         if acoustic_codes.size(-1) != len(self.acoustic_codebook_sizes):
@@ -202,7 +209,9 @@ class LongCatCodebookAdapter(nn.Module):
         factors: list[Tensor] = []
         for index, (size_a, size_b) in enumerate(self._factor_sizes):
             composite = acoustic_codes[..., index]
-            if bool(((composite < 0) | (composite >= size_a * size_b)).any()):
+            if validate_values and bool(
+                ((composite < 0) | (composite >= size_a * size_b)).any()
+            ):
                 raise ValueError(f"LongCat stage {index} codes contain an ID outside the codebook.")
             factors.extend(
                 (

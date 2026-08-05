@@ -11,18 +11,18 @@ defaults:
   - override /trainer: default
   - _self_
 
-output_subdir: 015/depth-recurrent-2cb-${datamodule.sample_limit}-${trainer.max_steps}
+output_subdir: 015/depth-recurrent-original-2cb-${datamodule.sample_limit}-${trainer.max_steps}
 
 datamodule:
-  sample_limit: 10000
-  batch_size: 32
+  sample_limit: 9984
+  batch_size: 96
   num_workers: 4
   pin_memory: true
   persistent_workers: true
   fixed_batch: false
   batching:
     enabled: true
-    max_batch_seconds: 384.0
+    max_batch_seconds: 1152.0
     planning_window: 512
     prefetch_factor: 2
     drop_distributed_tail: true
@@ -51,7 +51,7 @@ pl_module:
   weight_decay: 0.0
   reference_dropout: 1.0
   finite_loss_check_interval: 100
-  residual_retarget: true
+  residual_retarget: false
 
 trainer:
   accelerator: gpu
