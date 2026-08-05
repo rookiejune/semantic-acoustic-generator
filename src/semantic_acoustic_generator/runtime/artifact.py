@@ -17,6 +17,7 @@ from torch import Tensor
 
 from semantic_acoustic_generator.backend import adapt_backend
 from semantic_acoustic_generator.config import (
+    AnchorContext,
     DecoderConfig,
     FeatureAdapter,
     FMMode,
@@ -392,6 +393,7 @@ def _config_dict(config: GeneratorConfig) -> dict[str, object]:
     decoder = cast(dict[str, object], data["decoder"])
     decoder["rvq_predictor"] = config.decoder.rvq_predictor.value
     decoder["fm_mode"] = config.decoder.fm_mode.value
+    decoder["anchor_context"] = config.decoder.anchor_context.value
     return cast(dict[str, object], data)
 
 
@@ -440,6 +442,14 @@ def _config(data: Mapping[str, object]) -> GeneratorConfig:
                     "fm_mode",
                     owner="decoder",
                     default=FMMode.FLOW.value,
+                )
+            ),
+            anchor_context=AnchorContext(
+                _schema_optional_string(
+                    decoder,
+                    "anchor_context",
+                    owner="decoder",
+                    default=AnchorContext.LOCAL.value,
                 )
             ),
             anchor_hidden_dim=_schema_optional_int_default(

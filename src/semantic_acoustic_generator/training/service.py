@@ -243,6 +243,7 @@ def build_support_config(
             repa_student_layer=loss.repa_student_layer,
             repa_loss_weight=loss.repa_loss_weight,
             fm_mode=decoder.fm_mode,
+            anchor_context=decoder.anchor_context,
             anchor_hidden_dim=decoder.anchor_hidden_dim,
             anchor_layers=decoder.anchor_layers,
             anchor_kernel_size=decoder.anchor_kernel_size,

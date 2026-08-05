@@ -21,7 +21,13 @@ from anytrain.loss import (
 from anytrain.module.qwen import QwenMTPCodebookPredictor
 
 import semantic_acoustic_generator.model.rvq as rvq_module
-from semantic_acoustic_generator.config import DecoderConfig, FMMode, Route, RVQPredictor
+from semantic_acoustic_generator.config import (
+    AnchorContext,
+    DecoderConfig,
+    FMMode,
+    Route,
+    RVQPredictor,
+)
 from semantic_acoustic_generator.model import (
     AcousticRVQDecoder,
     DiTDecoder,
@@ -179,6 +185,36 @@ def test_aligned_anchor_predicts_features_and_factor_losses() -> None:
     assert output.loss.ndim == 0
     assert sample.shape == target.shape
     assert torch.equal(sample[1, 2:], torch.zeros_like(sample[1, 2:]))
+
+
+def test_transformer_anchor_preserves_frame_alignment_and_padding() -> None:
+    condition = torch.randn(2, 5, 8)
+    mask = torch.tensor([[True, True, True, True, True], [True, True, True, False, False]])
+    generator = FMFeatureGenerator(
+        8,
+        6,
+        DecoderConfig(
+            heads=2,
+            ffn_ratio=2,
+            fm_mode=FMMode.ANCHOR,
+            anchor_context=AnchorContext.TRANSFORMER,
+            anchor_hidden_dim=12,
+            anchor_layers=2,
+        ),
+    )
+
+    sample = generator.sample_features(
+        condition,
+        mask,
+        feature_mean=torch.zeros(1, 1, 6),
+        feature_std=torch.ones(1, 1, 6),
+        flow_steps=1,
+    )
+
+    assert sample.shape == (2, 5, 6)
+    assert generator.anchor is not None
+    assert generator.anchor.context is AnchorContext.TRANSFORMER
+    assert torch.equal(sample[1, 3:], torch.zeros_like(sample[1, 3:]))
 
 
 def test_residual_fm_trains_flow_and_anchor() -> None:

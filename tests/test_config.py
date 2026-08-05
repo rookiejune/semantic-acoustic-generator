@@ -8,6 +8,7 @@ from omegaconf import DictConfig
 
 from semantic_acoustic_generator.backend import BackendConfig
 from semantic_acoustic_generator.config import (
+    AnchorContext,
     DecoderConfig,
     FeatureAdapter,
     FMMode,
@@ -65,6 +66,15 @@ def test_decoder_options_rejects_non_finite_repa_weight() -> None:
                 "ffn_ratio": 4,
                 "repa_loss_weight": float("nan"),
             }
+        )
+
+
+def test_transformer_anchor_requires_heads_to_divide_hidden_dim() -> None:
+    with pytest.raises(ValueError, match="divisible by heads"):
+        DecoderConfig(
+            heads=3,
+            anchor_context=AnchorContext.TRANSFORMER,
+            anchor_hidden_dim=8,
         )
 
 
@@ -196,12 +206,24 @@ def test_train_config_parses_first_codebook_anchor_mode() -> None:
             "model.decoder.fm_mode=anchor",
             "model.decoder.anchor_hidden_dim=256",
             "model.decoder.anchor_layers=2",
+            "model.decoder.anchor_context=transformer",
         )
     )
 
     assert config.model.decoder.fm_mode is FMMode.ANCHOR
     assert config.model.decoder.anchor_hidden_dim == 256
     assert config.model.decoder.anchor_layers == 2
+    assert config.model.decoder.anchor_context is AnchorContext.TRANSFORMER
+
+
+def test_longcat_transformer_anchor_experiment_is_frame_aligned() -> None:
+    config = parse_train_config(_compose("experiment=011_longcat_transformer_anchor"))
+
+    assert config.model.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
+    assert config.model.decoder.fm_mode is FMMode.ANCHOR
+    assert config.model.decoder.anchor_context is AnchorContext.TRANSFORMER
+    assert config.datamodule.sample_limit == 10000
+    assert config.trainer.max_steps == 2000
 
 
 def test_train_config_rejects_anchor_without_first_codebook_adapter() -> None:

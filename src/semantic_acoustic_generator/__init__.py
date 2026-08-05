@@ -1,6 +1,12 @@
 """Reference-optional semantic-to-acoustic generation components."""
 
-from semantic_acoustic_generator.config import DecoderConfig, FeatureAdapter, FMMode, Route
+from semantic_acoustic_generator.config import (
+    AnchorContext,
+    DecoderConfig,
+    FeatureAdapter,
+    FMMode,
+    Route,
+)
 from semantic_acoustic_generator.model import (
     AcousticRVQDecoder,
     AcousticUnitGenerator,
@@ -24,6 +30,7 @@ from semantic_acoustic_generator.runtime import (
 __all__ = [
     "AcousticRVQDecoder",
     "AcousticUnitGenerator",
+    "AnchorContext",
     "DecoderLoss",
     "DecoderConfig",
     "DiTDecoder",

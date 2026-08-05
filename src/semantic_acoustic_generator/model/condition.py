@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
 from semantic_acoustic_generator._tensor import is_signed_integer_dtype
-from semantic_acoustic_generator.config import Initialization
+from semantic_acoustic_generator.config import AnchorContext, Initialization
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -179,7 +180,7 @@ class ReferenceConditioner(nn.Module):
 
 
 class AlignedAnchor(nn.Module):
-    """Predict one acoustic feature per semantic frame from bounded local context."""
+    """Predict one acoustic feature per semantic frame without changing the frame axis."""
 
     def __init__(
         self,
@@ -189,16 +190,31 @@ class AlignedAnchor(nn.Module):
         hidden_dim: int,
         layers: int,
         kernel_size: int,
+        context: AnchorContext = AnchorContext.LOCAL,
+        heads: int = 8,
+        ffn_ratio: int = 4,
     ) -> None:
         super().__init__()
         if min(condition_dim, feature_dim, hidden_dim, layers) <= 0:
             raise ValueError("aligned anchor dimensions and layers must be positive.")
         if kernel_size <= 0 or kernel_size % 2 == 0:
             raise ValueError("aligned anchor kernel_size must be a positive odd integer.")
+        if not isinstance(context, AnchorContext):
+            raise TypeError("aligned anchor context must be an AnchorContext.")
+        if heads <= 0 or ffn_ratio <= 0:
+            raise ValueError("aligned anchor heads and ffn_ratio must be positive.")
+        if context is AnchorContext.TRANSFORMER and hidden_dim % heads != 0:
+            raise ValueError("transformer anchor hidden_dim must be divisible by heads.")
+        self.context = context
         self.input = nn.Linear(condition_dim, hidden_dim)
-        self.blocks = nn.ModuleList(
-            [_AlignedAnchorBlock(hidden_dim, kernel_size=kernel_size) for _ in range(layers)]
-        )
+        if context is AnchorContext.LOCAL:
+            blocks = [_LocalAnchorBlock(hidden_dim, kernel_size=kernel_size) for _ in range(layers)]
+        else:
+            blocks = [
+                _TransformerAnchorBlock(hidden_dim, heads=heads, ffn_ratio=ffn_ratio)
+                for _ in range(layers)
+            ]
+        self.blocks = nn.ModuleList(blocks)
         self.norm = nn.LayerNorm(hidden_dim)
         self.output = nn.Linear(hidden_dim, feature_dim)
 
@@ -208,12 +224,17 @@ class AlignedAnchor(nn.Module):
         if mask.dtype != torch.bool:
             raise TypeError("aligned anchor mask must be boolean.")
         hidden = self.input(condition).masked_fill(~mask[..., None], 0)
+        if self.context is AnchorContext.TRANSFORMER:
+            hidden = (hidden + _sinusoidal_positions(hidden)).masked_fill(
+                ~mask[..., None],
+                0,
+            )
         for block in self.blocks:
             hidden = block(hidden, mask)
         return self.output(self.norm(hidden)).masked_fill(~mask[..., None], 0)
 
 
-class _AlignedAnchorBlock(nn.Module):
+class _LocalAnchorBlock(nn.Module):
     def __init__(self, hidden_dim: int, *, kernel_size: int) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
@@ -233,6 +254,55 @@ class _AlignedAnchorBlock(nn.Module):
         activation, gate = self.gate(value).chunk(2, dim=-1)
         value = self.output(torch.nn.functional.silu(activation) * gate.sigmoid())
         return (hidden + value).masked_fill(~mask[..., None], 0)
+
+
+class _TransformerAnchorBlock(nn.Module):
+    def __init__(self, hidden_dim: int, *, heads: int, ffn_ratio: int) -> None:
+        super().__init__()
+        self.attention_norm = nn.LayerNorm(hidden_dim)
+        self.attention = nn.MultiheadAttention(
+            hidden_dim,
+            heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * ffn_ratio),
+            nn.GELU(),
+            nn.Linear(hidden_dim * ffn_ratio, hidden_dim),
+        )
+
+    def forward(self, hidden: Tensor, mask: Tensor) -> Tensor:
+        value = self.attention_norm(hidden)
+        value, _ = self.attention(
+            value,
+            value,
+            value,
+            key_padding_mask=~mask,
+            need_weights=False,
+        )
+        hidden = (hidden + value).masked_fill(~mask[..., None], 0)
+        value = self.ffn(self.ffn_norm(hidden))
+        return (hidden + value).masked_fill(~mask[..., None], 0)
+
+
+def _sinusoidal_positions(hidden: Tensor) -> Tensor:
+    frames, dimensions = hidden.size(1), hidden.size(2)
+    positions = torch.arange(frames, device=hidden.device, dtype=torch.float32)[:, None]
+    dimensions_index = torch.arange(
+        0,
+        dimensions,
+        2,
+        device=hidden.device,
+        dtype=torch.float32,
+    )
+    frequencies = torch.exp(-math.log(10_000.0) * dimensions_index / dimensions)
+    angles = positions * frequencies[None]
+    encoding = torch.zeros(frames, dimensions, device=hidden.device, dtype=torch.float32)
+    encoding[:, 0::2] = angles.sin()
+    encoding[:, 1::2] = angles[:, : dimensions // 2].cos()
+    return encoding.to(dtype=hidden.dtype)[None]
 
 
 def repeat_condition(condition: Tensor, spans: Tensor, *, frames: int | None) -> Tensor:

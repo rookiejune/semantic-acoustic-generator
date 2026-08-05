@@ -105,6 +105,9 @@ class FMFeatureGenerator(AcousticUnitGenerator):
                 hidden_dim=config.anchor_hidden_dim,
                 layers=config.anchor_layers,
                 kernel_size=config.anchor_kernel_size,
+                context=config.anchor_context,
+                heads=config.heads,
+                ffn_ratio=config.ffn_ratio,
             )
         )
         self.repa_loss_weight = config.repa_loss_weight

@@ -12,6 +12,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from semantic_acoustic_generator.backend import BackendConfig
 from semantic_acoustic_generator.config import (
+    AnchorContext,
     DecoderConfig,
     FeatureAdapter,
     FMMode,
@@ -381,6 +382,9 @@ def _prepare(config: DictConfig) -> DictConfig:
             fm_mode = decoder.get("fm_mode")
             if fm_mode is not None:
                 decoder.fm_mode = _enum_name(FMMode, fm_mode)
+            anchor_context = decoder.get("anchor_context")
+            if anchor_context is not None:
+                decoder.anchor_context = _enum_name(AnchorContext, anchor_context)
     runtime = result.get("runtime")
     if isinstance(runtime, DictConfig):
         initialization = runtime.get("initialization")

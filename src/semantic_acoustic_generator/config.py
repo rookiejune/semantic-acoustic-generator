@@ -26,6 +26,11 @@ class FMMode(StrEnum):
     RESIDUAL = auto()
 
 
+class AnchorContext(StrEnum):
+    LOCAL = auto()
+    TRANSFORMER = auto()
+
+
 class Initialization(StrEnum):
     CODEC = auto()
     RANDOM = auto()
@@ -49,6 +54,7 @@ class DecoderConfig:
     repa_student_layer: int | None = None
     repa_loss_weight: float = 0.0
     fm_mode: FMMode = FMMode.FLOW
+    anchor_context: AnchorContext = AnchorContext.LOCAL
     anchor_hidden_dim: int = 512
     anchor_layers: int = 4
     anchor_kernel_size: int = 3
@@ -70,6 +76,8 @@ class DecoderConfig:
         _float(self.repa_loss_weight, name="repa_loss_weight")
         if not isinstance(self.fm_mode, FMMode):
             raise TypeError("fm_mode must be an FMMode.")
+        if not isinstance(self.anchor_context, AnchorContext):
+            raise TypeError("anchor_context must be an AnchorContext.")
         _int(self.anchor_hidden_dim, name="anchor_hidden_dim")
         _int(self.anchor_layers, name="anchor_layers")
         _int(self.anchor_kernel_size, name="anchor_kernel_size")
@@ -86,6 +94,11 @@ class DecoderConfig:
             raise ValueError("repa_feature_dim is required when repa_loss_weight is positive.")
         if self.anchor_hidden_dim <= 0 or self.anchor_layers <= 0:
             raise ValueError("anchor hidden_dim and layers must be positive.")
+        if (
+            self.anchor_context is AnchorContext.TRANSFORMER
+            and self.anchor_hidden_dim % self.heads != 0
+        ):
+            raise ValueError("transformer anchor hidden_dim must be divisible by heads.")
         if self.anchor_kernel_size <= 0 or self.anchor_kernel_size % 2 == 0:
             raise ValueError("anchor_kernel_size must be a positive odd integer.")
         if self.anchor_cosine_weight < 0 or self.anchor_factor_weight < 0:
@@ -109,6 +122,9 @@ def decoder_options(
     fm_mode = config.get("fm_mode", FMMode.FLOW.value)
     if not isinstance(fm_mode, str):
         raise TypeError("fm_mode must be a string.")
+    anchor_context = config.get("anchor_context", AnchorContext.LOCAL.value)
+    if not isinstance(anchor_context, str):
+        raise TypeError("anchor_context must be a string.")
     return DecoderConfig(
         hidden_dim=_optional_int(config.get("hidden_dim"), name="hidden_dim"),
         layers=_int(config["layers"], name="layers"),
@@ -124,6 +140,7 @@ def decoder_options(
         ),
         repa_loss_weight=_float(config.get("repa_loss_weight", 0.0), name="repa_loss_weight"),
         fm_mode=FMMode(fm_mode),
+        anchor_context=AnchorContext(anchor_context),
         anchor_hidden_dim=_int(config.get("anchor_hidden_dim", 512), name="anchor_hidden_dim"),
         anchor_layers=_int(config.get("anchor_layers", 4), name="anchor_layers"),
         anchor_kernel_size=_int(
@@ -169,6 +186,7 @@ def _float(value: object, *, name: str) -> float:
 
 
 __all__ = [
+    "AnchorContext",
     "DecoderConfig",
     "FeatureAdapter",
     "FMMode",

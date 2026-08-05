@@ -9,6 +9,7 @@ decoder:
   mtp_layers: 2
   mtp_heads: 4
   fm_mode: flow
+  anchor_context: local
   anchor_hidden_dim: 512
   anchor_layers: 4
   anchor_kernel_size: 3
