@@ -288,6 +288,15 @@ class DataModule(pl.LightningDataModule):
         acoustic_pad_ids: Sequence[int],
     ) -> None:
         super().__init__()
+        if codec == "bicodec":
+            raise ValueError(
+                "BiCodec provides semantic/global units; generator data requires "
+                "frame-aligned semantic/acoustic units."
+            )
+        if not isinstance(acoustic_layout, AcousticLayout):
+            raise TypeError("acoustic_layout must be an AcousticLayout.")
+        if acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
+            raise ValueError("generator data requires frame-aligned acoustic units.")
         self.data = data
         self.adapter = source_adapter(data.source_type)
         self.codec = codec

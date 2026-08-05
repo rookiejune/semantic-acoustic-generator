@@ -22,6 +22,10 @@ def collate_structured_codes(
         raise ValueError("cannot collate an empty structured codec batch.")
     if not isinstance(acoustic_layout, AcousticLayout):
         raise TypeError("acoustic_layout must be an AcousticLayout.")
+    if acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
+        raise ValueError(
+            "structured generator data requires frame-aligned semantic/acoustic units."
+        )
     _positive_id(semantic_pad_id, name="semantic_pad_id")
     pads = tuple(int(value) for value in acoustic_pad_ids)
     if not pads or any(value <= 0 for value in pads):
@@ -40,7 +44,7 @@ def collate_structured_codes(
         raise ValueError("acoustic_pad_ids must match the acoustic codebook axis.")
     if any(acoustic.size(1) != codebooks for _, acoustic in samples):
         raise ValueError("structured acoustic codebooks must be consistent across samples.")
-    if acoustic_layout is AcousticLayout.FRAME_ALIGNED and any(
+    if any(
         semantic.size(0) != acoustic.size(0) for semantic, acoustic in samples
     ):
         raise ValueError("frame-aligned structured samples must share semantic/acoustic lengths.")

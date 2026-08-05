@@ -42,14 +42,10 @@ def build_route(
 ) -> RouteModules:
     if not isinstance(acoustic_layout, AcousticLayout):
         raise TypeError("acoustic_layout must be an AcousticLayout.")
-    if acoustic_layout is AcousticLayout.FIXED_LENGTH:
-        if acoustic_unit_length is None or acoustic_unit_length <= 0:
-            raise ValueError("fixed-length routes require a positive acoustic_unit_length.")
-        fixed_length = acoustic_unit_length
-    else:
-        if acoustic_unit_length is not None:
-            raise ValueError("frame-aligned routes must not set acoustic_unit_length.")
-        fixed_length = None
+    if acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
+        raise ValueError("generator routes require frame-aligned acoustic units.")
+    if acoustic_unit_length is not None:
+        raise ValueError("frame-aligned routes must not set acoustic_unit_length.")
     options = DecoderConfig() if decoder is None else decoder
     if route is not Route.FM and options.fm_mode is not FMMode.FLOW:
         raise ValueError("fm_mode is only supported by the FM route.")
@@ -68,14 +64,12 @@ def build_route(
             condition_dim,
             acoustic_feature_dim,
             options,
-            fixed_length=fixed_length,
         )
     elif route is Route.RVQ:
         module = RVQCodeGenerator(
             condition_dim,
             acoustic_codebook_sizes,
             options,
-            fixed_length=fixed_length,
         )
     else:
         raise AssertionError(f"unsupported route: {route}")

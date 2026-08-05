@@ -118,6 +118,10 @@ class GeneratorBatch:
     def __post_init__(self) -> None:
         if not isinstance(self.acoustic_layout, AcousticLayout):
             raise TypeError("acoustic_layout must be an AcousticLayout.")
+        if self.acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
+            raise ValueError(
+                "GeneratorBatch supports only frame-aligned semantic/acoustic units."
+            )
         _check_positive_int(self.semantic_pad_id, name="semantic_pad_id")
         for index, pad_id in enumerate(self.acoustic_pad_ids):
             _check_positive_int(pad_id, name=f"acoustic_pad_ids[{index}]")
@@ -318,11 +322,12 @@ def _validate_side(
         raise ValueError(f"{name} codec units and masks must use the same device.")
     if acoustic_codes.size(-1) != len(acoustic_pad_ids):
         raise ValueError(f"{name} acoustic codebooks must match acoustic_pad_ids.")
-    if acoustic_layout is AcousticLayout.FRAME_ALIGNED:
-        if semantic_codes.shape[:2] != acoustic_codes.shape[:2]:
-            raise ValueError(f"frame-aligned {name} codes must share the [B, F] axis.")
-        if not torch.equal(mask, acoustic_mask):
-            raise ValueError(f"frame-aligned {name} semantic and acoustic masks must match.")
+    if acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
+        raise ValueError("generator batches require frame-aligned acoustic units.")
+    if semantic_codes.shape[:2] != acoustic_codes.shape[:2]:
+        raise ValueError(f"frame-aligned {name} codes must share the [B, F] axis.")
+    if not torch.equal(mask, acoustic_mask):
+        raise ValueError(f"frame-aligned {name} semantic and acoustic masks must match.")
     if not is_signed_integer_dtype(semantic_codes.dtype):
         raise TypeError(f"{name} semantic_codes must use a signed integer dtype.")
     if not is_signed_integer_dtype(acoustic_codes.dtype):

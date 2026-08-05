@@ -96,6 +96,17 @@ class AcousticGeneratorSpec:
     feature_std: tuple[float, ...]
     sampling: SamplingConfig
 
+    def __post_init__(self) -> None:
+        if self.acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
+            raise ValueError(
+                "acoustic generator artifacts support only frame-aligned units."
+            )
+        if self.acoustic_unit_length is not None:
+            raise ValueError(
+                "frame-aligned acoustic generator artifacts must not set "
+                "acoustic_unit_length."
+            )
+
     def validate_backend(self, backend: SemanticAcousticCodec) -> None:
         validate_backend_metadata(
             self.backend_metadata(),
@@ -320,26 +331,23 @@ def _generator(
     metadata: Mapping[str, object],
 ) -> AcousticUnitGenerator:
     codec_spec = _codec_spec(metadata)
-    fixed_length = codec_spec.acoustic_unit_length
     if config.route is Route.FM:
         return FMFeatureGenerator(
             config.condition_dim,
             codec_spec.acoustic_feature_dim,
             config.decoder,
-            fixed_length=fixed_length,
         )
     if config.route is Route.RVQ:
         return RVQCodeGenerator(
             config.condition_dim,
             codec_spec.acoustic_codebook_sizes,
             config.decoder,
-            fixed_length=fixed_length,
         )
     raise AssertionError(f"unsupported route: {config.route}")
 
 
 def _codec_spec(metadata: Mapping[str, object]) -> SemanticAcousticCodecSpec:
-    return SemanticAcousticCodecSpec(
+    spec = SemanticAcousticCodecSpec(
         sample_rate=_metadata_int(metadata, "sample_rate"),
         frame_rate=_metadata_float(metadata, "frame_rate"),
         semantic_frame_rate=_metadata_float(metadata, "semantic_frame_rate"),
@@ -350,6 +358,15 @@ def _codec_spec(metadata: Mapping[str, object]) -> SemanticAcousticCodecSpec:
         acoustic_layout=AcousticLayout(_metadata_string(metadata, "acoustic_layout")),
         acoustic_unit_length=_metadata_optional_int(metadata, "acoustic_unit_length"),
     )
+    if spec.acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
+        raise ValueError(
+            "semantic-acoustic generator artifacts require frame-aligned acoustic units."
+        )
+    if spec.acoustic_unit_length is not None:
+        raise ValueError(
+            "frame-aligned generator artifacts must not set acoustic_unit_length."
+        )
+    return spec
 
 
 def _generator_state(state: Mapping[str, Tensor]) -> dict[str, Tensor]:

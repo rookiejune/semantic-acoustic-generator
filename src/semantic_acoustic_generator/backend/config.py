@@ -13,6 +13,11 @@ class BackendConfig:
 
     def __post_init__(self) -> None:
         _non_empty_string(self.name, "backend.name")
+        if self.name == "bicodec":
+            raise ValueError(
+                "BiCodec is a semantic-global codec; semantic-acoustic-generator "
+                "supports only frame-aligned semantic-acoustic backends."
+            )
         _optional_non_empty_string(self.model_dir, "backend.model_dir")
         _optional_non_empty_string(self.revision, "backend.revision")
         _boolean(self.local_files_only, "backend.local_files_only")

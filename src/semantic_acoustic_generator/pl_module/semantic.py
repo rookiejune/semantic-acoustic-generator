@@ -433,14 +433,12 @@ class GeneratorModule(LightningLogMixin, LightningModule):
         reference_mask: Tensor | None,
         generator: torch.Generator,
     ) -> Tensor:
-        output_length = self.backend.acoustic_unit_length
         if self.support.route is Route.FM:
             prediction = self.support.sample_features(
                 batch.semantic_codes,
                 mask=batch.mask,
                 reference_features=reference_features,
                 reference_mask=reference_mask,
-                output_length=output_length,
                 generator=generator,
             )
             target = self._target_features(batch).to(
@@ -453,7 +451,6 @@ class GeneratorModule(LightningLogMixin, LightningModule):
             mask=batch.mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
-            output_length=output_length,
             generator=generator,
         )
         target_codes = batch.acoustic_codes.to(device=prediction.device)

@@ -78,8 +78,6 @@ def _compose(*overrides: str) -> DictConfig:
     [
         ("001_longcat_fm", "longcat", "fm", 1_000_000),
         ("001_longcat_rvq", "longcat", "rvq", 1_000_000),
-        ("001_bicodec_fm", "bicodec", "fm", 1_000_000),
-        ("001_bicodec_rvq", "bicodec", "rvq", 1_000_000),
         ("smoke", "longcat", "fm", 2),
         ("smoke32", "longcat", "fm", 4),
         ("overfit", "longcat", "fm", 20),
@@ -223,7 +221,7 @@ def test_train_config_rejects_feature_adapter_on_rvq_route() -> None:
 
 def test_train_config_rejects_longcat_adapter_on_other_backend() -> None:
     raw = _compose(
-        "backend=bicodec",
+        "backend.name=other",
         "model.feature_adapter=longcat_first_codebook",
     )
 
@@ -231,17 +229,11 @@ def test_train_config_rejects_longcat_adapter_on_other_backend() -> None:
         parse_train_config(raw)
 
 
-def test_experiment_composition_can_be_overridden_explicitly() -> None:
-    config = _compose("experiment=overfit", "backend=bicodec", "model/route=rvq")
-
-    assert config.backend.name == "bicodec"
-    assert config.backend.model_dir is None
-    assert config.backend.revision is None
-    assert config.backend.local_files_only is True
-    assert config.backend.allow_unpinned_revision is False
-    assert config.model.route == "rvq"
-    assert config.datamodule.fixed_batch is True
-    assert config.output_subdir == "overfit/bicodec/rvq-8l"
+def test_legacy_bicodec_config_is_rejected_as_semantic_global() -> None:
+    with pytest.raises(ValueError, match="semantic-global"):
+        parse_train_config(
+            _compose("experiment=overfit", "backend=bicodec", "model/route=rvq")
+        )
 
 
 def test_screening_uses_disjoint_training_partition() -> None:

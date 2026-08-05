@@ -1,51 +1,27 @@
 from __future__ import annotations
 
-from typing import Any
+from types import SimpleNamespace
 
 import pytest
+from anytrain.codec import AcousticLayout
 
 import semantic_acoustic_generator.backend.loader as backend_loader
 from semantic_acoustic_generator.backend import BackendConfig, load_backend
 
 
-def test_load_backend_passes_bicodec_loading_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[dict[str, Any]] = []
-    loaded = object()
-
-    class FakeBiCodec:
-        @classmethod
-        def from_pretrained(cls, **kwargs: Any) -> object:
-            calls.append(kwargs)
-            return loaded
-
-    monkeypatch.setattr(backend_loader, "_bicodec_type", lambda: FakeBiCodec)
-    config = BackendConfig(
-        name="bicodec",
-        model_dir="/models/bicodec",
-        revision="0123456789abcdef",
-        local_files_only=False,
-        allow_unpinned_revision=True,
-    )
-
-    assert load_backend(config, device="cpu") is loaded
-    assert calls == [
-        {
-            "model_dir": "/models/bicodec",
-            "revision": "0123456789abcdef",
-            "device": "cpu",
-            "local_files_only": False,
-            "allow_unpinned_revision": True,
-        }
-    ]
+def test_backend_config_rejects_bicodec_semantic_global_contract() -> None:
+    with pytest.raises(ValueError, match="semantic-global"):
+        BackendConfig(name="bicodec")
 
 
 def test_load_backend_keeps_default_loader_for_non_bicodec(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, object]] = []
-    loaded = object()
+    loaded = SimpleNamespace(
+        acoustic_layout=AcousticLayout.FRAME_ALIGNED,
+        acoustic_unit_length=None,
+    )
 
     def load_semantic_acoustic(name: str, *, device: object) -> object:
         calls.append((name, device))
@@ -60,6 +36,23 @@ def test_load_backend_keeps_default_loader_for_non_bicodec(
 
     assert load_backend(config, device="cpu") is loaded
     assert calls == [("longcat", "cpu")]
+
+
+def test_load_backend_rejects_non_aligned_acoustic_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = SimpleNamespace(
+        acoustic_layout=AcousticLayout.FIXED_LENGTH,
+        acoustic_unit_length=32,
+    )
+    monkeypatch.setattr(
+        backend_loader,
+        "load_semantic_acoustic",
+        lambda *args, **kwargs: loaded,
+    )
+
+    with pytest.raises(ValueError, match="frame-aligned"):
+        load_backend(BackendConfig(name="fixed-test"), device="cpu")
 
 
 def test_backend_config_rejects_string_booleans() -> None:

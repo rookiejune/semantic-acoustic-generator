@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -179,84 +178,6 @@ class ReferenceConditioner(nn.Module):
         return torch.where(use_reference[:, None, None], conditioned, null)
 
 
-class FixedLengthConditioner(nn.Module):
-    """Read semantic memory with one learned query per fixed acoustic slot."""
-
-    def __init__(self, condition_dim: int, *, slots: int) -> None:
-        super().__init__()
-        if (
-            isinstance(condition_dim, bool)
-            or not isinstance(condition_dim, int)
-            or isinstance(slots, bool)
-            or not isinstance(slots, int)
-        ):
-            raise TypeError("condition_dim and slots must be integers.")
-        if condition_dim <= 0 or slots <= 0:
-            raise ValueError("condition_dim and slots must be positive.")
-        self.condition_dim = condition_dim
-        self.slots = slots
-        self.slot_queries = nn.Parameter(torch.empty(slots, condition_dim))
-        _ = nn.init.normal_(self.slot_queries, std=condition_dim**-0.5)
-        self.query_norm = _norm(condition_dim)
-        self.memory_norm = _norm(condition_dim)
-        self.output_norm = _norm(condition_dim)
-        self._position_cache: Tensor = torch.empty(0, condition_dim)
-
-    def forward(
-        self,
-        memory: Tensor,
-        mask: Tensor,
-        *,
-        output_length: int,
-        validate: bool = True,
-    ) -> Tensor:
-        if validate and (memory.dim() != 3 or memory.size(-1) != self.condition_dim):
-            raise ValueError("semantic memory must have shape [B, F, condition_dim].")
-        if validate and (not torch.is_floating_point(memory) or torch.is_complex(memory)):
-            raise TypeError("semantic memory must be floating point.")
-        if validate and mask.shape != memory.shape[:2]:
-            raise ValueError("semantic memory mask must align on [B, F].")
-        if validate and mask.dtype != torch.bool:
-            raise TypeError("semantic memory mask must be boolean.")
-        if validate and mask.device != memory.device:
-            raise ValueError("semantic memory and mask must use the same device.")
-        if validate and not bool(mask.any(dim=1).all()):
-            raise ValueError("each semantic memory row must contain at least one valid unit.")
-        if validate and (isinstance(output_length, bool) or not isinstance(output_length, int)):
-            raise TypeError("fixed-length output_length must be an integer.")
-        if validate and (output_length < 1 or output_length > self.slots):
-            raise ValueError(
-                f"fixed-length output_length must be in [1, {self.slots}], got {output_length}."
-            )
-
-        positions = self._positions(memory)
-        normalized_memory = self.memory_norm(memory + positions[None])
-        queries = self.query_norm(self.slot_queries[:output_length].to(dtype=memory.dtype))
-        queries = queries[None].expand(memory.size(0), -1, -1)
-        scores = torch.matmul(queries, normalized_memory.transpose(1, 2))
-        scores = scores * self.condition_dim**-0.5
-        scores = scores.masked_fill(~mask[:, None], torch.finfo(scores.dtype).min)
-        weights = scores.float().softmax(dim=-1).to(dtype=normalized_memory.dtype)
-        context = torch.matmul(weights, normalized_memory)
-        return self.output_norm(queries + context)
-
-    def _positions(self, memory: Tensor) -> Tensor:
-        length = memory.size(1)
-        cache = self._position_cache
-        same_type = cache.device == memory.device and cache.dtype == memory.dtype
-        if not same_type or cache.size(0) < length:
-            previous = cache.size(0) if same_type else 0
-            capacity = max(length, max(1, previous * 2))
-            cache = _sinusoidal_positions(
-                capacity,
-                self.condition_dim,
-                device=memory.device,
-                dtype=memory.dtype,
-            )
-            self._position_cache = cache
-        return cache[:length]
-
-
 class AlignedAnchor(nn.Module):
     """Predict one acoustic feature per semantic frame from bounded local context."""
 
@@ -384,25 +305,3 @@ def _semantic_weight(
     if initialization is Initialization.RANDOM:
         return matched_random_weight(codebook.detach(), seed=seed)
     raise AssertionError(f"unsupported initialization: {initialization}")
-
-
-def _sinusoidal_positions(
-    length: int,
-    dim: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tensor:
-    positions = torch.arange(length, device=device, dtype=torch.float32)[:, None]
-    frequencies = torch.exp(
-        torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (-math.log(10_000.0) / dim)
-    )
-    angles = positions * frequencies[None]
-    encoding = torch.zeros(length, dim, device=device, dtype=torch.float32)
-    encoding[:, 0::2] = angles.sin()
-    encoding[:, 1::2] = angles[:, : dim // 2].cos()
-    return encoding.to(dtype=dtype)
-
-
-def _norm(dim: int) -> nn.Module:
-    return nn.Identity() if dim == 1 else nn.LayerNorm(dim)

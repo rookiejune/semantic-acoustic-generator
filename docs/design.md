@@ -3,8 +3,9 @@
 ## 目标
 
 本项目实现 reference-optional 的 semantic-to-acoustic generator：输入 semantic codes 和可选 reference
-acoustic features，生成外部 codec backend 解码所需的 acoustic features 或 codes。当前训练主线使用 Qwen
-speaker grid 离线生成的 LongCat / BiCodec units，并由 `qwen_cross_text` 构造显式 target/reference pair。
+acoustic features，生成外部 codec backend 解码所需的 acoustic features 或 codes。本工程只支持
+frame-aligned 的 semantic/acoustic codec；当前训练主线使用 Qwen speaker grid 离线生成的 LongCat units，
+并由 `qwen_cross_text` 构造显式 target/reference pair。
 每个 reference 必须和 target 属于同一 speaker，同时 sample index、utterance id 和文本均不同；无法配对时
 在 dataset 构造阶段直接报错。
 
@@ -15,8 +16,8 @@ ownership 边界如下：
   artifact。
 - `GeneratorRuntime` 只把 generator 与调用方提供的 codec backend 组合起来；它可以暴露端到端
   waveform 接口，但不因此拥有或实现 codec。
-- 当前实现通过 `anytrain.codec.SemanticAcousticCodec` 和 `SemanticAcousticCodecSpec` 接入 backend；这是
-  现有兼容边界，不改变 codec 本体归 AnyCodec 所有的工程边界。
+- 当前实现通过 `anytrain.codec.SemanticAcousticCodec` 和 `SemanticAcousticCodecSpec` 接入严格的
+  frame-aligned backend；这是现有兼容边界，不改变 codec 本体归 AnyCodec 所有的工程边界。
 
 保留的 LongCat prepared source 按现有约定解释 code layout：
 
@@ -24,10 +25,14 @@ ownership 边界如下：
 - `codes[..., 1:]`：acoustic RVQ codebooks。
 - semantic 和 acoustic codebooks 共享 frame 轴。
 
-抽象层不能绑定 LongCat 的 frame-level acoustic RVQ layout。LongCat backend 的缺失部分可以是
-frame-level acoustic features 或 RVQ codebooks；BiCodec backend 的缺失部分可能是 semantic 外的 global /
-acoustic / residual units。公共 runtime 稳定 semantic 必需输入与 optional-reference 输入，backend adapter
-和 generator 负责解释各 codec 自己的 side-unit layout。
+本工程的抽象就是 frame-level acoustic RVQ layout：LongCat backend 的缺失部分可以是逐帧 acoustic
+features 或 RVQ codebooks。公共 runtime 稳定 semantic 必需输入与 optional-reference 输入；backend adapter
+和 generator 只解释与 semantic 共享 frame 轴的 acoustic side units。
+
+BiCodec 是 `semantic + global` codec，不是本工程的 acoustic backend。它的 global units 不具有 acoustic
+frame 轴，不能伪装为 fixed-length acoustic slots，也不能通过 padding、repeat 或 learned query 接入这里的
+generator。BiCodec 应由 token-model 路径负责；`BackendConfig(name="bicodec")` 和携带非
+`FRAME_ALIGNED` metadata 的 backend/artifact 都会明确拒绝。
 
 这个仓库把 `speech-to-speech` 旧 codec oracle 中可复用的 acoustic generation 能力沉淀为独立包。
 `speech-to-speech` 只依赖公开的 generator、artifact 和 runtime composition 契约，不再持有 LongCat
@@ -64,7 +69,6 @@ class GeneratorSupport(nn.Module):
         mask: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor: ...
 
@@ -75,7 +79,6 @@ class GeneratorSupport(nn.Module):
         mask: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor: ...
 
@@ -106,8 +109,8 @@ class GeneratorRuntime:
 ```
 
 `GeneratorSupport` 不持有 codec backend：FM 路线可直接生成 features，RVQ 路线的 code-to-feature
-转换必须通过 `GeneratorRuntime` 完成。`mask` 用于 semantic padding，`output_length` 只适用于
-`FIXED_LENGTH` acoustic layout，`generator` 用于固定 seed 的采样对照。waveform decode 只接受每行
+转换必须通过 `GeneratorRuntime` 完成。`mask` 用于共享 semantic/acoustic frame 轴上的 padding，`generator`
+用于固定 seed 的采样对照。waveform decode 只接受每行
 有效长度相同的 batch，mask 必须表示连续的右侧 padding；runtime 会在进入 backend 前裁掉 padding。
 不同长度的请求应先按有效长度分组，或逐行 decode。
 
@@ -129,8 +132,6 @@ class FeatureSampler(Protocol):
         flow_steps: int,
         unconditional_condition: Tensor | None = None,
         cfg_scale: float = 1.0,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor: ...
 
@@ -143,8 +144,6 @@ class AcousticCodeSampler(Protocol):
         *,
         temperature: float,
         top_p: float,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor: ...
 
@@ -200,11 +199,11 @@ acoustic features，RVQ 只接收 acoustic code IDs；两者不再通过 nullabl
 `GeneratorBatch` 使用严格结构表达数据：
 
 - `semantic_codes: Tensor`，shape `[B, F, 1]`，signed integer dtype。
-- `acoustic_codes: Tensor`，shape `[B, U, K]`，其中 `U` 可以是 frame 或固定 acoustic slot。
+- `acoustic_codes: Tensor`，shape `[B, F, K]`，与 semantic 共享 frame 轴。
 - `mask: Tensor`，shape `[B, F]`，标记 semantic 时间轴的有效位置。
-- `acoustic_mask: Tensor`，shape `[B, U]`，标记 acoustic unit 轴的有效位置。
-- `acoustic_layout: AcousticLayout`，`FRAME_ALIGNED` 要求 `F == U` 且 mask 相同；
-  `FIXED_LENGTH` 允许 semantic 时间轴和 acoustic slot 轴独立变化。
+- `acoustic_mask: Tensor`，shape `[B, F]`，必须与 `mask` 相同。
+- `acoustic_layout: AcousticLayout.FRAME_ALIGNED`：这是唯一接受的 layout；`FIXED_LENGTH` 在 batch
+  构造时明确拒绝。
 - `reference_semantic_codes`、`reference_acoustic_codes`、`reference_mask` 和
   `reference_acoustic_mask`：`qwen_cross_text` batch 中完整保留 cross-text reference side。
 - `metadata: tuple[PairMetadata, ...]`：逐行记录 target/reference store index、grid
@@ -215,12 +214,9 @@ acoustic features，RVQ 只接收 acoustic code IDs；两者不再通过 nullabl
 `target_acoustic_mask` 或 `target_*` tensor alias。同一含义只保留一个名称，reference 侧通过
 `batch.reference` 返回四个已校验的必需 tensor。
 
-`collate_structured_codes()` 直接接收 anytrain 的 `SemanticAcousticCodes`，按两个轴分别 padding。
-因此 BiCodec 的 `[time, 1]` semantic 与 `[slot, codebook]` acoustic 不会被拼成一个伪造的
-`[frame, codebook]` Tensor。`FIXED_LENGTH` 不对 semantic 做 mean-pool 后复制：codec 声明的每个
-acoustic slot 都有 learned query，通过 masked cross-attention 读取完整、带位置信息的 semantic memory。
-BiCodec RVQ 的 temporal MTP 再沿 32-slot 轴自回归生成；FM 保留为在同一 32-slot condition 上联合生成的
-对照路线。`FRAME_ALIGNED` 仍保持逐帧 condition。
+`collate_structured_codes()` 直接接收 anytrain 的 `SemanticAcousticCodes`，并只对共享 frame 轴进行
+padding。它在 source/batch 边界验证 `FRAME_ALIGNED`；不会接受 BiCodec 的 semantic/global 表示，也不会
+把 global units 拼成伪造的 `[frame, codebook]` Tensor。
 
 ## 模块边界
 
@@ -277,9 +273,9 @@ loss、pl_module、runtime、callback 和 trainer，再覆盖该实验独有的�
 是本仓库训练实现，不应被 `speech-to-speech` 直接 import。
 
 codec backend 的 capability 由 anytrain 统一提供；本仓库的 `load_backend(BackendConfig, device)` 是严格
-配置边界：普通 backend 转交 `anytrain.codec.load_semantic_acoustic()`，BiCodec 则显式传递其模型目录、
-revision 和本地加载策略。它不接受松散 mapping，也不增加只转发属性和方法的 codec wrapper。固定长度
-acoustic units 的训练适配属于本仓库的 batch/generator contract，不属于 codec loader。
+配置边界：它转交 `anytrain.codec.load_semantic_acoustic()` 后，验证 backend 为 `FRAME_ALIGNED` 且未声明
+固定 acoustic unit length。它不接受松散 mapping，也不增加只转发属性和方法的 codec wrapper；配置为
+`bicodec` 时在加载前直接报错。
 
 ## 复用约定
 
@@ -295,10 +291,10 @@ generation 语义、condition、head、loss 和 runtime 组合。
 
 正式训练默认使用 `qwen_cross_text`：
 
-1. workspace 从 Qwen speaker grid 离线生成 waveform，并分别物化 LongCat / BiCodec structured units。
+1. workspace 从 Qwen speaker grid 离线生成 waveform，并物化 LongCat frame-aligned structured units。
 2. dataset 在 `__getitem__` 中按 source order 为每个 target 懒加载并确定性选择同 speaker、不同 utterance
    和文本的 reference；构造 dataset 不读取或缓存全量 codec tensor。
-3. datamodule 分别 padding target/reference 的 semantic 与 acoustic 轴，并保留 pair metadata。
+3. datamodule 分别 padding target/reference 的共享 semantic/acoustic frame 轴，并保留 pair metadata。
 4. target acoustic units 只构造 FM continuous target 或 RVQ labels；reference acoustic units 只构造
    reference condition，不能把 target features 回流到 condition。
 5. 训练逐样本以 `reference_dropout=0.5` 在显式 reference 与 learned null condition 之间切换。
@@ -324,8 +320,8 @@ RVQ 的优势是目标离散、与 LongCat acoustic representation 对齐；风�
 generator 需要显式持有每个 codebook size，不能假设所有 acoustic codebook 共用相同 vocab size。
 当前默认 predictor 是 MTP：temporal Qwen backbone 对 acoustic unit 轴做 causal teacher forcing 和
 cached autoregressive generation；一个 unit 内存在多个 codebook 时，再由小型 MTP backbone 逐 codebook
-补全。对 BiCodec 的 `[B, 32, 1]` acoustic units，这意味着严格沿 32-slot 轴生成，不是把一个 pooled
-condition 复制 32 次。`FIXED_LENGTH + CODEBOOK_AR` 在构造时直接拒绝。
+补全。该预测始终沿共享 frame 轴运行；fixed-length/global unit 路线不属于本工程，且会在构造或加载边界
+直接拒绝。
 
 ### FM
 
@@ -387,9 +383,9 @@ CPU 上以 `weights_only=True` 加载 state dict，再把已构造模块移动�
 ## 缺失 unit 生成
 
 用户侧 runtime 的唯一必需输入是 semantic codes；`decode()`、`sample_features()` 和
-`sample_acoustic_codes()` 额外接受可选的 `reference_features/reference_mask`。LongCat 的 acoustic
-features / RVQ codes、BiCodec 的 semantic 外 global / acoustic / residual units，都属于缺失 codec units，
-必须由 `AcousticUnitGenerator` 在 runtime 内部生成，不能成为调用方必须传入的 target 输入。
+`sample_acoustic_codes()` 额外接受可选的 `reference_features/reference_mask`。LongCat 的逐帧 acoustic
+features / RVQ codes 是本工程生成的缺失 codec units，不能成为调用方必须传入的 target 输入。BiCodec 的
+semantic 外 global units 不属于此 contract，必须由 token-model 路径生成。
 
 训练时可以使用 target side units 构造 backend feature、loss target 或 condition dropout；这些只属于
 `datamodule/`、`pl_module/` 和 `model/` 的训练内部契约。推理 artifact 必须保存生成缺失 units 所需的
@@ -411,23 +407,22 @@ reference gain。
 当前已完成的闭环包括：
 
 - paired data contract、FM/RVQ route contract 和 artifact roundtrip 的本地测试；
-- LongCat / BiCodec 四条路线的 fixed-sample overfit 与 finite waveform decode；
+- LongCat frame-aligned 路线的 fixed-sample overfit 与 finite waveform decode；
 - 32-sample LongCat FM 的 checkpoint/resume、sample metrics、TensorBoard audio 和 artifact export；
 - `speech-to-speech` 中一条真实 semantic-only TTS decode smoke。
 
 验收证据见 [experiments/results/](experiments/results/)。当前仍待验证的是：
 
-1. 用当前 `qwen_cross_text` pair contract 重跑 LongCat / BiCodec × FM / RVQ single-pair overfit，分别记录
+1. 用当前 `qwen_cross_text` pair contract 重跑 LongCat × FM / RVQ single-pair overfit，分别记录
    with-reference 与 without-reference 的 loss、feature MSE、音频和 `reference_gain`。
-2. 对 BiCodec RVQ 的真实 backend 运行 32-slot temporal AR generation，确认 finite decode 和推理耗时。
-3. 在 `speech-to-speech` 真实 generation 中同时跑通省略 reference 和提供 reference 的两条路径，并保留
+2. 在 `speech-to-speech` 真实 generation 中同时跑通省略 reference 和提供 reference 的两条路径，并保留
    可核对的 pair metadata 与同 seed A/B 指标。
-4. 完成约 1000 样本的四路线 screening，以及至少 16 条 held-out cross-text fixed eval；记录 loss、双路
+3. 完成约 1000 样本的 LongCat 两路线 screening，以及至少 16 条 held-out cross-text fixed eval；记录 loss、双路
    feature MSE、waveform finite、RTF、显存、MFU 和失败样本。
-5. 检查 reference 是否泄漏文本内容；验证完成前不把 reference gain 或音色保持写入 conclusion。
+4. 检查 reference 是否泄漏文本内容；验证完成前不把 reference gain 或音色保持写入 conclusion。
 
-其中 fixed-speaker 结果不等同于当前默认的 `qwen_cross_text` 训练契约；cross-text 重跑、真实 BiCodec
-RVQ 32-slot generation、held-out fixed eval 和 reference leakage 检查以
+其中 fixed-speaker 结果不等同于当前默认的 `qwen_cross_text` 训练契约；cross-text 重跑、held-out fixed
+eval 和 reference leakage 检查以
 [experiments/todo.md](experiments/todo.md) 为准。
 
 正式训练默认面向完整数据和长预算；smoke/overfit 配置只放在 `configs/experiment/`，不反向污染
@@ -437,7 +432,7 @@ RVQ 32-slot generation、held-out fixed eval 和 reference leakage 检查以
 
 迁移目标是：
 
-- `semantic-acoustic-generator` 消费外部 LongCat/BiCodec backend，拥有 codec-free
+- `semantic-acoustic-generator` 只消费外部 frame-aligned backend（当前为 LongCat），拥有 codec-free
   `GeneratorSupport`、FM/RVQ unit generator、sampling 和 runtime composition。
 - AnyCodec 拥有 codec encoder/decoder、codebook、unit layout、backend 权重和加载契约。
 - `speech-to-speech` 拥有 text/audio token model、task datamodule、generation service 和
@@ -445,6 +440,8 @@ RVQ 32-slot generation、held-out fixed eval 和 reference leakage 检查以
 - `speech-to-speech` 只通过公开 `GeneratorSupport`、anytrain 的
   `SemanticAcousticCodec`、route-specific sampler capability、`AcousticGeneratorArtifact` 和 artifact loading API
   依赖本仓库。
+- BiCodec 的 semantic/global contract 由 `speech-to-speech` token-model 路径负责；它不能加载或复用
+  `AcousticGeneratorArtifact`。
 
 避免循环依赖的规则：
 

@@ -1,7 +1,7 @@
 # speech-to-speech 集成边界
 
 `semantic-acoustic-generator` 作为 `speech-to-speech` 的下游依赖，提供 semantic-to-acoustic generation，
-而不是承接 codec 本体。本页定义依赖方向和迁移边界。
+而不是承接 codec 本体。它只适配 frame-aligned semantic/acoustic codec；本页定义依赖方向和迁移边界。
 
 ## 1. 依赖方向
 
@@ -37,6 +37,10 @@ frame_codec.decode(full_codes)           # FrameCodec path
 semantic_runtime.decode(semantic_codes)  # external codec + generator artifact
 ```
 
+第二条路径只适用于 LongCat 这类 frame-aligned semantic/acoustic codec。BiCodec 的契约是
+`semantic + global`，由 S2S token-model 路径处理；它不能把 global units 当作 fixed-length acoustic
+slots，也不能加载本仓库的 backend 或 generator artifact。
+
 接入 `SemanticAcousticCodec` 时，`speech-to-speech` 应选择 acoustic side channel 为 none 的组合：
 
 ```text
@@ -48,7 +52,7 @@ semantic audio tokens -> GeneratorRuntime.decode(semantic_codes) -> waveform
 
 structured path 中 S2S token model 只预测 semantic audio tokens；本仓库 artifact 生成 acoustic side units，
 再由外部 codec backend 完成 waveform reconstruction。FrameCodec path 则预测完整展开后的 frame/codebook
-token 序列。
+token 序列。这不是 BiCodec 的解码路径：其 global units 不满足本仓库生成器的共享 frame 轴不变量。
 
 同一个 generator artifact 还有一条独立的联合训练用途：
 
@@ -151,11 +155,14 @@ checkpoint_dir/
 其中 `config` 保存 generator 和 sampling 配置，`backend` 保存 runtime 兼容性 metadata。`backend` 至少
 包含：
 
-- acoustic layout：`frame_aligned` / `fixed_length`；
+- acoustic layout：只能是 `frame_aligned`；
 - backend name、sample rate、frame rate 与 semantic frame rate；
 - semantic vocab size 与 embedding dim；
 - acoustic codebook sizes 与 feature dim；
-- fixed-length layout 的 acoustic unit length（如适用）。
+- `acoustic_unit_length: null`，表明 acoustic units 与 semantic 共享 frame 轴。
+
+artifact loader 只接受这组 metadata。`fixed_length` 或 BiCodec semantic/global metadata 会在 artifact 或 backend
+校验时明确拒绝，不能通过兼容分支转换。
 
 训练目录中的 `sample_metrics.json`、TensorBoard events 和周期 checkpoint 属于训练产物，不是 runtime
 artifact 的必需文件。
@@ -192,8 +199,9 @@ acoustic:
   匹配，只以 acoustic metadata 约束目标 backend；artifact 的 semantic vocab/embedding 仅作为来源记录。
 
 当前联合初始化只支持 `FRAME_ALIGNED`。Flow 迁移 decoder 权重与 feature normalization；RVQ 只支持
-`codebook_ar` generator，本仓库默认的 `MTP` artifact 会被显式拒绝。fixed-length condition 如何从 S2S
-hidden sequence 映射到 acoustic slots 仍需单独设计，不能通过 repeat 或静默截断兼容。
+`codebook_ar` generator，本仓库默认的 `MTP` artifact 会被显式拒绝。BiCodec global condition 不在此初始化
+契约中，后续若需要支持必须作为 token-model 的独立设计，而不是通过 repeat、padding 或静默截断伪装成
+acoustic slots。
 
 ## 6. 两阶段训练与推理期差异
 

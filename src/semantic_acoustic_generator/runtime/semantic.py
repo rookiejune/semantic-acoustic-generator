@@ -9,6 +9,7 @@ from anytrain.codec import (
     AcousticLayout,
     SemanticAcousticCodec,
     SemanticAcousticCodecSpec,
+    semantic_acoustic_spec,
 )
 from torch import Tensor, nn
 
@@ -117,6 +118,7 @@ class GeneratorSupport(nn.Module):
         super().__init__()
         if not isinstance(codec_spec, SemanticAcousticCodecSpec):
             raise TypeError("codec_spec must be a SemanticAcousticCodecSpec.")
+        _validate_frame_aligned_spec(codec_spec)
         if modules.acoustic_codebook_sizes != codec_spec.acoustic_codebook_sizes:
             raise ValueError("route acoustic codebooks must match codec_spec.")
         self.conditioner = modules.conditioner
@@ -160,7 +162,6 @@ class GeneratorSupport(nn.Module):
         mask: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
-        output_length: int | None = None,
         cfg_scale: float | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
@@ -170,7 +171,6 @@ class GeneratorSupport(nn.Module):
             frame_mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
-            output_length=output_length,
             cfg_scale=cfg_scale,
             generator=generator,
         )
@@ -182,7 +182,6 @@ class GeneratorSupport(nn.Module):
         *,
         reference_features: Tensor | None,
         reference_mask: Tensor | None,
-        output_length: int | None,
         cfg_scale: float | None,
         generator: torch.Generator | None,
     ) -> Tensor:
@@ -210,8 +209,6 @@ class GeneratorSupport(nn.Module):
                 reference_indices=None,
                 validate=False,
             )
-        target_length = self._output_length(output_length)
-        target_mask = self._output_mask(frame_mask, target_length)
         features = self.feature_sampler.sample_features(
             condition,
             frame_mask,
@@ -220,11 +217,9 @@ class GeneratorSupport(nn.Module):
             flow_steps=self.sampling.flow_steps,
             unconditional_condition=unconditional_condition,
             cfg_scale=guidance_scale,
-            acoustic_layout=self.acoustic_layout,
-            output_length=target_length,
             generator=generator,
         )
-        return features.masked_fill(~target_mask[..., None], 0)
+        return features.masked_fill(~frame_mask[..., None], 0)
 
     @torch.no_grad()
     def sample_acoustic_codes(
@@ -234,7 +229,6 @@ class GeneratorSupport(nn.Module):
         mask: Tensor | None = None,
         reference_features: Tensor | None = None,
         reference_mask: Tensor | None = None,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
         prepared, frame_mask = self._semantic_input(semantic_codes, mask)
@@ -243,7 +237,6 @@ class GeneratorSupport(nn.Module):
             frame_mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
-            output_length=output_length,
             generator=generator,
         )
 
@@ -254,7 +247,6 @@ class GeneratorSupport(nn.Module):
         *,
         reference_features: Tensor | None,
         reference_mask: Tensor | None,
-        output_length: int | None,
         generator: torch.Generator | None,
     ) -> Tensor:
         semantic = self.conditioner(prepared, validate=False)
@@ -267,40 +259,12 @@ class GeneratorSupport(nn.Module):
             reference_indices=None,
             validate=True,
         )
-        target_length = self._output_length(output_length)
         return self.code_sampler.sample_acoustic_codes(
             condition,
             frame_mask,
             temperature=self.sampling.temperature,
             top_p=self.sampling.top_p,
-            acoustic_layout=self.acoustic_layout,
-            output_length=target_length,
             generator=generator,
-        )
-
-    def _output_length(self, value: int | None) -> int | None:
-        if self.acoustic_layout is AcousticLayout.FRAME_ALIGNED:
-            if value is not None:
-                raise ValueError("frame-aligned generation does not accept output_length.")
-            return None
-        length = self.acoustic_unit_length if value is None else value
-        if length is None or length <= 0:
-            raise ValueError("fixed-length generation requires a positive output_length.")
-        if self.acoustic_unit_length is not None and length != self.acoustic_unit_length:
-            raise ValueError(
-                "output_length must match the codec acoustic_unit_length "
-                f"{self.acoustic_unit_length}, got {length}."
-            )
-        return length
-
-    def _output_mask(self, frame_mask: Tensor, length: int | None) -> Tensor:
-        if length is None:
-            return frame_mask
-        return torch.ones(
-            frame_mask.size(0),
-            length,
-            device=frame_mask.device,
-            dtype=torch.bool,
         )
 
     def condition(
@@ -437,6 +401,7 @@ class GeneratorRuntime:
             else support.config.feature_adapter
         )
         self.backend = adapt_backend(backend, adapter)
+        _validate_frame_aligned_spec(semantic_acoustic_spec(self.backend))
         metadata = support.artifact_backend_metadata
         if metadata is None:
             validate_support_metadata(support_metadata(support), self.backend)
@@ -495,14 +460,12 @@ class GeneratorRuntime:
         cfg_scale: float | None,
         generator: torch.Generator | None,
     ) -> Tensor:
-        output_length = self.backend.acoustic_unit_length
         if self.support.route is Route.FM:
             return self.support._sample_features(
                 prepared,
                 frame_mask,
                 reference_features=reference_features,
                 reference_mask=reference_mask,
-                output_length=output_length,
                 cfg_scale=cfg_scale,
                 generator=generator,
             )
@@ -511,12 +474,10 @@ class GeneratorRuntime:
             frame_mask,
             reference_features=reference_features,
             reference_mask=reference_mask,
-            output_length=output_length,
             generator=generator,
         )
-        target_mask = self.support._output_mask(frame_mask, output_length)
         features = self.backend.acoustic_codes_to_features(codes)
-        return features.masked_fill(~target_mask.to(device=features.device)[..., None], 0)
+        return features.masked_fill(~frame_mask.to(device=features.device)[..., None], 0)
 
     @torch.no_grad()
     def decode(
@@ -556,20 +517,9 @@ class GeneratorRuntime:
             raise ValueError("features must match support acoustic_feature_dim.")
         original_length = prepared.size(1)
         prepared, frame_mask = _trim_decode_input(prepared, frame_mask)
-        if self.support.acoustic_layout is AcousticLayout.FRAME_ALIGNED:
-            if features.size(1) != original_length:
-                raise ValueError("frame-aligned features must match the padded semantic length.")
-            features = features[:, : prepared.size(1)]
-        expected_length = (
-            prepared.size(1)
-            if self.support.acoustic_layout is AcousticLayout.FRAME_ALIGNED
-            else self.support.acoustic_unit_length
-        )
-        if expected_length is None or features.size(1) != expected_length:
-            raise ValueError(
-                "features must align with the backend acoustic unit length "
-                f"{expected_length}, got {features.size(1)}."
-            )
+        if features.size(1) != original_length:
+            raise ValueError("frame-aligned features must match the padded semantic length.")
+        features = features[:, : prepared.size(1)]
         return self.backend.decode_features(prepared, features)
 
 
@@ -580,6 +530,7 @@ def build_support(
     codec_spec: SemanticAcousticCodecSpec,
     artifact_backend_metadata: Mapping[str, object] | None = None,
 ) -> GeneratorSupport:
+    _validate_frame_aligned_spec(codec_spec)
     _validate_semantic_codebook(semantic_codebook, codec_spec)
     modules = build_route(
         config.route,
@@ -590,8 +541,6 @@ def build_support(
         decoder=config.decoder,
         initialization=config.initialization,
         seed=config.seed,
-        acoustic_layout=codec_spec.acoustic_layout,
-        acoustic_unit_length=codec_spec.acoustic_unit_length,
     )
     mean = (
         None
@@ -630,6 +579,17 @@ def _validate_semantic_codebook(
         raise ValueError(
             "semantic_codebook must match codec_spec [vocab, embedding]: "
             f"{tuple(semantic_codebook.shape)} != {expected}."
+        )
+
+
+def _validate_frame_aligned_spec(codec_spec: SemanticAcousticCodecSpec) -> None:
+    if codec_spec.acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
+        raise ValueError(
+            "semantic-acoustic-generator supports only frame-aligned acoustic units."
+        )
+    if codec_spec.acoustic_unit_length is not None:
+        raise ValueError(
+            "frame-aligned semantic-acoustic specs must not set acoustic_unit_length."
         )
 
 

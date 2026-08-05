@@ -1,21 +1,13 @@
 from __future__ import annotations
 
-import json
-from types import SimpleNamespace
-from typing import Any, cast
-
+import pytest
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
-from semantic_acoustic_generator.callback import SampleLogConfig, SampleLogger
 from semantic_acoustic_generator.config import DecoderConfig, Route
 from semantic_acoustic_generator.datamodule import collate_structured_codes
 from semantic_acoustic_generator.pl_module import build_module
-from semantic_acoustic_generator.runtime import (
-    GeneratorConfig,
-    GeneratorRuntime,
-)
-from semantic_acoustic_generator.runtime.artifact import load_artifact
+from semantic_acoustic_generator.runtime import GeneratorConfig
 from semantic_acoustic_generator.types import GeneratorBatch, PairMetadata
 
 
@@ -145,107 +137,23 @@ def _paired_batch() -> GeneratorBatch:
     )
 
 
-def test_fixed_layout_fm_trains_and_runtime_uses_acoustic_axis(tmp_path) -> None:
+def test_fixed_layout_backend_is_rejected_before_training() -> None:
     backend = FixedBackend()
-    batch = _batch()
     config = GeneratorConfig(
         route=Route.FM,
         condition_dim=10,
         decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
-    module = build_module(backend, config, batch, normalize_features=True)
 
-    output = module.training_step(batch, 0)
-    assert torch.isfinite(output["loss"])
-    output["loss"].backward()
-
-    module.export_artifact(tmp_path)
-    loaded = load_artifact(tmp_path)
-    assert loaded.acoustic_layout is AcousticLayout.FIXED_LENGTH
-    assert loaded.acoustic_unit_length == backend.acoustic_unit_length
-
-    runtime = GeneratorRuntime(loaded, backend)
-    encoded = runtime.encode(torch.zeros((1, 1, 16)), 16_000)
-    features = runtime.sample_features(
-        batch.semantic_codes[:1],
-        mask=batch.mask[:1],
-        generator=torch.Generator().manual_seed(0),
-    )
-    waveform = runtime.decode(batch.semantic_codes[:1], mask=batch.mask[:1])
-
-    assert encoded.shape == (1, 2, 1)
-    assert features.shape == (1, backend.acoustic_unit_length, backend.acoustic_feature_dim)
-    assert waveform.shape == (1, 1, backend.acoustic_unit_length * 8)
+    with pytest.raises(ValueError, match="frame-aligned"):
+        build_module(backend, config, normalize_features=False)
 
 
-def test_fixed_runtime_masks_semantic_padding_before_backend_decode() -> None:
-    backend = FixedBackend()
-    batch = _batch()
-    config = GeneratorConfig(
-        route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
-    )
-    support = build_module(backend, config, batch, normalize_features=True).support
-
-    waveform = GeneratorRuntime(support, backend).decode(
-        batch.semantic_codes[1:],
-        mask=batch.mask[1:],
-    )
-
-    assert waveform.shape == (1, 1, backend.acoustic_unit_length * 8)
+def test_fixed_layout_collation_is_rejected() -> None:
+    with pytest.raises(ValueError, match="frame-aligned"):
+        _batch()
 
 
-def test_fixed_sample_logger_emits_reference_token_passthrough(tmp_path) -> None:
-    backend = RecordingFixedBackend()
-    batch = _paired_batch()
-    config = GeneratorConfig(
-        route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
-    )
-    module = build_module(backend, config, batch, normalize_features=True)
-    experiment = SimpleNamespace(audio=[])
-
-    def add_audio(tag: str, value: torch.Tensor, *, global_step: int, sample_rate: int) -> None:
-        experiment.audio.append((tag, value, global_step, sample_rate))
-
-    experiment.add_audio = add_audio
-    trainer = SimpleNamespace(
-        is_global_zero=True,
-        global_step=1,
-        loggers=[SimpleNamespace(experiment=experiment)],
-    )
-    callback = SampleLogger(
-        tmp_path,
-        batch,
-        SampleLogConfig(every_n_train_steps=1, seed=11),
-    )
-
-    callback.on_train_batch_end(cast(Any, trainer), module, None, object(), 99)
-
-    assert len(backend.detokenized) == 3
-    target, reference, passthrough = backend.detokenized
-    reference_semantic = batch.reference_semantic_codes
-    reference_acoustic = batch.reference_acoustic_codes
-    assert reference_semantic is not None
-    assert reference_acoustic is not None
-    assert torch.equal(target.semantic, batch.semantic_codes)
-    assert torch.equal(target.acoustic, batch.acoustic_codes)
-    assert torch.equal(reference.semantic, reference_semantic)
-    assert torch.equal(reference.acoustic, reference_acoustic)
-    assert torch.equal(passthrough.semantic, batch.semantic_codes)
-    assert torch.equal(passthrough.acoustic, reference_acoustic)
-
-    audio = {tag: value for tag, value, _, _ in experiment.audio}
-    assert "sample/target_codec_reconstruction" in audio
-    assert "sample/reference_codec_reconstruction" in audio
-    assert "sample/reference_token_passthrough" in audio
-    assert torch.equal(
-        torch.unique(audio["sample/reference_token_passthrough"]),
-        torch.tensor([605.0]),
-    )
-    events = json.loads((tmp_path / "sample_metrics.json").read_text(encoding="utf-8"))
-    assert events[0]["target_codec_reconstruction"]["finite"] is True
-    assert events[0]["reference_codec_reconstruction"]["finite"] is True
-    assert events[0]["reference_token_passthrough"]["finite"] is True
+def test_fixed_layout_paired_batch_is_rejected() -> None:
+    with pytest.raises(ValueError, match="frame-aligned"):
+        _paired_batch()

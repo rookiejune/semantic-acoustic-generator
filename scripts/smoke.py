@@ -115,7 +115,7 @@ def _args() -> argparse.Namespace:
         help="Prepared codec grid root; workspace resolves the standard root when omitted.",
     )
     parser.add_argument("--data-source", default="qwen_cross_text")
-    parser.add_argument("--codec", default="longcat", choices=("longcat", "bicodec"))
+    parser.add_argument("--codec", default="longcat", choices=("longcat",))
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--split", default="train")
     parser.add_argument("--index", type=int, default=0)

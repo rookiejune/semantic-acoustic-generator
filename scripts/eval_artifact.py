@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from anytrain.codec import AcousticLayout, SemanticAcousticCodes
+from anytrain.codec import SemanticAcousticCodes
 
 from semantic_acoustic_generator.backend import BackendConfig, load_backend
 from semantic_acoustic_generator.datamodule import (
@@ -116,7 +116,6 @@ def _args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--reference-reconstruction-wav", type=Path, default=None)
-    parser.add_argument("--passthrough-wav", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -172,13 +171,6 @@ def _evaluate(
         "target_reconstruction": backend.detokenize(target_codes),
         "reference_reconstruction": backend.detokenize(reference_codes),
     }
-    if batch.acoustic_layout is AcousticLayout.FIXED_LENGTH:
-        audio["reference_token_passthrough"] = backend.detokenize(
-            SemanticAcousticCodes(
-                semantic=target_codes.semantic,
-                acoustic=reference_codes.acoustic,
-            )
-        )
     return audio, {
         "feature_mse_without_reference": evaluation.mse_without_reference,
         "feature_mse_with_reference": evaluation.mse_with_reference,
@@ -220,7 +212,6 @@ def _summary(
         **metrics,
         **summaries,
     }
-    result.setdefault("reference_token_passthrough", None)
     return result
 
 
@@ -244,10 +235,7 @@ def _write_outputs(
         "generated_with_reference": args.with_reference_wav,
         "target_reconstruction": args.target_reconstruction_wav,
         "reference_reconstruction": args.reference_reconstruction_wav,
-        "reference_token_passthrough": args.passthrough_wav,
     }
-    if args.passthrough_wav is not None and "reference_token_passthrough" not in audio:
-        raise ValueError("--passthrough-wav requires a fixed-length acoustic layout.")
     for name, path in paths.items():
         if path is None:
             continue

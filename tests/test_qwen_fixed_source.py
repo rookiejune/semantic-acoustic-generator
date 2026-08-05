@@ -46,7 +46,7 @@ def test_longcat_module_preserves_former_data_module_imports() -> None:
     assert longcat_data.DataModule is module_data.DataModule
 
 
-def test_qwen_fixed_speaker_source_batches_fixed_length_units(
+def test_qwen_fixed_speaker_source_batches_frame_aligned_units(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -73,11 +73,22 @@ def test_qwen_fixed_speaker_source_batches_fixed_length_units(
     module.setup()
     batch = next(iter(module.train_dataloader()))
 
-    assert batch.acoustic_layout is AcousticLayout.FIXED_LENGTH
+    assert batch.acoustic_layout is AcousticLayout.FRAME_ALIGNED
     assert batch.semantic_codes.tolist() == [[[1], [2], [3]]]
-    assert batch.acoustic_codes.tolist() == [[[4], [5], [6], [7]]]
+    assert batch.acoustic_codes.tolist() == [[[4], [5], [6]]]
     assert batch.mask.tolist() == [[True, True, True]]
-    assert batch.acoustic_mask.tolist() == [[True, True, True, True]]
+    assert batch.acoustic_mask.tolist() == [[True, True, True]]
+
+
+def test_qwen_bicodec_source_is_rejected_as_semantic_global(tmp_path) -> None:
+    with pytest.raises(ValueError, match="semantic/global"):
+        qwen_data.QwenCodecColumnDataset(
+            codec="bicodec",
+            root=tmp_path,
+            split="train",
+            role=Role.TARGET,
+            speaker_id="vivian",
+        )
 
 
 def test_qwen_cross_text_source_batches_explicit_pair_and_metadata(
@@ -234,7 +245,7 @@ def test_qwen_column_sample_reads_its_cell_once(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     source = qwen_data.QwenCodecColumnDataset(
-        codec="bicodec",
+        codec="longcat",
         root=tmp_path,
         split="train",
         role=Role.TARGET,
@@ -266,7 +277,7 @@ def test_qwen_pair_length_reuses_bounded_column_info_cache(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     source = qwen_data.QwenCodecColumnDataset(
-        codec="bicodec",
+        codec="longcat",
         root=tmp_path,
         split="train",
         role=Role.TARGET,
@@ -292,7 +303,7 @@ def test_qwen_pair_reference_cache_is_bounded(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     source = qwen_data.QwenCodecColumnDataset(
-        codec="bicodec",
+        codec="longcat",
         root=tmp_path,
         split="train",
         role=Role.TARGET,
@@ -436,7 +447,7 @@ def test_qwen_pair_dataset_construction_does_not_load_codec_samples(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     source = qwen_data.QwenCodecColumnDataset(
-        codec="bicodec",
+        codec="longcat",
         root=tmp_path,
         split="train",
         role=Role.TARGET,
@@ -465,7 +476,7 @@ def test_qwen_pair_sample_count_fences_reference_pool(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     source = qwen_data.QwenCodecColumnDataset(
-        codec="bicodec",
+        codec="longcat",
         root=tmp_path,
         split="train",
         role=Role.TARGET,
@@ -517,7 +528,7 @@ def test_qwen_column_and_pair_preserve_payload_local_index_groups_without_loadin
     )
 
     column = qwen_data.QwenCodecColumnDataset(
-        codec="bicodec",
+        codec="longcat",
         root=tmp_path,
         split="train",
         role=Role.TARGET,
@@ -587,7 +598,7 @@ def test_qwen_column_rejects_cells_without_anydataset_index_order(
 
     with pytest.raises(TypeError, match="cells must be a MapStyleABC"):
         qwen_data.QwenCodecColumnDataset(
-            codec="bicodec",
+            codec="longcat",
             root=tmp_path,
             split="train",
             role=Role.TARGET,
@@ -622,7 +633,7 @@ def test_qwen_pair_reads_candidates_once_and_materializes_only_the_pair(
 
     monkeypatch.setattr(qwen_data, "_codes", codes)
     source = qwen_data.QwenCodecColumnDataset(
-        codec="bicodec",
+        codec="longcat",
         root=tmp_path,
         split="train",
         role=Role.TARGET,
@@ -659,7 +670,7 @@ def test_qwen_pair_duration_uses_the_actual_cross_text_reference_without_payload
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     source = qwen_data.QwenCodecColumnDataset(
-        codec="bicodec",
+        codec="longcat",
         root=tmp_path,
         split="train",
         role=Role.TARGET,
@@ -822,8 +833,8 @@ def test_qwen_cross_text_filter_checks_target_and_reference_raw_lengths(
 def _module(data: DataConfig, tmp_path, *, frame_rate: float = 50.0) -> DataModule:
     return DataModule(
         data,
-        codec="bicodec",
-        acoustic_layout=AcousticLayout.FIXED_LENGTH,
+        codec="longcat",
+        acoustic_layout=AcousticLayout.FRAME_ALIGNED,
         frame_rate=frame_rate,
         semantic_pad_id=10,
         acoustic_pad_ids=(20,),
@@ -845,10 +856,7 @@ def _grid(
             ),
             (Role.DEFAULT, Modality.AUDIO): AudioItem(
                 views={
-                    AudioView.BICODEC: {
-                        "semantic": semantic,
-                        "acoustic": acoustic,
-                    }
+                    AudioView.LONGCAT: _frame_aligned_codes(semantic, acoustic)
                 },
                 meta={
                     AudioMeta.DURATION: float(semantic.size(0)) / frame_rate,
@@ -871,6 +879,16 @@ def _grid(
             SpeakerAudioRow(source_index=index, role=Role.TARGET) for index in range(len(cells))
         ),
     )
+
+
+def _frame_aligned_codes(semantic: torch.Tensor, acoustic: torch.Tensor) -> torch.Tensor:
+    if acoustic.dim() != 2 or acoustic.size(0) < 1:
+        raise ValueError("test acoustic codes must have shape [frame, codebook].")
+    semantic = semantic.to(dtype=torch.long)
+    acoustic = acoustic.to(dtype=torch.long)
+    indices = torch.arange(semantic.size(0)).remainder(acoustic.size(0))
+    aligned = acoustic.index_select(0, indices)
+    return torch.cat((semantic, aligned), dim=-1)
 
 
 class _TrackingCells(MapStyleABC):

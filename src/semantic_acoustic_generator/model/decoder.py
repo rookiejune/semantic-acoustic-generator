@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
-from anytrain.codec import AcousticLayout
 from anytrain.framework.flow_matching import ContinuousFlowRuntime
 from anytrain.loss import (
     LossItem,
@@ -17,7 +16,7 @@ from torch import nn
 
 from semantic_acoustic_generator.config import DecoderConfig, FMMode, Route, RVQPredictor
 from semantic_acoustic_generator.loss.flow import FlowLoss, FlowRuntime
-from semantic_acoustic_generator.model.condition import AlignedAnchor, FixedLengthConditioner
+from semantic_acoustic_generator.model.condition import AlignedAnchor
 from semantic_acoustic_generator.model.dit import DiTDecoder
 from semantic_acoustic_generator.model.rvq import AcousticRVQDecoder
 
@@ -50,8 +49,6 @@ class FeatureSampler(Protocol):
         flow_steps: int,
         unconditional_condition: Tensor | None = None,
         cfg_scale: float = 1.0,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor: ...
 
@@ -65,40 +62,12 @@ class AcousticCodeSampler(Protocol):
         *,
         temperature: float,
         top_p: float,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor: ...
 
 
 class AcousticUnitGenerator(nn.Module):
     route: Route
-
-    def __init__(self, condition_dim: int, *, fixed_length: int | None = None) -> None:
-        super().__init__()
-        self.fixed_conditioner = (
-            None
-            if fixed_length is None
-            else FixedLengthConditioner(condition_dim, slots=fixed_length)
-        )
-
-    def _target_condition(
-        self,
-        condition: Tensor,
-        mask: Tensor,
-        *,
-        acoustic_layout: AcousticLayout,
-        output_length: int | None,
-        validate: bool = True,
-    ) -> tuple[Tensor, Tensor]:
-        return _target_condition(
-            condition,
-            mask,
-            acoustic_layout=acoustic_layout,
-            output_length=output_length,
-            fixed_conditioner=self.fixed_conditioner,
-            validate=validate,
-        )
 
 
 class FMFeatureGenerator(AcousticUnitGenerator):
@@ -109,10 +78,8 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         condition_dim: int,
         feature_dim: int,
         config: DecoderConfig,
-        *,
-        fixed_length: int | None = None,
     ) -> None:
-        super().__init__(condition_dim, fixed_length=fixed_length)
+        super().__init__()
         self.mode = config.fm_mode
         self.feature_dim = feature_dim
         self.core = (
@@ -186,23 +153,14 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         flow_steps: int,
         unconditional_condition: Tensor | None = None,
         cfg_scale: float = 1.0,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        target_condition, target_mask = self._target_condition(
-            condition,
-            mask,
-            acoustic_layout=acoustic_layout,
-            output_length=output_length,
-        )
+        target_condition, target_mask = _aligned_condition(condition, mask)
         target_unconditional = None
         if unconditional_condition is not None:
-            target_unconditional, unconditional_mask = self._target_condition(
+            target_unconditional, unconditional_mask = _aligned_condition(
                 unconditional_condition,
                 mask,
-                acoustic_layout=acoustic_layout,
-                output_length=output_length,
             )
             if not torch.equal(target_mask, unconditional_mask):
                 raise ValueError("conditional and unconditional FM masks must match.")
@@ -236,19 +194,16 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         factor_codebooks: tuple[Tensor, Tensor] | None = None,
     ) -> DecoderLoss:
         target_mask = batch.acoustic_mask
-        target_condition, _ = self._target_condition(
+        target_condition, _ = _aligned_condition(
             condition,
             batch.mask,
-            acoustic_layout=batch.acoustic_layout,
-            output_length=target_mask.size(1),
+            target_mask=target_mask,
             validate=False,
         )
         repa_features = None
         if self.repa_loss_weight > 0:
             if repa_teacher is None:
                 raise RuntimeError("REPA requires a teacher.")
-            if batch.acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
-                raise ValueError("REPA currently requires frame-aligned acoustic units.")
             repa_features = repa_teacher(
                 batch.semantic_codes,
                 batch.acoustic_codes,
@@ -437,15 +392,11 @@ class RVQCodeGenerator(AcousticUnitGenerator):
         condition_dim: int,
         codebook_sizes: tuple[int, ...],
         config: DecoderConfig,
-        *,
-        fixed_length: int | None = None,
     ) -> None:
-        super().__init__(condition_dim, fixed_length=fixed_length)
+        super().__init__()
         if not codebook_sizes:
             raise ValueError("RVQ route requires acoustic codebooks.")
         self.predictor = config.rvq_predictor
-        if fixed_length is not None and self.predictor is RVQPredictor.CODEBOOK_AR:
-            raise ValueError("fixed-length RVQ requires the MTP predictor along the slot axis.")
         if config.rvq_predictor is RVQPredictor.CODEBOOK_AR:
             self.core: AcousticRVQDecoder | QwenMTPCodebookPredictor = AcousticRVQDecoder(
                 condition_dim,
@@ -480,16 +431,9 @@ class RVQCodeGenerator(AcousticUnitGenerator):
         *,
         temperature: float,
         top_p: float,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        target_condition, target_mask = self._target_condition(
-            condition,
-            mask,
-            acoustic_layout=acoustic_layout,
-            output_length=output_length,
-        )
+        target_condition, target_mask = _aligned_condition(condition, mask)
         return self.core.generate(
             target_condition,
             mask=target_mask,
@@ -505,11 +449,10 @@ class RVQCodeGenerator(AcousticUnitGenerator):
     ) -> DecoderLoss:
         labels = batch.acoustic_codes
         target_mask = batch.acoustic_mask
-        target_condition, _ = self._target_condition(
+        target_condition, _ = _aligned_condition(
             condition,
             batch.mask,
-            acoustic_layout=batch.acoustic_layout,
-            output_length=labels.size(1),
+            target_mask=target_mask,
             validate=False,
         )
         return self.code_loss_from_condition(
@@ -555,13 +498,11 @@ class RVQCodeGenerator(AcousticUnitGenerator):
         return DecoderLoss(loss=item.loss.mean(), items={"rvq": item}, primary="rvq")
 
 
-def _target_condition(
+def _aligned_condition(
     condition: Tensor,
     mask: Tensor,
     *,
-    acoustic_layout: AcousticLayout,
-    output_length: int | None,
-    fixed_conditioner: FixedLengthConditioner | None,
+    target_mask: Tensor | None = None,
     validate: bool = True,
 ) -> tuple[Tensor, Tensor]:
     if validate and (
@@ -570,29 +511,12 @@ def _target_condition(
         raise ValueError("condition and mask must have shapes [B, semantic_unit, C] and [B, unit].")
     if validate and not bool(mask.any(dim=1).all()):
         raise ValueError("each condition row must contain at least one valid semantic unit.")
-    if acoustic_layout is AcousticLayout.FRAME_ALIGNED:
-        if validate and output_length is not None and output_length != condition.size(1):
-            raise ValueError("frame-aligned output_length must match the semantic unit length.")
-        return condition, mask
-    if acoustic_layout is not AcousticLayout.FIXED_LENGTH:
-        raise ValueError(f"unsupported acoustic layout: {acoustic_layout!r}")
-    if output_length is None or output_length < 1:
-        raise ValueError("fixed-length acoustic generation requires a positive output_length.")
-    if fixed_conditioner is None:
-        raise RuntimeError("fixed-length generation requires a configured slot conditioner.")
-    target_condition = fixed_conditioner(
-        condition,
-        mask,
-        output_length=output_length,
-        validate=validate,
-    )
-    target_mask = torch.ones(
-        condition.size(0),
-        output_length,
-        dtype=torch.bool,
-        device=condition.device,
-    )
-    return target_condition, target_mask
+    if target_mask is not None:
+        if target_mask.shape != condition.shape[:2] or target_mask.dtype != torch.bool:
+            raise ValueError("acoustic target mask must align with semantic frames.")
+        if not torch.equal(mask, target_mask):
+            raise ValueError("semantic and acoustic masks must match frame by frame.")
+    return condition, mask
 
 
 def _normalized_features(

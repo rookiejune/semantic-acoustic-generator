@@ -103,7 +103,12 @@ class QwenCodecColumnDataset(Dataset[QwenCodecSample]):
     ) -> None:
         super().__init__()
         self.codec = qwen_tts.Codec(codec)
-        self.view = AudioView.BICODEC if self.codec is qwen_tts.Codec.BICODEC else AudioView.LONGCAT
+        if self.codec is qwen_tts.Codec.BICODEC:
+            raise ValueError(
+                "Qwen BiCodec views contain semantic/global units and cannot be consumed "
+                "by semantic-acoustic-generator."
+            )
+        self.view = AudioView.LONGCAT
         self.grid = qwen_tts.speaker_grid(
             codec=self.codec,
             root=root,
@@ -412,21 +417,6 @@ def _codes(
         combined = cast(Tensor, value).contiguous()
         semantic, acoustic = split_longcat_codes(combined)
         return SemanticAcousticCodes(semantic=semantic, acoustic=acoustic)
-    if codec is qwen_tts.Codec.BICODEC:
-        if not isinstance(value, Mapping):
-            raise TypeError("Qwen BiCodec view must be a semantic/acoustic mapping.")
-        fields = cast(Mapping[str, Any], value)
-        semantic = fields["semantic"]
-        acoustic = fields["acoustic"]
-        if not isinstance(semantic, Tensor) or not isinstance(acoustic, Tensor):
-            raise TypeError("Qwen BiCodec semantic and acoustic values must be Tensors.")
-        _raw_length(value, codec)
-        if acoustic.dim() != 2 or acoustic.size(0) < 1:
-            raise ValueError("Qwen BiCodec acoustic view must expose [unit, codebook].")
-        return SemanticAcousticCodes(
-            semantic=semantic.contiguous(),
-            acoustic=acoustic.contiguous(),
-        )
     raise ValueError(f"unsupported Qwen codec: {codec!r}.")
 
 
@@ -435,13 +425,6 @@ def _raw_length(value: object, codec: qwen_tts.Codec) -> int:
         if not isinstance(value, Tensor) or value.dim() != 2:
             raise ValueError("Qwen LongCat view must expose [time, codebook].")
         return _positive_length(value.size(0))
-    if codec is qwen_tts.Codec.BICODEC:
-        if not isinstance(value, Mapping):
-            raise TypeError("Qwen BiCodec view must be a semantic/acoustic mapping.")
-        semantic = cast(Mapping[str, Any], value)["semantic"]
-        if not isinstance(semantic, Tensor) or semantic.dim() != 2:
-            raise ValueError("Qwen BiCodec semantic view must expose [time, codebook].")
-        return _positive_length(semantic.size(0))
     raise ValueError(f"unsupported Qwen codec: {codec!r}.")
 
 

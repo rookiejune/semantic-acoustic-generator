@@ -29,16 +29,19 @@ class EvalBackend:
     acoustic_feature_dim = 1
 
     def __init__(self, layout: AcousticLayout) -> None:
+        if layout is not AcousticLayout.FRAME_ALIGNED:
+            raise ValueError("evaluation backend must be frame-aligned.")
         self.acoustic_layout = layout
-        self.acoustic_unit_length = 3 if layout is AcousticLayout.FIXED_LENGTH else None
+        self.acoustic_unit_length = None
         self.detokenized: list[SemanticAcousticCodes] = []
         self.feature_inputs: list[torch.Tensor] = []
 
     def tokenize(self, audio: torch.Tensor, sample_rate: int) -> SemanticAcousticCodes:
         del sample_rate
         semantic = torch.zeros(audio.size(0), 2, 1, dtype=torch.long, device=audio.device)
-        units = semantic.size(1) if self.acoustic_unit_length is None else self.acoustic_unit_length
-        acoustic = torch.zeros(audio.size(0), units, 1, dtype=torch.long, device=audio.device)
+        acoustic = torch.zeros(
+            audio.size(0), semantic.size(1), 1, dtype=torch.long, device=audio.device
+        )
         return SemanticAcousticCodes(semantic=semantic, acoustic=acoustic)
 
     def detokenize(self, codes: SemanticAcousticCodes) -> torch.Tensor:
@@ -166,34 +169,6 @@ def test_eval_artifact_generates_seeded_pair_metrics() -> None:
     assert len(backend.detokenized) == 2
 
 
-def test_eval_artifact_fixed_layout_adds_reference_passthrough() -> None:
-    backend = EvalBackend(AcousticLayout.FIXED_LENGTH)
-    batch = _pair(AcousticLayout.FIXED_LENGTH)
-    runtime = EvalRuntime(units=batch.acoustic_codes.size(1))
-
-    audio, _ = eval_artifact._evaluate(
-        cast(GeneratorRuntime, cast(object, runtime)),
-        backend,
-        batch,
-        device=torch.device("cpu"),
-        seed=3,
-    )
-
-    assert "reference_token_passthrough" in audio
-    assert len(backend.detokenized) == 3
-    target, reference, passthrough = backend.detokenized
-    reference_semantic = batch.reference_semantic_codes
-    reference_acoustic = batch.reference_acoustic_codes
-    assert reference_semantic is not None
-    assert reference_acoustic is not None
-    assert torch.equal(target.semantic, batch.semantic_codes)
-    assert torch.equal(target.acoustic, batch.acoustic_codes)
-    assert torch.equal(reference.semantic, reference_semantic)
-    assert torch.equal(reference.acoustic, reference_acoustic)
-    assert torch.equal(passthrough.semantic, batch.semantic_codes)
-    assert torch.equal(passthrough.acoustic, reference_acoustic)
-
-
 def test_eval_artifact_main_loads_cross_text_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -206,7 +181,7 @@ def test_eval_artifact_main_loads_cross_text_pair(
     loaded: dict[str, Any] = {}
     args = argparse.Namespace(
         artifact=tmp_path / "artifact",
-        codec="bicodec",
+        codec="longcat",
         data_source="qwen_cross_text",
         data_root=None,
         split="train",
@@ -222,7 +197,6 @@ def test_eval_artifact_main_loads_cross_text_pair(
         with_reference_wav=None,
         target_reconstruction_wav=None,
         reference_reconstruction_wav=None,
-        passthrough_wav=None,
     )
 
     def load_pair(data, **kwargs):
@@ -243,7 +217,7 @@ def test_eval_artifact_main_loads_cross_text_pair(
 
     eval_artifact.main()
 
-    assert loaded["backend_config"].name == "bicodec"
+    assert loaded["backend_config"].name == "longcat"
     assert loaded["backend_config"].model_dir is None
     assert loaded["backend_config"].revision is None
     assert loaded["backend_config"].local_files_only is True
@@ -251,7 +225,7 @@ def test_eval_artifact_main_loads_cross_text_pair(
     assert loaded["backend_kwargs"]["device"] == torch.device("cpu")
     assert loaded["data"].source == "qwen_cross_text"
     assert loaded["data"].sample_index == 2
-    assert loaded["kwargs"]["codec"] == "bicodec"
+    assert loaded["kwargs"]["codec"] == "longcat"
     assert loaded["kwargs"]["acoustic_layout"] is AcousticLayout.FRAME_ALIGNED
     result = json.loads(capsys.readouterr().out)
     assert result["artifact"] == "artifact"
@@ -298,7 +272,6 @@ def test_eval_artifact_can_include_private_metadata(
         with_reference_wav=None,
         target_reconstruction_wav=None,
         reference_reconstruction_wav=None,
-        passthrough_wav=None,
     )
 
     def load_eval_backend(config, **kwargs):

@@ -153,12 +153,10 @@ class SeededGenerator(nn.Module):
         flow_steps: int,
         unconditional_condition: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         del feature_mean, feature_std, flow_steps
-        _validate_frame_aligned(condition, mask, acoustic_layout, output_length)
+        _validate_frame_aligned(condition, mask)
         self.conditions.append(condition.detach().clone())
         self.unconditional_conditions.append(
             None if unconditional_condition is None else unconditional_condition.detach().clone()
@@ -183,12 +181,10 @@ class SeededGenerator(nn.Module):
         *,
         temperature: float,
         top_p: float,
-        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
-        output_length: int | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         del temperature, top_p
-        _validate_frame_aligned(condition, mask, acoustic_layout, output_length)
+        _validate_frame_aligned(condition, mask)
         self.conditions.append(condition.detach().clone())
         codes = torch.randint(
             self.codebook_size,
@@ -656,12 +652,6 @@ def _generator() -> torch.Generator:
 def _validate_frame_aligned(
     condition: torch.Tensor,
     mask: torch.Tensor,
-    acoustic_layout: AcousticLayout,
-    output_length: int | None,
 ) -> None:
-    if acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
-        raise AssertionError("test generator only supports frame-aligned conditions")
-    if output_length is not None:
-        raise AssertionError("frame-aligned generation must not provide output_length")
     if mask.shape != condition.shape[:2]:
         raise AssertionError("condition and mask must align")

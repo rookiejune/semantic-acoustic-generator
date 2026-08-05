@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from anytrain.codec import AcousticLayout, SemanticAcousticCodes
+from anytrain.codec import SemanticAcousticCodes
 from anytrain.lightning import find_ema_callback
 from anytrain.lightning.experiment import audio as experiment_audio
 from anytrain.lightning.experiment import scalar as experiment_scalar
@@ -171,7 +171,6 @@ def _sample(
         "generated_with_reference": _audio_stats(with_audio),
         "target_codec_reconstruction": None,
         "reference_codec_reconstruction": None,
-        "reference_token_passthrough": None,
     }
     audio = {
         "sample/generated_without_reference": _audio_tensor(without_audio),
@@ -180,20 +179,10 @@ def _sample(
     if include_static_audio:
         target_audio = _reconstruct_target(module, sample)
         reference_audio = _reconstruct_reference(module, sample)
-        passthrough_audio = (
-            _reference_passthrough(module, sample)
-            if sample.acoustic_layout is AcousticLayout.FIXED_LENGTH
-            else None
-        )
         event["target_codec_reconstruction"] = _audio_stats(target_audio)
         event["reference_codec_reconstruction"] = _audio_stats(reference_audio)
-        event["reference_token_passthrough"] = (
-            None if passthrough_audio is None else _audio_stats(passthrough_audio)
-        )
         audio["sample/target_codec_reconstruction"] = _audio_tensor(target_audio)
         audio["sample/reference_codec_reconstruction"] = _audio_tensor(reference_audio)
-        if passthrough_audio is not None:
-            audio["sample/reference_token_passthrough"] = _audio_tensor(passthrough_audio)
     scalars = {
         "sample/feature_mse_without_reference": evaluation.mse_without_reference,
         "sample/feature_mse_with_reference": evaluation.mse_with_reference,
@@ -263,15 +252,6 @@ def _reconstruct_reference(module: GeneratorModule, batch: GeneratorBatch) -> Te
     codes = SemanticAcousticCodes(
         semantic=reference.semantic_codes,
         acoustic=reference.acoustic_codes,
-    )
-    return module.backend.detokenize(codes)
-
-
-def _reference_passthrough(module: GeneratorModule, batch: GeneratorBatch) -> Tensor:
-    # Fixed acoustic slots can be paired with the target semantic sequence without axis alignment.
-    codes = SemanticAcousticCodes(
-        semantic=batch.semantic_codes,
-        acoustic=batch.reference.acoustic_codes,
     )
     return module.backend.detokenize(codes)
 

@@ -10,7 +10,7 @@ from semantic_acoustic_generator.pl_module.semantic import GeneratorModule
 from semantic_acoustic_generator.types import GeneratorBatch, PairMetadata
 
 
-def test_fixed_length_structured_batch_keeps_independent_axes() -> None:
+def test_structured_batch_rejects_fixed_length_axes() -> None:
     values = [
         SemanticAcousticCodes(
             semantic=torch.tensor([[1], [2], [3]], dtype=torch.long),
@@ -22,22 +22,13 @@ def test_fixed_length_structured_batch_keeps_independent_axes() -> None:
         ),
     ]
 
-    batch = collate_structured_codes(
-        values,
-        semantic_pad_id=100,
-        acoustic_pad_ids=(200,),
-        acoustic_layout=AcousticLayout.FIXED_LENGTH,
-    )
-
-    assert batch.acoustic_layout is AcousticLayout.FIXED_LENGTH
-    assert batch.semantic_codes.tolist() == [[[1], [2], [3]], [[8], [9], [100]]]
-    assert batch.acoustic_codes.tolist() == [
-        [[4], [5], [6], [7]],
-        [[10], [11], [12], [13]],
-    ]
-    assert batch.mask.tolist() == [[True, True, True], [True, True, False]]
-    assert batch.acoustic_mask is not None
-    assert batch.acoustic_mask.tolist() == [[True, True, True, True], [True, True, True, True]]
+    with pytest.raises(ValueError, match="frame-aligned"):
+        collate_structured_codes(
+            values,
+            semantic_pad_id=100,
+            acoustic_pad_ids=(200,),
+            acoustic_layout=AcousticLayout.FIXED_LENGTH,
+        )
 
 
 def test_frame_aligned_structured_batch_rejects_axis_mismatch() -> None:
@@ -57,11 +48,11 @@ def test_frame_aligned_structured_batch_rejects_axis_mismatch() -> None:
         )
 
 
-def test_fixed_length_batch_requires_shared_target_and_reference_batch_axes() -> None:
+def test_batch_requires_shared_target_and_reference_batch_axes() -> None:
     semantic = torch.tensor([[[1], [2]]], dtype=torch.long)
-    acoustic = torch.tensor([[[3]], [[4]]], dtype=torch.long)
+    acoustic = torch.tensor([[[3], [4]], [[5], [6]]], dtype=torch.long)
     semantic_mask = torch.ones(1, 2, dtype=torch.bool)
-    acoustic_mask = torch.ones(2, 1, dtype=torch.bool)
+    acoustic_mask = torch.ones(2, 2, dtype=torch.bool)
 
     with pytest.raises(ValueError, match="target semantic and acoustic codes must share"):
         GeneratorBatch(
@@ -71,14 +62,14 @@ def test_fixed_length_batch_requires_shared_target_and_reference_batch_axes() ->
             semantic_pad_id=100,
             acoustic_pad_ids=(200,),
             acoustic_mask=acoustic_mask,
-            acoustic_layout=AcousticLayout.FIXED_LENGTH,
+            acoustic_layout=AcousticLayout.FRAME_ALIGNED,
         )
 
     target = collate_structured_codes(
         [SemanticAcousticCodes(semantic=semantic[0], acoustic=acoustic[0])],
         semantic_pad_id=100,
         acoustic_pad_ids=(200,),
-        acoustic_layout=AcousticLayout.FIXED_LENGTH,
+        acoustic_layout=AcousticLayout.FRAME_ALIGNED,
     )
     metadata = PairMetadata(
         target_index=0,
@@ -118,12 +109,12 @@ def test_reference_batch_requires_complete_units_and_row_metadata() -> None:
         [
             SemanticAcousticCodes(
                 semantic=torch.tensor([[1], [2]], dtype=torch.long),
-                acoustic=torch.tensor([[3]], dtype=torch.long),
+                acoustic=torch.tensor([[3], [4]], dtype=torch.long),
             )
         ],
         semantic_pad_id=100,
         acoustic_pad_ids=(200,),
-        acoustic_layout=AcousticLayout.FIXED_LENGTH,
+        acoustic_layout=AcousticLayout.FRAME_ALIGNED,
     )
 
     with pytest.raises(ValueError, match="must be provided together"):

@@ -31,10 +31,6 @@ from semantic_acoustic_generator.model import (
     SemanticConditioner,
     build_route,
 )
-from semantic_acoustic_generator.model import (
-    condition as condition_module,
-)
-from semantic_acoustic_generator.model.condition import FixedLengthConditioner
 from semantic_acoustic_generator.runtime import (
     GeneratorConfig,
     GeneratorRuntime,
@@ -354,64 +350,6 @@ def test_reference_conditioner_projects_only_pooled_rows() -> None:
 
     assert projected_shapes == [(3, 4)]
     assert torch.equal(output[1, 0], conditioner.null_condition)
-
-
-def test_fixed_length_conditioner_uses_slot_queries_and_full_semantic_memory() -> None:
-    conditioner = FixedLengthConditioner(condition_dim=4, slots=3)
-    with torch.no_grad():
-        conditioner.slot_queries.zero_()
-        conditioner.slot_queries[0, 0] = 1
-        conditioner.slot_queries[1, 1] = 1
-        conditioner.slot_queries[2, 2] = 1
-    memory = torch.tensor(
-        [[[1.0, 0.0, 0.5, -0.5], [0.0, 1.0, -0.5, 0.5], [9.0, 9.0, 9.0, 9.0]]],
-        requires_grad=True,
-    )
-    mask = torch.tensor([[True, True, False]])
-
-    output = conditioner(memory, mask, output_length=3)
-    padded_changed = memory.detach().clone()
-    padded_changed[:, 2] = -100
-    unchanged = conditioner(padded_changed, mask, output_length=3)
-    permuted = conditioner(memory.detach()[:, [1, 0, 2]], mask, output_length=3)
-    weights = output.new_tensor([1.0, 2.0, 3.0, 4.0])
-    (output * weights).sum().backward()
-
-    assert conditioner.slot_queries.shape == (3, 4)
-    assert output.shape == (1, 3, 4)
-    assert not torch.allclose(output[:, 0], output[:, 1])
-    assert torch.allclose(output, unchanged)
-    assert not torch.allclose(output, permuted)
-    assert memory.grad is not None
-    assert bool((memory.grad[0, :2].abs().sum(dim=-1) > 0).all())
-    assert torch.equal(memory.grad[0, 2], torch.zeros_like(memory.grad[0, 2]))
-
-
-def test_fixed_length_conditioner_reuses_and_grows_position_cache(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[int] = []
-    positions = condition_module._sinusoidal_positions
-
-    def capture_positions(length, dim, *, device, dtype):
-        calls.append(length)
-        return positions(length, dim, device=device, dtype=dtype)
-
-    monkeypatch.setattr(condition_module, "_sinusoidal_positions", capture_positions)
-    conditioner = FixedLengthConditioner(condition_dim=4, slots=3)
-    memory = torch.randn(1, 2, 4)
-    mask = torch.ones(1, 2, dtype=torch.bool)
-
-    first = conditioner(memory, mask, output_length=2)
-    second = conditioner(memory, mask, output_length=2)
-    _ = conditioner(
-        torch.randn(1, 3, 4),
-        torch.ones(1, 3, dtype=torch.bool),
-        output_length=2,
-    )
-
-    torch.testing.assert_close(first, second)
-    assert calls == [2, 4]
 
 
 def test_fm_loss_returns_repa_features_when_configured() -> None:
@@ -861,71 +799,23 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
     assert bool((generated[..., 1][mask] < 7).all())
 
 
-def test_fixed_length_rvq_rejects_codebook_ar_and_uses_mtp_slot_axis() -> None:
-    if not _has_qwen3_builder():
-        pytest.skip("fixed-length RVQ requires transformers and the Qwen3 builder.")
-
-    condition = torch.randn(1, 5, 4)
-    semantic_mask = torch.tensor([[True, True, True, True, False]])
-    slots = 32
-    with pytest.raises(ValueError, match="fixed-length RVQ requires the MTP predictor"):
-        RVQCodeGenerator(
+def test_generator_routes_reject_fixed_length_acoustic_units() -> None:
+    with pytest.raises(ValueError, match="frame-aligned"):
+        build_route(
+            Route.RVQ,
+            torch.randn(8, 4),
             4,
             (5,),
-            DecoderConfig(
+            condition_dim=4,
+            decoder=DecoderConfig(
                 hidden_dim=4,
                 layers=1,
                 heads=1,
                 ffn_ratio=2,
-                rvq_predictor=RVQPredictor.CODEBOOK_AR,
             ),
-            fixed_length=slots,
+            acoustic_layout=AcousticLayout.FIXED_LENGTH,
+            acoustic_unit_length=32,
         )
-
-    generator = RVQCodeGenerator(
-        4,
-        (5,),
-        DecoderConfig(
-            hidden_dim=4,
-            layers=1,
-            heads=1,
-            ffn_ratio=2,
-            rvq_predictor=RVQPredictor.MTP,
-            mtp_layers=1,
-            mtp_heads=1,
-        ),
-        fixed_length=slots,
-    )
-    acoustic = torch.arange(slots).remainder(5).view(1, -1, 1)
-    batch = GeneratorBatch(
-        semantic_codes=torch.tensor([[[1], [2], [3], [4], [8]]]),
-        acoustic_codes=acoustic,
-        mask=semantic_mask,
-        semantic_pad_id=8,
-        acoustic_pad_ids=(5,),
-        acoustic_mask=torch.ones(1, slots, dtype=torch.bool),
-        acoustic_layout=AcousticLayout.FIXED_LENGTH,
-    )
-    output = generator.loss(batch, condition)
-    output.loss.backward()
-    generated = generator.sample_acoustic_codes(
-        condition,
-        semantic_mask,
-        temperature=1.0,
-        top_p=1.0,
-        acoustic_layout=AcousticLayout.FIXED_LENGTH,
-        output_length=slots,
-        generator=torch.Generator().manual_seed(0),
-    )
-
-    assert isinstance(generator.core, QwenMTPCodebookPredictor)
-    assert torch.isfinite(output.loss)
-    fixed_conditioner = generator.fixed_conditioner
-    assert fixed_conditioner is not None
-    assert fixed_conditioner.slot_queries.grad is not None
-    assert bool(torch.isfinite(fixed_conditioner.slot_queries.grad).all())
-    assert generated.shape == (1, slots, 1)
-    assert bool((generated < 5).all())
 
 
 def test_rvq_loss_validates_per_codebook_logits() -> None:
