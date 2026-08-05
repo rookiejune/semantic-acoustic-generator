@@ -23,6 +23,7 @@ from anytrain.module.qwen import QwenMTPCodebookPredictor
 import semantic_acoustic_generator.model.rvq as rvq_module
 from semantic_acoustic_generator.config import (
     AnchorContext,
+    AnchorTarget,
     DecoderConfig,
     FMMode,
     Route,
@@ -185,6 +186,71 @@ def test_aligned_anchor_predicts_features_and_factor_losses() -> None:
     assert output.loss.ndim == 0
     assert sample.shape == target.shape
     assert torch.equal(sample[1, 2:], torch.zeros_like(sample[1, 2:]))
+
+
+def test_factor_anchor_trains_ce_and_returns_original_codebook_embeddings() -> None:
+    condition = torch.randn(2, 4, 6)
+    mask = torch.tensor([[True, True, True, True], [True, True, False, False]])
+    codebooks = (
+        torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]),
+        torch.tensor([[2.0, 0.0], [0.0, 2.0], [-2.0, 0.0], [0.0, -2.0]]),
+    )
+    generator = FMFeatureGenerator(
+        6,
+        4,
+        DecoderConfig(
+            heads=2,
+            ffn_ratio=2,
+            fm_mode=FMMode.ANCHOR,
+            anchor_target=AnchorTarget.FACTOR,
+            anchor_hidden_dim=8,
+            anchor_layers=1,
+        ),
+        factor_codebooks=codebooks,
+    )
+    labels = torch.tensor(
+        [
+            [[0, 0], [1, 1], [2, 2], [0, 3]],
+            [[1, 2], [2, 3], [0, 0], [0, 0]],
+        ]
+    )
+
+    output = generator.feature_loss_from_condition(
+        condition,
+        mask,
+        target_features=None,
+        factor_targets=labels,
+    )
+    output.loss.backward()
+
+    assert output.primary == "anchor_factor"
+    assert set(output.items) == {"anchor_factor"}
+    assert generator.anchor is not None
+    assert generator.anchor.output.weight.grad is not None
+    assert generator.factor_codebook_a is not None
+    assert generator.factor_codebook_a.requires_grad is False
+
+    with torch.no_grad():
+        generator.anchor.output.weight.zero_()
+        generator.anchor.output.bias.zero_()
+        generator.anchor.output.bias[1] = 5
+        generator.anchor.output.bias[3 + 2] = 5
+    factor_codes = generator.sample_factor_codes(condition, mask)
+    sample = generator.sample_features(
+        condition,
+        mask,
+        feature_mean=torch.randn(1, 1, 4),
+        feature_std=torch.rand(1, 1, 4),
+        flow_steps=1,
+    )
+    expected = torch.cat((codebooks[0][1], codebooks[1][2]))
+    valid_frames = int(mask.sum())
+
+    assert factor_codes.shape == (2, 4, 2)
+    assert torch.equal(factor_codes[mask], torch.tensor([1, 2]).expand(valid_frames, -1))
+    assert torch.equal(factor_codes[~mask], torch.zeros_like(factor_codes[~mask]))
+    torch.testing.assert_close(sample[mask], expected.expand(valid_frames, -1))
+    assert torch.equal(sample[~mask], torch.zeros_like(sample[~mask]))
 
 
 def test_transformer_anchor_preserves_frame_alignment_and_padding() -> None:

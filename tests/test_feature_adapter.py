@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from anytrain.codec import (
     AcousticLayout,
@@ -12,8 +13,15 @@ from semantic_acoustic_generator.backend import (
     LongCatFirstCodebookAdapter,
     adapt_backend,
 )
-from semantic_acoustic_generator.config import DecoderConfig, FeatureAdapter, FMMode, Route
+from semantic_acoustic_generator.config import (
+    AnchorTarget,
+    DecoderConfig,
+    FeatureAdapter,
+    FMMode,
+    Route,
+)
 from semantic_acoustic_generator.evaluation import evaluate_first_codebook_oracle
+from semantic_acoustic_generator.model import FMFeatureGenerator
 from semantic_acoustic_generator.pl_module import build_module
 from semantic_acoustic_generator.runtime import GeneratorConfig, GeneratorRuntime, build_support
 from semantic_acoustic_generator.runtime.artifact import (
@@ -218,6 +226,7 @@ def test_longcat_factor_targets_ignore_padded_code_ids() -> None:
             heads=1,
             ffn_ratio=2,
             fm_mode=FMMode.ANCHOR,
+            anchor_target=AnchorTarget.FACTOR,
             anchor_hidden_dim=4,
             anchor_layers=1,
         ),
@@ -225,6 +234,15 @@ def test_longcat_factor_targets_ignore_padded_code_ids() -> None:
     module = build_module(adapted, config, batch, normalize_features=True)
 
     targets = module._factor_targets(batch)
+    generator = module.support.generator
+    assert isinstance(generator, FMFeatureGenerator)
+    assert generator.anchor is not None
+    with torch.no_grad():
+        generator.anchor.output.weight.zero_()
+        generator.anchor.output.bias.zero_()
+        generator.anchor.output.bias[1] = 5
+        generator.anchor.output.bias[90] = 5
+    metrics = module.validation_step(batch, 0)
 
     assert targets is not None
     assert torch.equal(
@@ -236,6 +254,8 @@ def test_longcat_factor_targets_ignore_padded_code_ids() -> None:
             ]
         ),
     )
+    assert set(metrics) == {"val/without_reference_factor_code_error"}
+    assert float(metrics["val/without_reference_factor_code_error"]) == pytest.approx(2 / 3)
 
 
 def test_first_codebook_oracle_compares_native_raw_and_snap_paths() -> None:
@@ -302,3 +322,42 @@ def test_artifact_restores_longcat_feature_adapter_for_raw_backend(tmp_path) -> 
     assert generator.spec.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
     assert generator.spec.decoder.fm_mode is FMMode.ANCHOR
     generator.spec.validate_backend(backend)
+
+
+def test_factor_artifact_restores_codebook_buffers_without_codec_weights(tmp_path) -> None:
+    backend = _LongCat()
+    adapted = LongCatFirstCodebookAdapter(backend)
+    config = GeneratorConfig(
+        route=Route.FM,
+        condition_dim=4,
+        feature_adapter=FeatureAdapter.LONGCAT_FIRST_CODEBOOK,
+        decoder=DecoderConfig(
+            hidden_dim=4,
+            layers=1,
+            heads=1,
+            ffn_ratio=2,
+            fm_mode=FMMode.ANCHOR,
+            anchor_target=AnchorTarget.FACTOR,
+            anchor_hidden_dim=4,
+            anchor_layers=1,
+        ),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=adapted.semantic_codebook,
+        codec_spec=semantic_acoustic_spec(adapted),
+        factor_codebooks=adapted.factor_codebooks,
+    )
+    save_artifact(tmp_path, support, backend=adapted)
+
+    loaded = load_artifact(tmp_path)
+    acoustic = load_generator_artifact(tmp_path)
+
+    assert loaded.config is not None
+    assert loaded.config.decoder.anchor_target is AnchorTarget.FACTOR
+    for restored in (loaded.generator, acoustic.generator):
+        assert isinstance(restored, FMFeatureGenerator)
+        assert restored.factor_codebook_a is not None
+        assert restored.factor_codebook_b is not None
+        torch.testing.assert_close(restored.factor_codebook_a, adapted.factor_codebooks[0])
+        torch.testing.assert_close(restored.factor_codebook_b, adapted.factor_codebooks[1])

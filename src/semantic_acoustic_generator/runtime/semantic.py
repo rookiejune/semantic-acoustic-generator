@@ -16,6 +16,7 @@ from torch import Tensor, nn
 from semantic_acoustic_generator._tensor import is_signed_integer_dtype
 from semantic_acoustic_generator.backend import adapt_backend
 from semantic_acoustic_generator.config import (
+    AnchorTarget,
     DecoderConfig,
     FeatureAdapter,
     Initialization,
@@ -87,6 +88,13 @@ class GeneratorConfig:
             raise ValueError("condition_dim must be positive.")
         if self.feature_adapter is not FeatureAdapter.NONE and self.route is not Route.FM:
             raise ValueError("feature_adapter requires the FM route.")
+        if (
+            self.decoder.anchor_target is AnchorTarget.FACTOR
+            and self.feature_adapter is not FeatureAdapter.LONGCAT_FIRST_CODEBOOK
+        ):
+            raise ValueError(
+                "anchor_target=factor requires feature_adapter=longcat_first_codebook."
+            )
         if (self.feature_mean is None) != (self.feature_std is None):
             raise ValueError("feature_mean and feature_std must be set together.")
         if self.feature_mean is None or self.feature_std is None:
@@ -529,6 +537,7 @@ def build_support(
     semantic_codebook: Tensor,
     codec_spec: SemanticAcousticCodecSpec,
     artifact_backend_metadata: Mapping[str, object] | None = None,
+    factor_codebooks: tuple[Tensor, Tensor] | None = None,
 ) -> GeneratorSupport:
     _validate_frame_aligned_spec(codec_spec)
     _validate_semantic_codebook(semantic_codebook, codec_spec)
@@ -541,6 +550,7 @@ def build_support(
         decoder=config.decoder,
         initialization=config.initialization,
         seed=config.seed,
+        factor_codebooks=factor_codebooks,
     )
     mean = (
         None

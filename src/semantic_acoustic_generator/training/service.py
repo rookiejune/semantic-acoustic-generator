@@ -29,6 +29,7 @@ from semantic_acoustic_generator.callback import (
     UnitThroughputCallback,
 )
 from semantic_acoustic_generator.config import (
+    AnchorTarget,
     DecoderConfig,
     Route,
 )
@@ -138,7 +139,10 @@ def build_session(config: DictConfig | TrainConfig) -> TrainingSession:
     support_config = build_support_config(config, seed=seed, repa_teacher=repa_teacher)
     backend = adapt_backend(backend, support_config.feature_adapter)
     ckpt_path = config.trainer.ckpt_path
-    normalize_features = config.pl_module.normalize_features
+    normalize_features = (
+        config.pl_module.normalize_features
+        and support_config.decoder.anchor_target is AnchorTarget.FEATURE
+    )
     feature_mean: tuple[float, ...] | None = None
     feature_std: tuple[float, ...] | None = None
     if normalize_features and support_config.route is Route.FM:
@@ -244,6 +248,7 @@ def build_support_config(
             repa_loss_weight=loss.repa_loss_weight,
             fm_mode=decoder.fm_mode,
             anchor_context=decoder.anchor_context,
+            anchor_target=decoder.anchor_target,
             anchor_hidden_dim=decoder.anchor_hidden_dim,
             anchor_layers=decoder.anchor_layers,
             anchor_kernel_size=decoder.anchor_kernel_size,

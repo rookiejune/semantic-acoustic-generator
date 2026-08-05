@@ -18,6 +18,7 @@ from torch import Tensor
 from semantic_acoustic_generator.backend import adapt_backend
 from semantic_acoustic_generator.config import (
     AnchorContext,
+    AnchorTarget,
     DecoderConfig,
     FeatureAdapter,
     FMMode,
@@ -186,9 +187,14 @@ def load_generator_artifact(
 ) -> AcousticGeneratorArtifact:
     """Load the reusable acoustic generator and its strict input contract."""
     checkpoint, metadata, config = _artifact(path)
-    generator = _generator(config, metadata)
     state = _load_state(checkpoint)
-    generator.load_state_dict(_generator_state(state))
+    generator_state = _generator_state(state)
+    generator = _generator(
+        config,
+        metadata,
+        factor_codebooks=_factor_codebooks(generator_state, config, prefix=""),
+    )
+    generator.load_state_dict(generator_state)
     if device is not None:
         generator.to(device=device)
     generator.eval()
@@ -269,6 +275,7 @@ def _load_artifact(
 
     checkpoint, backend_data, config = _artifact(path)
     codec_spec = _codec_spec(backend_data)
+    state = _load_state(checkpoint)
     support = build_support(
         config,
         semantic_codebook=torch.zeros(
@@ -277,8 +284,8 @@ def _load_artifact(
         ),
         codec_spec=codec_spec,
         artifact_backend_metadata=backend_data,
+        factor_codebooks=_factor_codebooks(state, config, prefix="generator."),
     )
-    state = _load_state(checkpoint)
     support.load_state_dict(state)
     if device is not None:
         support.to(device=device)
@@ -330,6 +337,8 @@ def _manifest(root: Path) -> tuple[Path, int]:
 def _generator(
     config: GeneratorConfig,
     metadata: Mapping[str, object],
+    *,
+    factor_codebooks: tuple[Tensor, Tensor] | None = None,
 ) -> AcousticUnitGenerator:
     codec_spec = _codec_spec(metadata)
     if config.route is Route.FM:
@@ -337,6 +346,7 @@ def _generator(
             config.condition_dim,
             codec_spec.acoustic_feature_dim,
             config.decoder,
+            factor_codebooks=factor_codebooks,
         )
     if config.route is Route.RVQ:
         return RVQCodeGenerator(
@@ -378,6 +388,20 @@ def _generator_state(state: Mapping[str, Tensor]) -> dict[str, Tensor]:
     return result
 
 
+def _factor_codebooks(
+    state: Mapping[str, Tensor],
+    config: GeneratorConfig,
+    *,
+    prefix: str,
+) -> tuple[Tensor, Tensor] | None:
+    if config.decoder.anchor_target is AnchorTarget.FEATURE:
+        return None
+    keys = (f"{prefix}factor_codebook_a", f"{prefix}factor_codebook_b")
+    if any(key not in state for key in keys):
+        raise RuntimeError("factor-target artifact is missing stored factor codebooks.")
+    return state[keys[0]], state[keys[1]]
+
+
 def _load_state(path: Path) -> Mapping[str, Tensor]:
     state = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(state, Mapping):
@@ -394,6 +418,7 @@ def _config_dict(config: GeneratorConfig) -> dict[str, object]:
     decoder["rvq_predictor"] = config.decoder.rvq_predictor.value
     decoder["fm_mode"] = config.decoder.fm_mode.value
     decoder["anchor_context"] = config.decoder.anchor_context.value
+    decoder["anchor_target"] = config.decoder.anchor_target.value
     return cast(dict[str, object], data)
 
 
@@ -450,6 +475,14 @@ def _config(data: Mapping[str, object]) -> GeneratorConfig:
                     "anchor_context",
                     owner="decoder",
                     default=AnchorContext.LOCAL.value,
+                )
+            ),
+            anchor_target=AnchorTarget(
+                _schema_optional_string(
+                    decoder,
+                    "anchor_target",
+                    owner="decoder",
+                    default=AnchorTarget.FEATURE.value,
                 )
             ),
             anchor_hidden_dim=_schema_optional_int_default(

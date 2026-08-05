@@ -9,6 +9,7 @@ from omegaconf import DictConfig
 from semantic_acoustic_generator.backend import BackendConfig
 from semantic_acoustic_generator.config import (
     AnchorContext,
+    AnchorTarget,
     DecoderConfig,
     FeatureAdapter,
     FMMode,
@@ -76,6 +77,12 @@ def test_transformer_anchor_requires_heads_to_divide_hidden_dim() -> None:
             anchor_context=AnchorContext.TRANSFORMER,
             anchor_hidden_dim=8,
         )
+
+
+def test_factor_target_requires_anchor_mode() -> None:
+    assert DecoderConfig().anchor_target is AnchorTarget.FEATURE
+    with pytest.raises(ValueError, match="anchor_target=factor requires fm_mode=anchor"):
+        DecoderConfig(anchor_target=AnchorTarget.FACTOR)
 
 
 def _compose(*overrides: str) -> DictConfig:
@@ -214,6 +221,31 @@ def test_train_config_parses_first_codebook_anchor_mode() -> None:
     assert config.model.decoder.anchor_hidden_dim == 256
     assert config.model.decoder.anchor_layers == 2
     assert config.model.decoder.anchor_context is AnchorContext.TRANSFORMER
+
+
+def test_train_config_parses_factor_anchor_target() -> None:
+    config = parse_train_config(
+        _compose(
+            "model.feature_adapter=longcat_first_codebook",
+            "model.decoder.fm_mode=anchor",
+            "model.decoder.anchor_target=factor",
+        )
+    )
+
+    assert config.model.decoder.anchor_target is AnchorTarget.FACTOR
+
+
+def test_longcat_factor_classifier_experiment_is_frame_aligned() -> None:
+    config = parse_train_config(_compose("experiment=012_longcat_factor_classifier"))
+
+    assert config.model.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
+    assert config.model.decoder.fm_mode is FMMode.ANCHOR
+    assert config.model.decoder.anchor_context is AnchorContext.LOCAL
+    assert config.model.decoder.anchor_target is AnchorTarget.FACTOR
+    assert config.datamodule.sample_limit == 128
+    assert config.datamodule.batch_size == 16
+    assert config.pl_module.normalize_features is False
+    assert config.trainer.max_steps == 2000
 
 
 def test_longcat_transformer_anchor_experiment_is_frame_aligned() -> None:

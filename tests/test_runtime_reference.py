@@ -11,6 +11,7 @@ from torch import nn
 import semantic_acoustic_generator.runtime.semantic as runtime_semantic
 from semantic_acoustic_generator.config import (
     AnchorContext,
+    AnchorTarget,
     DecoderConfig,
     FeatureAdapter,
     FMMode,
@@ -74,6 +75,18 @@ def test_semantic_support_config_rejects_invalid_field_types(
 
     with pytest.raises(TypeError, match=message):
         GeneratorConfig(**options)  # type: ignore[arg-type]
+
+
+def test_factor_target_requires_longcat_first_codebook_adapter() -> None:
+    with pytest.raises(ValueError, match="requires feature_adapter=longcat_first_codebook"):
+        GeneratorConfig(
+            route=Route.FM,
+            condition_dim=4,
+            decoder=DecoderConfig(
+                fm_mode=FMMode.ANCHOR,
+                anchor_target=AnchorTarget.FACTOR,
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -488,6 +501,7 @@ def test_early_schema_eight_artifact_defaults_new_fm_fields(tmp_path) -> None:
     for key in (
         "fm_mode",
         "anchor_context",
+        "anchor_target",
         "anchor_hidden_dim",
         "anchor_layers",
         "anchor_kernel_size",
@@ -504,6 +518,7 @@ def test_early_schema_eight_artifact_defaults_new_fm_fields(tmp_path) -> None:
     assert loaded.config.feature_adapter is FeatureAdapter.NONE
     assert loaded.config.decoder.fm_mode is FMMode.FLOW
     assert loaded.config.decoder.anchor_context is AnchorContext.LOCAL
+    assert loaded.config.decoder.anchor_target is AnchorTarget.FEATURE
 
 
 def test_schema_eight_artifact_rejects_missing_decoder_fields(tmp_path) -> None:

@@ -2,6 +2,7 @@
 
 from semantic_acoustic_generator.config import (
     AnchorContext,
+    AnchorTarget,
     DecoderConfig,
     FeatureAdapter,
     FMMode,
@@ -31,6 +32,7 @@ __all__ = [
     "AcousticRVQDecoder",
     "AcousticUnitGenerator",
     "AnchorContext",
+    "AnchorTarget",
     "DecoderLoss",
     "DecoderConfig",
     "DiTDecoder",

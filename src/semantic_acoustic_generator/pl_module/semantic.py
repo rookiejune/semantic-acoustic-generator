@@ -15,7 +15,7 @@ from anytrain.lightning import LightningLogMixin
 from lightning import LightningModule
 
 from semantic_acoustic_generator.backend import LongCatFirstCodebookAdapter, adapt_backend
-from semantic_acoustic_generator.config import Route
+from semantic_acoustic_generator.config import AnchorTarget, Route
 from semantic_acoustic_generator.loss.repa import decode_group_metrics
 from semantic_acoustic_generator.model.decoder import FMFeatureGenerator, RVQCodeGenerator
 from semantic_acoustic_generator.runtime.artifact import save_artifact
@@ -144,18 +144,19 @@ class GeneratorModule(LightningLogMixin, LightningModule):
     def training_step(self, batch: GeneratorBatch, batch_idx: int) -> dict[str, Any]:
         del batch_idx
         mask = batch.mask
-        target_features = None
-        if self.support.route is Route.FM:
-            target_features = self._target_features(batch)
         acoustic_mask = batch.acoustic_mask
-        condition, reference_rows = self._condition(batch)
+        feature_generator: FMFeatureGenerator | None = None
+        target_features: Tensor | None = None
         if self.support.route is Route.FM:
-            if target_features is None:
-                raise RuntimeError("FM training requires acoustic target features.")
             generator = self.support.generator
             if not isinstance(generator, FMFeatureGenerator):
                 raise TypeError("FM support requires an FMFeatureGenerator.")
-            output = generator.loss(
+            feature_generator = generator
+            if generator.anchor_target is AnchorTarget.FEATURE:
+                target_features = self._target_features(batch)
+        condition, reference_rows = self._condition(batch)
+        if feature_generator is not None:
+            output = feature_generator.loss(
                 batch,
                 condition,
                 target_features,
@@ -242,7 +243,14 @@ class GeneratorModule(LightningLogMixin, LightningModule):
             reference_mask=None,
             generator=self._validation_generator(batch_idx),
         )
-        suffix = "feature_mse" if self.support.route is Route.FM else "code_error"
+        suffix = "feature_mse"
+        if self.support.route is Route.RVQ:
+            suffix = "code_error"
+        elif (
+            isinstance(self.support.generator, FMFeatureGenerator)
+            and self.support.generator.anchor_target is AnchorTarget.FACTOR
+        ):
+            suffix = "factor_code_error"
         metrics = {f"val/without_reference_{suffix}": without}
         if reference_features is not None:
             with_reference = self._validation_error(
@@ -434,6 +442,23 @@ class GeneratorModule(LightningLogMixin, LightningModule):
         generator: torch.Generator,
     ) -> Tensor:
         if self.support.route is Route.FM:
+            feature_generator = self.support.generator
+            if (
+                isinstance(feature_generator, FMFeatureGenerator)
+                and feature_generator.anchor_target is AnchorTarget.FACTOR
+            ):
+                condition = self.support.condition(
+                    batch.semantic_codes,
+                    mask=batch.mask,
+                    reference_features=reference_features,
+                    reference_mask=reference_mask,
+                )
+                predicted = feature_generator.sample_factor_codes(condition, batch.mask)
+                target_factors = self._factor_targets(batch)
+                if target_factors is None:
+                    raise RuntimeError("factor validation requires factor targets.")
+                error = predicted.ne(target_factors.to(device=predicted.device)).float().mean(-1)
+                return _masked_mean(error, batch.acoustic_mask)
             prediction = self.support.sample_features(
                 batch.semantic_codes,
                 mask=batch.mask,
@@ -520,7 +545,12 @@ def build_module(
     repa_teacher: Teacher | None = None,
 ) -> GeneratorModule:
     backend = adapt_backend(backend, config.feature_adapter)
-    if normalize_features and config.route is not Route.RVQ:
+    normalize_features = (
+        normalize_features
+        and config.route is not Route.RVQ
+        and config.decoder.anchor_target is AnchorTarget.FEATURE
+    )
+    if normalize_features:
         if (feature_mean is None) != (feature_std is None):
             raise ValueError("feature_mean and feature_std must be provided together.")
         if feature_mean is None or feature_std is None:
@@ -533,6 +563,12 @@ def build_module(
         config,
         semantic_codebook=backend.semantic_codebook,
         codec_spec=semantic_acoustic_spec(backend),
+        factor_codebooks=(
+            backend.factor_codebooks
+            if isinstance(backend, LongCatFirstCodebookAdapter)
+            and config.decoder.anchor_target is AnchorTarget.FACTOR
+            else None
+        ),
     )
     return GeneratorModule(
         support,
