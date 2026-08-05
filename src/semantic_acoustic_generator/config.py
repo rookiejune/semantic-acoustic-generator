@@ -37,6 +37,11 @@ class AnchorTarget(StrEnum):
     FACTOR = auto()
 
 
+class FactorPredictor(StrEnum):
+    PARALLEL = auto()
+    DEPTH_AR = auto()
+
+
 class Initialization(StrEnum):
     CODEC = auto()
     RANDOM = auto()
@@ -62,6 +67,7 @@ class DecoderConfig:
     fm_mode: FMMode = FMMode.FLOW
     anchor_context: AnchorContext = AnchorContext.LOCAL
     anchor_target: AnchorTarget = AnchorTarget.FEATURE
+    factor_predictor: FactorPredictor = FactorPredictor.PARALLEL
     anchor_hidden_dim: int = 512
     anchor_layers: int = 4
     anchor_kernel_size: int = 3
@@ -87,6 +93,8 @@ class DecoderConfig:
             raise TypeError("anchor_context must be an AnchorContext.")
         if not isinstance(self.anchor_target, AnchorTarget):
             raise TypeError("anchor_target must be an AnchorTarget.")
+        if not isinstance(self.factor_predictor, FactorPredictor):
+            raise TypeError("factor_predictor must be a FactorPredictor.")
         _int(self.anchor_hidden_dim, name="anchor_hidden_dim")
         _int(self.anchor_layers, name="anchor_layers")
         _int(self.anchor_kernel_size, name="anchor_kernel_size")
@@ -116,6 +124,11 @@ class DecoderConfig:
             raise ValueError("anchor_factor_temperature must be positive.")
         if self.anchor_target is AnchorTarget.FACTOR and self.fm_mode is not FMMode.ANCHOR:
             raise ValueError("anchor_target=factor requires fm_mode=anchor.")
+        if (
+            self.factor_predictor is FactorPredictor.DEPTH_AR
+            and self.anchor_target is not AnchorTarget.FACTOR
+        ):
+            raise ValueError("factor_predictor=depth_ar requires anchor_target=factor.")
         if self.fm_mode is not FMMode.FLOW and self.repa_loss_weight > 0:
             raise ValueError("REPA is only supported by fm_mode=flow.")
 
@@ -139,6 +152,9 @@ def decoder_options(
     anchor_target = config.get("anchor_target", AnchorTarget.FEATURE.value)
     if not isinstance(anchor_target, str):
         raise TypeError("anchor_target must be a string.")
+    factor_predictor = config.get("factor_predictor", FactorPredictor.PARALLEL.value)
+    if not isinstance(factor_predictor, str):
+        raise TypeError("factor_predictor must be a string.")
     return DecoderConfig(
         hidden_dim=_optional_int(config.get("hidden_dim"), name="hidden_dim"),
         layers=_int(config["layers"], name="layers"),
@@ -156,6 +172,7 @@ def decoder_options(
         fm_mode=FMMode(fm_mode),
         anchor_context=AnchorContext(anchor_context),
         anchor_target=AnchorTarget(anchor_target),
+        factor_predictor=FactorPredictor(factor_predictor),
         anchor_hidden_dim=_int(config.get("anchor_hidden_dim", 512), name="anchor_hidden_dim"),
         anchor_layers=_int(config.get("anchor_layers", 4), name="anchor_layers"),
         anchor_kernel_size=_int(
@@ -204,6 +221,7 @@ __all__ = [
     "AnchorContext",
     "AnchorTarget",
     "DecoderConfig",
+    "FactorPredictor",
     "FeatureAdapter",
     "FMMode",
     "Initialization",

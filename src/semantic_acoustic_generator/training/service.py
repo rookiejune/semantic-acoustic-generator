@@ -254,6 +254,7 @@ def build_support_config(
             fm_mode=decoder.fm_mode,
             anchor_context=decoder.anchor_context,
             anchor_target=decoder.anchor_target,
+            factor_predictor=decoder.factor_predictor,
             anchor_hidden_dim=decoder.anchor_hidden_dim,
             anchor_layers=decoder.anchor_layers,
             anchor_kernel_size=decoder.anchor_kernel_size,

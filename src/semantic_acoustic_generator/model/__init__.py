@@ -14,7 +14,7 @@ from semantic_acoustic_generator.model.decoder import (
 )
 from semantic_acoustic_generator.model.dit import DiTDecoder
 from semantic_acoustic_generator.model.routes import RouteModules, build_route
-from semantic_acoustic_generator.model.rvq import AcousticRVQDecoder
+from semantic_acoustic_generator.model.rvq import AcousticRVQDecoder, FactorDepthPredictor
 
 __all__ = [
     "AcousticCodeSampler",
@@ -24,6 +24,7 @@ __all__ = [
     "DecoderLoss",
     "DiTDecoder",
     "FMFeatureGenerator",
+    "FactorDepthPredictor",
     "FeatureSampler",
     "RVQCodeGenerator",
     "ReferenceConditioner",

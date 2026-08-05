@@ -15,6 +15,7 @@ from semantic_acoustic_generator.config import (
     AnchorContext,
     AnchorTarget,
     DecoderConfig,
+    FactorPredictor,
     FeatureAdapter,
     FMMode,
     Initialization,
@@ -399,6 +400,9 @@ def _prepare(config: DictConfig) -> DictConfig:
             anchor_target = decoder.get("anchor_target")
             if anchor_target is not None:
                 decoder.anchor_target = _enum_name(AnchorTarget, anchor_target)
+            factor_predictor = decoder.get("factor_predictor")
+            if factor_predictor is not None:
+                decoder.factor_predictor = _enum_name(FactorPredictor, factor_predictor)
     runtime = result.get("runtime")
     if isinstance(runtime, DictConfig):
         initialization = runtime.get("initialization")

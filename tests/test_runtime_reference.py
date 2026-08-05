@@ -13,6 +13,7 @@ from semantic_acoustic_generator.config import (
     AnchorContext,
     AnchorTarget,
     DecoderConfig,
+    FactorPredictor,
     FeatureAdapter,
     FMMode,
     Route,
@@ -446,6 +447,7 @@ def test_schema_eight_artifact_roundtrip_preserves_decoder_fields(
     assert data["backend"]["frame_rate"] == backend.frame_rate
     assert data["backend"]["semantic_frame_rate"] == backend.semantic_frame_rate
     assert data["config"]["decoder"]["rvq_predictor"] == RVQPredictor.MTP.value
+    assert data["config"]["decoder"]["factor_predictor"] == FactorPredictor.PARALLEL.value
     assert data["config"]["feature_adapter"] == FeatureAdapter.NONE.value
     assert data["config"]["feature_codebooks"] == 1
     assert data["config"]["sampling"]["cfg_scale"] == 1.0
@@ -462,6 +464,7 @@ def test_schema_eight_artifact_roundtrip_preserves_decoder_fields(
 
     assert len(captured) == 1
     assert captured[0].decoder.rvq_predictor is RVQPredictor.MTP
+    assert captured[0].decoder.factor_predictor is FactorPredictor.PARALLEL
     assert captured[0].feature_adapter is FeatureAdapter.NONE
     assert captured[0].sampling.cfg_scale == 1.0
     assert loaded.acoustic_layout is AcousticLayout.FRAME_ALIGNED
@@ -519,6 +522,7 @@ def test_early_schema_eight_artifact_defaults_new_fm_fields(tmp_path) -> None:
         "fm_mode",
         "anchor_context",
         "anchor_target",
+        "factor_predictor",
         "anchor_hidden_dim",
         "anchor_layers",
         "anchor_kernel_size",
@@ -537,6 +541,7 @@ def test_early_schema_eight_artifact_defaults_new_fm_fields(tmp_path) -> None:
     assert loaded.config.decoder.fm_mode is FMMode.FLOW
     assert loaded.config.decoder.anchor_context is AnchorContext.LOCAL
     assert loaded.config.decoder.anchor_target is AnchorTarget.FEATURE
+    assert loaded.config.decoder.factor_predictor is FactorPredictor.PARALLEL
 
 
 def test_schema_eight_artifact_rejects_missing_decoder_fields(tmp_path) -> None:

@@ -11,13 +11,18 @@ from semantic_acoustic_generator.config import (
     AnchorContext,
     AnchorTarget,
     DecoderConfig,
+    FactorPredictor,
     FeatureAdapter,
     FMMode,
     Route,
     RVQPredictor,
     decoder_options,
 )
-from semantic_acoustic_generator.training import TrainConfig, parse_train_config
+from semantic_acoustic_generator.training import (
+    TrainConfig,
+    build_support_config,
+    parse_train_config,
+)
 
 CONFIG_DIR = Path(__file__).parents[1] / "configs"
 
@@ -56,6 +61,35 @@ def test_decoder_config_rejects_non_finite_repa_weight(value: float) -> None:
 def test_decoder_config_requires_declared_predictor() -> None:
     with pytest.raises(TypeError, match="rvq_predictor must be an RVQPredictor"):
         DecoderConfig(rvq_predictor="mtp")  # type: ignore[arg-type]
+
+
+def test_decoder_config_requires_declared_factor_predictor() -> None:
+    with pytest.raises(TypeError, match="factor_predictor must be a FactorPredictor"):
+        DecoderConfig(factor_predictor="depth_ar")  # type: ignore[arg-type]
+
+
+def test_depth_ar_factor_predictor_requires_factor_target() -> None:
+    assert DecoderConfig().factor_predictor is FactorPredictor.PARALLEL
+    with pytest.raises(
+        ValueError,
+        match="factor_predictor=depth_ar requires anchor_target=factor",
+    ):
+        DecoderConfig(factor_predictor=FactorPredictor.DEPTH_AR)
+
+
+def test_decoder_options_parses_depth_ar_factor_predictor() -> None:
+    config = decoder_options(
+        {
+            "layers": 8,
+            "heads": 8,
+            "ffn_ratio": 4,
+            "fm_mode": "anchor",
+            "anchor_target": "factor",
+            "factor_predictor": "depth_ar",
+        }
+    )
+
+    assert config.factor_predictor is FactorPredictor.DEPTH_AR
 
 
 def test_decoder_options_rejects_non_finite_repa_weight() -> None:
@@ -145,6 +179,7 @@ def test_train_config_parses_to_typed_entry_schema() -> None:
     assert config.model.route is Route.FM
     assert config.model.feature_adapter is FeatureAdapter.NONE
     assert config.model.decoder.rvq_predictor is RVQPredictor.MTP
+    assert config.model.decoder.factor_predictor is FactorPredictor.PARALLEL
     assert config.datamodule.fixed_batch is False
     assert config.callback.performance.enabled is False
     assert config.runtime.sampling.cfg_scale == 1.0
@@ -253,10 +288,14 @@ def test_train_config_parses_factor_anchor_target() -> None:
             "model.feature_adapter=longcat_first_codebook",
             "model.decoder.fm_mode=anchor",
             "model.decoder.anchor_target=factor",
+            "model.decoder.factor_predictor=depth_ar",
         )
     )
 
     assert config.model.decoder.anchor_target is AnchorTarget.FACTOR
+    assert config.model.decoder.factor_predictor is FactorPredictor.DEPTH_AR
+    support = build_support_config(config, seed=0, repa_teacher=None)
+    assert support.decoder.factor_predictor is FactorPredictor.DEPTH_AR
 
 
 def test_longcat_factor_classifier_experiment_is_frame_aligned() -> None:

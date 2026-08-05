@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from anytrain.codec import (
@@ -17,12 +19,14 @@ from semantic_acoustic_generator.backend import (
 from semantic_acoustic_generator.config import (
     AnchorTarget,
     DecoderConfig,
+    FactorPredictor,
     FeatureAdapter,
     FMMode,
     Route,
 )
 from semantic_acoustic_generator.evaluation import evaluate_first_codebook_oracle
 from semantic_acoustic_generator.model import FMFeatureGenerator
+from semantic_acoustic_generator.model import rvq as rvq_module
 from semantic_acoustic_generator.pl_module import build_module
 from semantic_acoustic_generator.runtime import GeneratorConfig, GeneratorRuntime, build_support
 from semantic_acoustic_generator.runtime.artifact import (
@@ -40,11 +44,38 @@ class _Stage(nn.Module):
         self.codebook_size_b = 90
         self.codebook_a = nn.Embedding(90, 8)
         self.codebook_b = nn.Embedding(90, 8)
-        self.out_proj_a = nn.Conv1d(8, 512, kernel_size=1, bias=False)
-        self.out_proj_b = nn.Conv1d(8, 512, kernel_size=1, bias=False)
+        self.out_proj_a = nn.Conv1d(8, 512, kernel_size=1, bias=True)
+        self.out_proj_b = nn.Conv1d(8, 512, kernel_size=1, bias=True)
         with torch.no_grad():
             self.codebook_a.weight.copy_(torch.arange(90 * 8).view(90, 8) / 100)
             self.codebook_b.weight.copy_(torch.arange(90 * 8).view(90, 8) / 50 + 20)
+            self.out_proj_a.bias.fill_(0.1)
+            self.out_proj_b.bias.fill_(-0.2)
+
+
+class _DepthCore(nn.Module):
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(1, hidden_dim)
+
+    def forward(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        use_cache: bool,
+        return_dict: bool,
+        past_key_values: torch.Tensor | None = None,
+    ) -> SimpleNamespace:
+        del return_dict
+        hidden = (
+            inputs_embeds.cumsum(dim=1)
+            if past_key_values is None
+            else inputs_embeds + past_key_values[:, -1:]
+        )
+        return SimpleNamespace(
+            last_hidden_state=hidden,
+            past_key_values=hidden[:, -1:] if use_cache else None,
+        )
 
 
 class _Quantizer(nn.Module):
@@ -197,6 +228,29 @@ def test_longcat_factor_adapter_sums_multiple_stage_projections() -> None:
     assert backend.decoded_features is not None
     torch.testing.assert_close(backend.decoded_features, native)
     torch.testing.assert_close(waveform, native.transpose(1, 2))
+
+
+def test_longcat_factor_adapter_skips_inactive_projection_bias() -> None:
+    backend = _LongCat()
+    adapted = LongCatCodebookAdapter(backend, codebooks=3)
+    codes = torch.tensor([[[90, 180, 270], [360, 450, 540]]], dtype=torch.long)
+    features = adapted.acoustic_codes_to_features(codes)
+
+    stage0 = adapted.project_features(features, active_codebooks=1)
+    first = backend._decoder().acoustic_quantizer.quantizers[0]
+    expected = torch.cat(
+        (
+            first.out_proj_a(features[..., :8].transpose(1, 2)),
+            first.out_proj_b(features[..., 8:16].transpose(1, 2)),
+        ),
+        dim=1,
+    ).transpose(1, 2)
+    zeroed = features.clone()
+    zeroed[..., 16:] = 0
+    zero_embedding_projection = adapted.project_features(zeroed)
+
+    torch.testing.assert_close(stage0, expected)
+    assert not torch.allclose(stage0, zero_embedding_projection)
 
 
 def test_longcat_first_codebook_adapter_snaps_each_factor_by_cosine() -> None:
@@ -436,3 +490,54 @@ def test_multi_codebook_factor_artifact_roundtrip(tmp_path) -> None:
             else f"factor_codebook_{index // 2}_{'a' if index % 2 == 0 else 'b'}"
         )
         torch.testing.assert_close(loaded.generator.state_dict()[key], codebook)
+
+
+def test_depth_factor_artifact_roundtrip(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        rvq_module,
+        "_qwen3_model",
+        lambda **options: _DepthCore(options["hidden_dim"]),
+    )
+    backend = _LongCat()
+    adapted = LongCatCodebookAdapter(backend, codebooks=2)
+    config = GeneratorConfig(
+        route=Route.FM,
+        condition_dim=4,
+        feature_adapter=FeatureAdapter.LONGCAT_CODEBOOKS,
+        feature_codebooks=2,
+        decoder=DecoderConfig(
+            hidden_dim=4,
+            layers=1,
+            heads=1,
+            ffn_ratio=2,
+            fm_mode=FMMode.ANCHOR,
+            anchor_target=AnchorTarget.FACTOR,
+            factor_predictor=FactorPredictor.DEPTH_AR,
+            anchor_hidden_dim=4,
+            anchor_layers=1,
+        ),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=adapted.semantic_codebook,
+        codec_spec=semantic_acoustic_spec(adapted),
+        factor_codebooks=adapted.factor_codebooks,
+    )
+    condition = torch.randn(1, 3, 4)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    expected = support.generator.sample_factor_codes(condition, mask)
+    save_artifact(tmp_path, support, backend=backend)
+
+    loaded = load_artifact(tmp_path)
+    assert loaded.config is not None
+    assert loaded.config.decoder.factor_predictor is FactorPredictor.DEPTH_AR
+    assert isinstance(loaded.generator, FMFeatureGenerator)
+    assert loaded.generator.factor_depth is not None
+    assert "factor_depth.factor_codebook_1_b" in loaded.generator.state_dict()
+    torch.testing.assert_close(
+        loaded.generator.sample_factor_codes(condition, mask),
+        expected,
+    )

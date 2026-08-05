@@ -20,6 +20,7 @@ from semantic_acoustic_generator.config import (
     AnchorContext,
     AnchorTarget,
     DecoderConfig,
+    FactorPredictor,
     FeatureAdapter,
     FMMode,
     Initialization,
@@ -434,6 +435,7 @@ def _config_dict(config: GeneratorConfig) -> dict[str, object]:
     decoder["fm_mode"] = config.decoder.fm_mode.value
     decoder["anchor_context"] = config.decoder.anchor_context.value
     decoder["anchor_target"] = config.decoder.anchor_target.value
+    decoder["factor_predictor"] = config.decoder.factor_predictor.value
     return cast(dict[str, object], data)
 
 
@@ -504,6 +506,14 @@ def _config(data: Mapping[str, object]) -> GeneratorConfig:
                     "anchor_target",
                     owner="decoder",
                     default=AnchorTarget.FEATURE.value,
+                )
+            ),
+            factor_predictor=FactorPredictor(
+                _schema_optional_string(
+                    decoder,
+                    "factor_predictor",
+                    owner="decoder",
+                    default=FactorPredictor.PARALLEL.value,
                 )
             ),
             anchor_hidden_dim=_schema_optional_int_default(

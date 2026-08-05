@@ -17,6 +17,7 @@ from torch import nn
 from semantic_acoustic_generator.config import (
     AnchorTarget,
     DecoderConfig,
+    FactorPredictor,
     FMMode,
     Route,
     RVQPredictor,
@@ -24,7 +25,7 @@ from semantic_acoustic_generator.config import (
 from semantic_acoustic_generator.loss.flow import FlowLoss, FlowRuntime
 from semantic_acoustic_generator.model.condition import AlignedAnchor
 from semantic_acoustic_generator.model.dit import DiTDecoder
-from semantic_acoustic_generator.model.rvq import AcousticRVQDecoder
+from semantic_acoustic_generator.model.rvq import AcousticRVQDecoder, FactorDepthPredictor
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -90,7 +91,9 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         super().__init__()
         self.mode = config.fm_mode
         self.anchor_target = config.anchor_target
+        self.factor_predictor = config.factor_predictor
         self.feature_dim = feature_dim
+        self.factor_depth: FactorDepthPredictor | None
         self.factor_codebook_a: Tensor | None
         self.factor_codebook_b: Tensor | None
         self._factor_codebook_names: tuple[str, ...]
@@ -109,13 +112,26 @@ class FMFeatureGenerator(AcousticUnitGenerator):
                 buffer = nn.Buffer(value.detach().clone())
                 setattr(self, name, buffer)
             self._factor_codebook_names = names
-            anchor_output_dim = sum(value.size(0) for value in factor_codebooks)
+            if self.factor_predictor is FactorPredictor.DEPTH_AR:
+                anchor_output_dim = config.anchor_hidden_dim
+                self.factor_depth = FactorDepthPredictor(
+                    config.anchor_hidden_dim,
+                    factor_codebooks,
+                    hidden_dim=config.hidden_dim,
+                    layers=config.layers,
+                    heads=config.heads,
+                    ffn_ratio=config.ffn_ratio,
+                )
+            else:
+                anchor_output_dim = sum(value.size(0) for value in factor_codebooks)
+                self.factor_depth = None
         else:
             if factor_codebooks is not None:
                 raise ValueError("factor codebooks require anchor_target=factor.")
             self.factor_codebook_a = None
             self.factor_codebook_b = None
             self._factor_codebook_names = ()
+            self.factor_depth = None
             anchor_output_dim = feature_dim
         self.anchor_output_dim = anchor_output_dim
         self.core = (
@@ -190,7 +206,33 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         if self.anchor_target is not AnchorTarget.FACTOR:
             raise RuntimeError("factor-code generation requires anchor_target=factor.")
         target_condition, target_mask = _aligned_condition(condition, mask)
-        return self._factor_codes(self._anchor(target_condition, target_mask), target_mask)
+        return self._factor_codes_from_anchor(
+            self._anchor(target_condition, target_mask),
+            target_mask,
+        )
+
+    @torch.no_grad()
+    def factor_logits(
+        self,
+        condition: Tensor,
+        mask: Tensor,
+        *,
+        factor_targets: Tensor | None = None,
+    ) -> tuple[Tensor, ...]:
+        """Return factor logits, teacher-forcing previous stages for depth-AR."""
+        if self.anchor_target is not AnchorTarget.FACTOR:
+            raise RuntimeError("factor logits require anchor_target=factor.")
+        target_condition, target_mask = _aligned_condition(condition, mask)
+        anchor = self._anchor(target_condition, target_mask)
+        if self.factor_depth is None:
+            return self._factor_output(anchor)
+        if factor_targets is None:
+            raise ValueError("depth-AR factor logits require factor targets for teacher forcing.")
+        return self.factor_depth(
+            anchor,
+            factor_targets,
+            mask=target_mask,
+        )
 
     @torch.no_grad()
     def sample_features(
@@ -428,7 +470,17 @@ class FMFeatureGenerator(AcousticUnitGenerator):
     ) -> DecoderLoss:
         if factor_targets is None:
             raise ValueError("anchor_target=factor requires factor targets.")
-        logits = self._factor_output(self._anchor(condition, target_mask))
+        anchor = self._anchor(condition, target_mask)
+        logits = (
+            self._factor_output(anchor)
+            if self.factor_depth is None
+            else self.factor_depth(
+                anchor,
+                factor_targets,
+                mask=target_mask,
+                validate=validate,
+            )
+        )
         factor = self.anchor_factor_loss(
             logits,
             factor_targets,
@@ -457,9 +509,9 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             raise ValueError("factor logits do not match stored codebook sizes.")
         return logits.split(sizes, dim=-1)  # type: ignore[return-value]
 
-    def _factor_features(self, logits: Tensor, mask: Tensor) -> Tensor:
+    def _factor_features(self, anchor: Tensor, mask: Tensor) -> Tensor:
         codebooks = self._stored_factor_codebooks()
-        codes = self._factor_codes(logits, mask)
+        codes = self._factor_codes_from_anchor(anchor, mask)
         features = torch.cat(
             tuple(
                 torch.nn.functional.embedding(value, codebook)
@@ -468,6 +520,11 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             dim=-1,
         )
         return features.masked_fill(~mask[..., None], 0)
+
+    def _factor_codes_from_anchor(self, anchor: Tensor, mask: Tensor) -> Tensor:
+        if self.factor_depth is not None:
+            return self.factor_depth.generate(anchor, mask=mask)
+        return self._factor_codes(anchor, mask)
 
     def _factor_codes(self, logits: Tensor, mask: Tensor) -> Tensor:
         codes = torch.stack(

@@ -193,14 +193,26 @@ class LongCatCodebookAdapter(nn.Module):
         return torch.stack(indices, dim=-1)
 
     @torch.no_grad()
-    def project_features(self, acoustic_features: Tensor) -> Tensor:
+    def project_features(
+        self,
+        acoustic_features: Tensor,
+        *,
+        active_codebooks: int | None = None,
+    ) -> Tensor:
         if acoustic_features.dim() != 3:
             raise ValueError("acoustic_features must have shape [batch, time, dim].")
         if acoustic_features.size(-1) != self.acoustic_feature_dim:
             raise ValueError(
                 f"adapted LongCat acoustic features must have dim {self.acoustic_feature_dim}."
             )
-        stages = self._stages()
+        count = (
+            self.feature_codebooks
+            if active_codebooks is None
+            else _positive_int(active_codebooks, "active feature codebook count")
+        )
+        if count > self.feature_codebooks:
+            raise ValueError("active LongCat feature codebooks exceed the adapted codebooks.")
+        stages = self._stages()[:count]
         reference = stages[0].codebook_a.weight
         features = acoustic_features.to(device=reference.device, dtype=reference.dtype)
         dims = tuple(dim for pair in self._factor_dims for dim in pair)
@@ -243,7 +255,13 @@ class LongCatCodebookAdapter(nn.Module):
         return self.native_features(acoustic_codes)
 
     @torch.no_grad()
-    def decode_features(self, semantic_codes: Tensor, acoustic_features: Tensor) -> Tensor:
+    def decode_features(
+        self,
+        semantic_codes: Tensor,
+        acoustic_features: Tensor,
+        *,
+        active_codebooks: int | None = None,
+    ) -> Tensor:
         if acoustic_features.dim() != 3:
             raise ValueError("acoustic_features must have shape [batch, time, dim].")
         if acoustic_features.size(-1) != self.acoustic_feature_dim:
@@ -256,7 +274,10 @@ class LongCatCodebookAdapter(nn.Module):
             raise TypeError("acoustic_features must be real floating point tensors.")
         return self.backend.decode_features(
             semantic_codes,
-            self.project_features(acoustic_features),
+            self.project_features(
+                acoustic_features,
+                active_codebooks=active_codebooks,
+            ),
         )
 
     def _decoder(self) -> Any:

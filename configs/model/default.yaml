@@ -12,6 +12,7 @@ decoder:
   fm_mode: flow
   anchor_context: local
   anchor_target: feature
+  factor_predictor: parallel
   anchor_hidden_dim: 512
   anchor_layers: 4
   anchor_kernel_size: 3

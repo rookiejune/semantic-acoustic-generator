@@ -18,6 +18,7 @@ from semantic_acoustic_generator.backend import (
 )
 from semantic_acoustic_generator.datamodule import BatchingConfig, DataConfig, load_batch
 from semantic_acoustic_generator.evaluation import masked_feature_mse, seeded_generator
+from semantic_acoustic_generator.model import FMFeatureGenerator
 from semantic_acoustic_generator.runtime import GeneratorRuntime
 from semantic_acoustic_generator.runtime.artifact import load_artifact
 
@@ -99,16 +100,35 @@ def main() -> None:
             predicted = runtime.backend.features_to_factor_codes(generated)
             labels = runtime.backend.factor_codes(batch.acoustic_codes).to(predicted.device)
             valid = batch.acoustic_mask.to(predicted.device)
-            accuracy = predicted[valid].eq(labels[valid]).float().mean(dim=0)
-            for factor, value in enumerate(accuracy):
-                codebook, local = divmod(factor, 2)
-                suffix = "a" if local == 0 else "b"
-                name = (
-                    f"factor_{suffix}_accuracy"
-                    if codebook == 0
-                    else f"codebook_{codebook}_factor_{suffix}_accuracy"
+            _factor_accuracy(metrics, predicted, labels, valid)
+            feature_generator = runtime.support.generator
+            if (
+                isinstance(feature_generator, FMFeatureGenerator)
+                and feature_generator.factor_depth is not None
+            ):
+                condition = runtime.support.condition(batch.semantic_codes, mask=batch.mask)
+                teacher_logits = feature_generator.factor_logits(
+                    condition,
+                    batch.mask,
+                    factor_targets=labels,
                 )
-                metrics[name] = float(value.cpu())
+                teacher = torch.stack(
+                    tuple(value.argmax(dim=-1) for value in teacher_logits),
+                    dim=-1,
+                )
+                _factor_accuracy(
+                    metrics,
+                    teacher,
+                    labels,
+                    valid,
+                    prefix="teacher_forced_",
+                )
+            if runtime.backend.feature_codebooks > 1:
+                audio["generated_stage0_only"] = runtime.backend.decode_features(
+                    semantic,
+                    generated,
+                    active_codebooks=1,
+                )
         text = batch.metadata[0].target_text
         for group, waveform in audio.items():
             path = output / group / f"sample-{sample_index:04d}.wav"
@@ -143,6 +163,26 @@ def main() -> None:
         encoding="utf-8",
     )
     print(json.dumps({"summary": summary}, sort_keys=True))
+
+
+def _factor_accuracy(
+    metrics: dict[str, float],
+    predicted: torch.Tensor,
+    labels: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    prefix: str = "",
+) -> None:
+    accuracy = predicted[valid].eq(labels[valid]).float().mean(dim=0)
+    for factor, value in enumerate(accuracy):
+        codebook, local = divmod(factor, 2)
+        suffix = "a" if local == 0 else "b"
+        name = (
+            f"factor_{suffix}_accuracy"
+            if codebook == 0
+            else f"codebook_{codebook}_factor_{suffix}_accuracy"
+        )
+        metrics[f"{prefix}{name}"] = float(value.cpu())
 
 
 def _args() -> argparse.Namespace:
