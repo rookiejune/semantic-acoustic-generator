@@ -1,0 +1,73 @@
+# @package _global_
+defaults:
+  - override /backend: longcat
+  - override /datamodule: qwen_fixed_speaker
+  - override /model: default
+  - override /model/route: fm
+  - override /loss: default
+  - override /pl_module: default
+  - override /runtime: default
+  - override /callback: default
+  - override /trainer: default
+  - _self_
+
+output_subdir: 011/local-anchor-${datamodule.sample_limit}-${trainer.max_steps}
+
+datamodule:
+  sample_limit: 10000
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  fixed_batch: false
+  batching:
+    enabled: false
+
+model:
+  condition_dim: 512
+  feature_adapter: longcat_first_codebook
+  decoder:
+    hidden_dim: 512
+    layers: 4
+    heads: 8
+    ffn_ratio: 4
+    fm_mode: anchor
+    anchor_hidden_dim: 512
+    anchor_layers: 4
+    anchor_kernel_size: 3
+    anchor_cosine_weight: 0.1
+    anchor_factor_weight: 0.1
+    anchor_factor_temperature: 0.1
+
+pl_module:
+  learning_rate: 1e-3
+  weight_decay: 0.0
+  reference_dropout: 1.0
+  finite_loss_check_interval: 1
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  precision: bf16-mixed
+  max_steps: 2000
+  max_epochs: -1
+  log_every_n_steps: 10
+  gradient_clip_val: 1.0
+
+callback:
+  sample:
+    enabled: false
+  performance:
+    enabled: true
+    profile_flops: true
+    log_every_n_steps: 10
+    warmup_steps: 10
+    measure_window_steps: 50
+  loss_time_bucket:
+    enabled: false
+  checkpoint:
+    enabled: true
+    save_last: true
+    save_top_k: -1
+    every_n_train_steps: 500
