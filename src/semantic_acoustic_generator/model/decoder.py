@@ -93,30 +93,29 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         self.feature_dim = feature_dim
         self.factor_codebook_a: Tensor | None
         self.factor_codebook_b: Tensor | None
-        self._factor_codebooks: tuple[Tensor, ...]
+        self._factor_codebook_names: tuple[str, ...]
         if self.anchor_target is AnchorTarget.FACTOR:
             if factor_codebooks is None:
                 raise ValueError("anchor_target=factor requires factor codebook pairs.")
             _validate_factor_codebooks(factor_codebooks, feature_dim=feature_dim)
             self.factor_codebook_a = nn.Buffer(factor_codebooks[0].detach().clone())
             self.factor_codebook_b = nn.Buffer(factor_codebooks[1].detach().clone())
-            stored = [self.factor_codebook_a, self.factor_codebook_b]
+            names = factor_codebook_names(len(factor_codebooks) // 2)
             for name, value in zip(
-                factor_codebook_names(len(factor_codebooks) // 2)[2:],
+                names[2:],
                 factor_codebooks[2:],
                 strict=True,
             ):
                 buffer = nn.Buffer(value.detach().clone())
                 setattr(self, name, buffer)
-                stored.append(buffer)
-            self._factor_codebooks = tuple(stored)
+            self._factor_codebook_names = names
             anchor_output_dim = sum(value.size(0) for value in factor_codebooks)
         else:
             if factor_codebooks is not None:
                 raise ValueError("factor codebooks require anchor_target=factor.")
             self.factor_codebook_a = None
             self.factor_codebook_b = None
-            self._factor_codebooks = ()
+            self._factor_codebook_names = ()
             anchor_output_dim = feature_dim
         self.anchor_output_dim = anchor_output_dim
         self.core = (
@@ -478,9 +477,15 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         return codes.masked_fill(~mask[..., None], 0)
 
     def _stored_factor_codebooks(self) -> tuple[Tensor, ...]:
-        if not self._factor_codebooks:
+        if not self._factor_codebook_names:
             raise RuntimeError("factor target requires stored factor codebooks.")
-        return self._factor_codebooks
+        result: list[Tensor] = []
+        for name in self._factor_codebook_names:
+            value = getattr(self, name, None)
+            if not isinstance(value, torch.Tensor):
+                raise RuntimeError(f"stored factor codebook {name!r} is missing.")
+            result.append(value)
+        return tuple(result)
 
     def _factor_logits(
         self,

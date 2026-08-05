@@ -296,6 +296,16 @@ def test_factor_anchor_scales_to_multiple_acoustic_codebooks() -> None:
     assert "codebook_5_top1" in output.items["anchor_factor"].details
     assert "factor_codebook_2_b" in generator.state_dict()
 
+    generator.to(dtype=torch.float64)
+    moved = generator.sample_features(
+        condition.double(),
+        mask,
+        feature_mean=torch.zeros(1, 1, 12, dtype=torch.float64),
+        feature_std=torch.ones(1, 1, 12, dtype=torch.float64),
+        flow_steps=1,
+    )
+    assert moved.dtype == torch.float64
+
 
 def test_transformer_anchor_preserves_frame_alignment_and_padding() -> None:
     condition = torch.randn(2, 5, 8)
