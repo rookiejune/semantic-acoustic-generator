@@ -124,23 +124,37 @@ def main() -> None:
                     prefix="teacher_forced_",
                 )
             if runtime.backend.feature_codebooks > 1:
+                full_target = runtime.backend.backend.acoustic_codes_to_features(
+                    batch.acoustic_codes
+                )
                 audio["generated_stage0_only"] = runtime.backend.decode_features(
                     semantic,
                     generated,
                     active_codebooks=1,
                 )
+                metrics["stage0_projected_mse"] = masked_feature_mse(
+                    runtime.backend.project_features(generated, active_codebooks=1),
+                    full_target,
+                    batch.acoustic_mask,
+                    name="artifact set stage0 projection",
+                )
                 retargeted = runtime.backend.retarget_factor_codes(
                     batch.acoustic_codes,
                     predicted,
+                )
+                _factor_accuracy(
+                    metrics,
+                    predicted[..., 2:],
+                    retargeted[..., 2:],
+                    valid,
+                    prefix="retargeted_",
+                    codebook_offset=1,
                 )
                 retargeted_features = runtime.backend.factor_codes_to_features(retargeted)
                 audio["generated_residual_oracle"] = runtime.decode_features(
                     semantic,
                     retargeted_features,
                     mask=batch.mask,
-                )
-                full_target = runtime.backend.backend.acoustic_codes_to_features(
-                    batch.acoustic_codes
                 )
                 metrics["generated_projected_mse"] = masked_feature_mse(
                     runtime.backend.project_features(generated),
@@ -197,10 +211,12 @@ def _factor_accuracy(
     valid: torch.Tensor,
     *,
     prefix: str = "",
+    codebook_offset: int = 0,
 ) -> None:
     accuracy = predicted[valid].eq(labels[valid]).float().mean(dim=0)
     for factor, value in enumerate(accuracy):
         codebook, local = divmod(factor, 2)
+        codebook += codebook_offset
         suffix = "a" if local == 0 else "b"
         name = (
             f"factor_{suffix}_accuracy"

@@ -136,6 +136,27 @@ def test_speech_manifest_falls_back_to_pcm16_wav(
     torch.testing.assert_close(audio, expected[0], atol=1 / 32_768, rtol=0)
 
 
+def test_factor_accuracy_names_retargeted_later_codebooks() -> None:
+    metrics: dict[str, float] = {}
+    predicted = torch.tensor([[[1, 2], [3, 4], [5, 6]]])
+    labels = torch.tensor([[[1, 0], [3, 4], [0, 6]]])
+    valid = torch.tensor([[True, True, False]])
+
+    eval_artifact_set._factor_accuracy(
+        metrics,
+        predicted,
+        labels,
+        valid,
+        prefix="retargeted_",
+        codebook_offset=1,
+    )
+
+    assert metrics == {
+        "retargeted_codebook_1_factor_a_accuracy": 1.0,
+        "retargeted_codebook_1_factor_b_accuracy": 0.5,
+    }
+
+
 def test_eval_artifact_generates_seeded_pair_metrics() -> None:
     backend = EvalBackend(AcousticLayout.FRAME_ALIGNED)
     batch = _pair(AcousticLayout.FRAME_ALIGNED)
