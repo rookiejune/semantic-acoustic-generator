@@ -5,7 +5,7 @@
 - 日期：2026-07-27。
 - 机器：复旦 145，NVIDIA RTX 4090D；LongCat decode 在同机完成。
 - 数据：Qwen fixed-speaker `vivian` 的 prepared target sample 0。
-- 训练：当前 `semantic-acoustic-codec` package，8-layer decoder，seed 0，batch size 1，
+- 训练：当前 `semantic-acoustic-generator` package，8-layer decoder，seed 0，batch size 1，
   `lr=1e-3`，weight decay 0，20 optimizer steps，bf16 mixed precision。
 - 入口：`scripts/train.py experiment=overfit`；overfit preset 关闭周期 checkpoint，训练结束只导出
   semantic codec artifact。

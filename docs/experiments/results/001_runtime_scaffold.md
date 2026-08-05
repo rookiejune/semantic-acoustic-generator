@@ -5,7 +5,8 @@ codec oracle 细节。
 
 已完成：
 
-- 建立 `semantic_acoustic_codec` package、README 和设计文档。
+- 建立 generator 初始 package、README 和设计文档；package 当时名为
+  `semantic_acoustic_codec`，现已迁移为 `semantic_acoustic_generator`。
 - 迁移/改写 `speech-to-speech` codec oracle 中的 shared semantic conditioner、DiT/FM backbone、RVQ decoder 和三类 masked loss。
 - 添加 LongCat prepared code parser：按 `[frame, codebook]` 拆分 `codes[..., :1]` semantic 和
   `codes[..., 1:]` acoustic RVQ codebooks。

@@ -5,10 +5,10 @@
 ## Anydataset batching 迁移验证
 
 - anydataset commit `813b9f7` 通过标准 `batch_sampler.sampler.set_epoch()` 契约暴露
-  dataset-owned shuffle epoch；semantic-acoustic-codec commit `0e1ddd9` 改用
+  dataset-owned shuffle epoch；semantic-acoustic-generator commit `0e1ddd9` 改用
   `MapStyleABC.dataloader(...)`，并从依赖、配置、job 和实验 wrapper 移除
   length-based batching adapter。
-- 本地 semantic-acoustic-codec 验证为 `70 passed`，ruff 与 basedpyright 均通过；真实
+- 本地 semantic-acoustic-generator 验证为 `70 passed`，ruff 与 basedpyright 均通过；真实
   Lightning 集成测试完成两个无长度 dynamic-loader epoch，规划 epoch 为 `[0, 1]`。
 - `145` 上使用实际 codec store 的目标测试为 `2 passed`。32 秒 hard limit 对 LongCat 和
   BiCodec 都从前 984 pairs 过滤 4 条，训练集合为 980 pairs。

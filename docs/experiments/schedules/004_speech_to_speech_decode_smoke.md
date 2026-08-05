@@ -2,14 +2,14 @@
 
 ## 目标
 
-在 `speech-to-speech` 的真实 generation 路径中加载 semantic-acoustic-codec artifact，验证
+在 `speech-to-speech` 的真实 generation 路径中加载 semantic-acoustic-generator artifact，验证
 `model/acoustic=none` 时只依赖生成的 LongCat semantic codes 也能完成 waveform decode。
 
 本实验只验证两个仓库之间的 runtime 契约，不验证 token model 收敛、语音可懂度或音质。
 
 ## 输入
 
-- semantic-acoustic-codec artifact：LongCat FM 8-layer single-sample overfit artifact。
+- semantic-acoustic-generator artifact：LongCat FM 8-layer single-sample overfit artifact。
 - speech-to-speech codec：LongCat native semantic/acoustic backend。
 - speech-to-speech model/data：toy token model 与 toy sample。
 - task：TTS。

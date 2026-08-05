@@ -61,7 +61,7 @@ event 中的 WAV 另外通过 Python `wave` 和 NumPy 解码验证：单声道�
 
 ## 结论边界
 
-`speech-to-speech` 已在 `model/acoustic=none` 下通过 semantic-acoustic-codec artifact 完成一条真实
+`speech-to-speech` 已在 `model/acoustic=none` 下通过 semantic-acoustic-generator artifact 完成一条真实
 TTS generation waveform decode。`features=null`、acoustic decoder 参数量为 0，且 event 内 WAV
 可独立解码，验证了 semantic-only runtime 接入闭环。
 
