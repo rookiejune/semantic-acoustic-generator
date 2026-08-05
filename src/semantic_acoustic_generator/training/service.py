@@ -175,6 +175,7 @@ def build_session(config: DictConfig | TrainConfig) -> TrainingSession:
         reference_dropout=config.pl_module.reference_dropout,
         validation_seed=config.pl_module.validation_seed,
         finite_loss_check_interval=config.pl_module.finite_loss_check_interval,
+        residual_retarget=config.pl_module.residual_retarget,
         repa_teacher=repa_teacher,
     )
 

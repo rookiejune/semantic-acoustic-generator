@@ -28,6 +28,8 @@ from semantic_acoustic_generator.model.dit import DiTDecoder
 from semantic_acoustic_generator.model.rvq import AcousticRVQDecoder, FactorDepthPredictor
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torch import Tensor
 
     from semantic_acoustic_generator.loss.repa import Teacher
@@ -112,7 +114,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
                 buffer = nn.Buffer(value.detach().clone())
                 setattr(self, name, buffer)
             self._factor_codebook_names = names
-            if self.factor_predictor is FactorPredictor.DEPTH_AR:
+            if self.factor_predictor is not FactorPredictor.PARALLEL:
                 anchor_output_dim = config.anchor_hidden_dim
                 self.factor_depth = FactorDepthPredictor(
                     config.anchor_hidden_dim,
@@ -121,6 +123,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
                     layers=config.layers,
                     heads=config.heads,
                     ffn_ratio=config.ffn_ratio,
+                    recurrent=self.factor_predictor is FactorPredictor.DEPTH_RECURRENT,
                 )
             else:
                 anchor_output_dim = sum(value.size(0) for value in factor_codebooks)
@@ -286,6 +289,8 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         repa_teacher: Teacher | None = None,
         factor_targets: Tensor | None = None,
         factor_codebooks: tuple[Tensor, ...] | None = None,
+        factor_targeter: Callable[[int, Tensor], Tensor] | None = None,
+        include_details: bool = True,
     ) -> DecoderLoss:
         target_mask = batch.acoustic_mask
         target_condition, _ = _aligned_condition(
@@ -312,7 +317,9 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             repa_features=repa_features,
             factor_targets=factor_targets,
             factor_codebooks=factor_codebooks,
+            factor_targeter=factor_targeter,
             validate=False,
+            include_details=include_details,
         )
 
     def feature_loss_from_condition(
@@ -327,6 +334,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         flow_runtime: FlowRuntime | None = None,
         factor_targets: Tensor | None = None,
         factor_codebooks: tuple[Tensor, ...] | None = None,
+        factor_targeter: Callable[[int, Tensor], Tensor] | None = None,
         validate: bool = True,
         include_details: bool = True,
     ) -> DecoderLoss:
@@ -337,6 +345,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
                 condition,
                 target_mask,
                 factor_targets=factor_targets,
+                factor_targeter=factor_targeter,
                 validate=validate,
                 include_details=include_details,
             )
@@ -465,6 +474,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         target_mask: Tensor,
         *,
         factor_targets: Tensor | None,
+        factor_targeter: Callable[[int, Tensor], Tensor] | None,
         validate: bool,
         include_details: bool,
     ) -> DecoderLoss:
@@ -482,11 +492,21 @@ class FMFeatureGenerator(AcousticUnitGenerator):
                 include_details=include_details,
             )
         else:
-            packed = self.factor_depth.forward_packed(
-                anchor,
-                factor_targets,
-                mask=target_mask,
-                validate=validate,
+            packed = (
+                self.factor_depth.forward_packed(
+                    anchor,
+                    factor_targets,
+                    mask=target_mask,
+                    validate=validate,
+                )
+                if factor_targeter is None
+                else self.factor_depth.forward_packed_retargeted(
+                    anchor,
+                    factor_targets,
+                    factor_targeter,
+                    mask=target_mask,
+                    validate=validate,
+                )
             )
             factor = self.anchor_factor_loss.forward_packed(
                 packed,

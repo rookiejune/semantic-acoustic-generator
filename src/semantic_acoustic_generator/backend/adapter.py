@@ -10,6 +10,15 @@ from torch.nn import functional as F
 from semantic_acoustic_generator.config import FeatureAdapter
 
 
+class _ResidualFactorTargeter:
+    def __init__(self, adapter: LongCatCodebookAdapter, target: Tensor) -> None:
+        self.adapter = adapter
+        self.target = target
+
+    def __call__(self, stage: int, prefix: Tensor) -> Tensor:
+        return self.adapter._retarget_factor_pair(self.target, prefix, stage=stage)
+
+
 class LongCatCodebookAdapter(nn.Module):
     """Expose selected LongCat factor embeddings as frame-aligned acoustic features."""
 
@@ -161,29 +170,24 @@ class LongCatCodebookAdapter(nn.Module):
         output = predicted_factors.clone()
         for stage_index in range(1, self.feature_codebooks):
             prefix = output[..., : stage_index * 2]
-            projected = self._project_factor_codes(prefix, stages=stage_index)
-            residual = (target - projected).transpose(1, 2).contiguous()
-            stage = self._stages()[stage_index]
-            result = stage(residual)
-            if (
-                not isinstance(result, tuple)
-                or len(result) < 4
-                or not isinstance(result[3], Tensor)
-            ):
-                raise TypeError("LongCat quantizer stage must return code indices at position 3.")
-            composite = result[3]
-            if composite.shape != acoustic_codes.shape[:2]:
-                raise ValueError("LongCat residual code indices must align on batch and time.")
-            size_b = self._factor_sizes[stage_index][1]
-            output[..., stage_index * 2] = torch.div(
-                composite,
-                size_b,
-                rounding_mode="floor",
-            ).to(device=output.device)
-            output[..., stage_index * 2 + 1] = composite.remainder(size_b).to(
-                device=output.device
+            output[..., stage_index * 2 : stage_index * 2 + 2] = (
+                self._retarget_factor_pair(target, prefix, stage=stage_index)
             )
         return output
+
+    @torch.no_grad()
+    def residual_factor_targeter(
+        self,
+        acoustic_codes: Tensor,
+        mask: Tensor,
+    ) -> _ResidualFactorTargeter:
+        if mask.shape != acoustic_codes.shape[:2] or mask.dtype != torch.bool:
+            raise ValueError("residual factor target mask must be boolean and frame-aligned.")
+        if mask.device != acoustic_codes.device:
+            raise ValueError("residual factor target mask and codes must share a device.")
+        packed_codes = acoustic_codes[mask]
+        target = self.backend.acoustic_codes_to_features(packed_codes[:, None])[:, 0]
+        return _ResidualFactorTargeter(self, target)
 
     @torch.no_grad()
     def factor_codes(self, acoustic_codes: Tensor) -> Tensor:
@@ -297,6 +301,42 @@ class LongCatCodebookAdapter(nn.Module):
         if projected is None:
             raise RuntimeError("LongCat factor projection requires at least one stage.")
         return projected.transpose(1, 2).contiguous()
+
+    def _retarget_factor_pair(
+        self,
+        target: Tensor,
+        prefix: Tensor,
+        *,
+        stage: int,
+    ) -> Tensor:
+        if not 0 < stage < self.feature_codebooks:
+            raise ValueError("residual factor stage must follow a non-empty generated prefix.")
+        packed = prefix.dim() == 2
+        prefix_frames = prefix[:, None] if packed else prefix
+        target_frames = target[:, None] if packed else target
+        if target_frames.dim() != 3 or target_frames.shape[:2] != prefix_frames.shape[:2]:
+            raise ValueError("residual target and factor prefix must align on batch and time.")
+        projected = self._project_factor_codes(prefix_frames, stages=stage)
+        residual = (target_frames - projected).transpose(1, 2).contiguous()
+        result = self._stages()[stage](residual)
+        if (
+            not isinstance(result, tuple)
+            or len(result) < 4
+            or not isinstance(result[3], Tensor)
+        ):
+            raise TypeError("LongCat quantizer stage must return code indices at position 3.")
+        composite = result[3]
+        if composite.shape != prefix_frames.shape[:2]:
+            raise ValueError("LongCat residual code indices must align on batch and time.")
+        size_b = self._factor_sizes[stage][1]
+        pair = torch.stack(
+            (
+                torch.div(composite, size_b, rounding_mode="floor"),
+                composite.remainder(size_b),
+            ),
+            dim=-1,
+        ).to(device=prefix.device)
+        return pair[:, 0] if packed else pair
 
     def _validate_factor_codes(self, factor_codes: Tensor, *, stages: int) -> None:
         if factor_codes.dim() != 3 or factor_codes.size(-1) != stages * 2:

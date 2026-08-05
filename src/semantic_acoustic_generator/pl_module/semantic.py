@@ -15,7 +15,7 @@ from anytrain.lightning import LightningLogMixin
 from lightning import LightningModule
 
 from semantic_acoustic_generator.backend import LongCatCodebookAdapter, adapt_backend
-from semantic_acoustic_generator.config import AnchorTarget, Route
+from semantic_acoustic_generator.config import AnchorTarget, FactorPredictor, Route
 from semantic_acoustic_generator.loss.repa import decode_group_metrics
 from semantic_acoustic_generator.model.decoder import FMFeatureGenerator, RVQCodeGenerator
 from semantic_acoustic_generator.runtime.artifact import save_artifact
@@ -27,6 +27,7 @@ from semantic_acoustic_generator.runtime.semantic import (
 from semantic_acoustic_generator.types import GeneratorBatch
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
     from typing import Any
 
@@ -63,6 +64,7 @@ class GeneratorModule(LightningLogMixin, LightningModule):
         reference_dropout: float = 0.5,
         validation_seed: int = 0,
         finite_loss_check_interval: int = 100,
+        residual_retarget: bool = False,
         repa_teacher: Teacher | None = None,
     ) -> None:
         super().__init__()
@@ -85,6 +87,8 @@ class GeneratorModule(LightningLogMixin, LightningModule):
             raise TypeError("finite_loss_check_interval must be an integer.")
         if finite_loss_check_interval <= 0:
             raise ValueError("finite_loss_check_interval must be positive.")
+        if not isinstance(residual_retarget, bool):
+            raise TypeError("residual_retarget must be a boolean.")
         if support.route is not config.route:
             raise ValueError("module config route must match support route.")
         repa_weight = config.decoder.repa_loss_weight
@@ -98,6 +102,13 @@ class GeneratorModule(LightningLogMixin, LightningModule):
             and repa_teacher.feature_dim != config.decoder.repa_feature_dim
         ):
             raise ValueError("REPA teacher feature_dim must match repa_feature_dim.")
+        if residual_retarget and (
+            not isinstance(backend, LongCatCodebookAdapter)
+            or config.decoder.factor_predictor is not FactorPredictor.DEPTH_RECURRENT
+        ):
+            raise ValueError(
+                "residual retargeting requires a LongCat recurrent factor predictor."
+            )
         self.support = support
         self._backend = _ExternalDependency(backend)
         _freeze_backend(backend)
@@ -110,6 +121,7 @@ class GeneratorModule(LightningLogMixin, LightningModule):
         self.reference_dropout = float(reference_dropout)
         self.validation_seed = validation_seed
         self.finite_loss_check_interval = finite_loss_check_interval
+        self.residual_retarget = residual_retarget
         self._finite_training_loss_ok: Tensor | None = None
         self._finite_training_loss_name: str | None = None
 
@@ -156,6 +168,7 @@ class GeneratorModule(LightningLogMixin, LightningModule):
                 target_features = self._target_features(batch)
         condition, reference_rows = self._condition(batch)
         if feature_generator is not None:
+            factor_targets = self._factor_targets(batch)
             output = feature_generator.loss(
                 batch,
                 condition,
@@ -163,8 +176,10 @@ class GeneratorModule(LightningLogMixin, LightningModule):
                 feature_mean=self.support.feature_mean,
                 feature_std=self.support.feature_std,
                 repa_teacher=self.repa_teacher,
-                factor_targets=self._factor_targets(batch),
+                factor_targets=factor_targets,
                 factor_codebooks=self._factor_codebooks(),
+                factor_targeter=self._factor_targeter(batch),
+                include_details=self._include_factor_details(feature_generator),
             )
         else:
             generator = self.support.generator
@@ -228,6 +243,12 @@ class GeneratorModule(LightningLogMixin, LightningModule):
                 )
         result: dict[str, Any] = {"loss": output.loss, **output.items}
         return result
+
+    def _include_factor_details(self, generator: FMFeatureGenerator) -> bool:
+        if generator.anchor_target is not AnchorTarget.FACTOR or self._trainer is None:
+            return True
+        interval = int(getattr(self.trainer, "log_every_n_steps", 1))
+        return (self.global_step + 1) % interval == 0
 
     @torch.no_grad()
     def validation_step(self, batch: GeneratorBatch, batch_idx: int) -> dict[str, Tensor]:
@@ -527,6 +548,19 @@ class GeneratorModule(LightningLogMixin, LightningModule):
             return None
         return self.backend.factor_codebooks
 
+    def _factor_targeter(
+        self,
+        batch: GeneratorBatch,
+    ) -> Callable[[int, Tensor], Tensor] | None:
+        if not self.residual_retarget:
+            return None
+        if not isinstance(self.backend, LongCatCodebookAdapter):
+            raise RuntimeError("residual retargeting requires a LongCat codebook adapter.")
+        return self.backend.residual_factor_targeter(
+            batch.acoustic_codes,
+            batch.acoustic_mask,
+        )
+
 
 @torch.no_grad()
 def build_module(
@@ -542,6 +576,7 @@ def build_module(
     reference_dropout: float = 0.5,
     validation_seed: int = 0,
     finite_loss_check_interval: int = 100,
+    residual_retarget: bool = False,
     repa_teacher: Teacher | None = None,
 ) -> GeneratorModule:
     backend = adapt_backend(
@@ -583,6 +618,7 @@ def build_module(
         reference_dropout=reference_dropout,
         validation_seed=validation_seed,
         finite_loss_check_interval=finite_loss_check_interval,
+        residual_retarget=residual_retarget,
         repa_teacher=repa_teacher,
     )
 

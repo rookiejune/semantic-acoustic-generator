@@ -72,9 +72,15 @@ def test_depth_ar_factor_predictor_requires_factor_target() -> None:
     assert DecoderConfig().factor_predictor is FactorPredictor.PARALLEL
     with pytest.raises(
         ValueError,
-        match="factor_predictor=depth_ar requires anchor_target=factor",
+        match="depth factor predictors require anchor_target=factor",
     ):
         DecoderConfig(factor_predictor=FactorPredictor.DEPTH_AR)
+
+    with pytest.raises(
+        ValueError,
+        match="depth factor predictors require anchor_target=factor",
+    ):
+        DecoderConfig(factor_predictor=FactorPredictor.DEPTH_RECURRENT)
 
 
 def test_decoder_options_parses_depth_ar_factor_predictor() -> None:
@@ -90,6 +96,21 @@ def test_decoder_options_parses_depth_ar_factor_predictor() -> None:
     )
 
     assert config.factor_predictor is FactorPredictor.DEPTH_AR
+
+
+def test_decoder_options_parses_recurrent_factor_predictor() -> None:
+    config = decoder_options(
+        {
+            "layers": 2,
+            "heads": 8,
+            "ffn_ratio": 2,
+            "fm_mode": "anchor",
+            "anchor_target": "factor",
+            "factor_predictor": "depth_recurrent",
+        }
+    )
+
+    assert config.factor_predictor is FactorPredictor.DEPTH_RECURRENT
 
 
 def test_decoder_options_rejects_non_finite_repa_weight() -> None:
@@ -323,6 +344,37 @@ def test_longcat_factor_scale_experiment_is_frame_aligned() -> None:
     assert config.datamodule.batch_size == 16
     assert config.pl_module.normalize_features is False
     assert config.trainer.max_steps == 2000
+
+
+def test_longcat_factor_recurrent_experiment_is_formal_and_frame_aligned() -> None:
+    config = parse_train_config(_compose("experiment=015_longcat_factor_recurrent"))
+
+    assert config.model.feature_adapter is FeatureAdapter.LONGCAT_CODEBOOKS
+    assert config.model.feature_codebooks == 2
+    assert config.model.decoder.factor_predictor is FactorPredictor.DEPTH_RECURRENT
+    assert config.model.decoder.ffn_ratio == 2
+    assert config.datamodule.batch_size == 32
+    assert config.datamodule.batching.enabled is True
+    assert config.datamodule.batching.max_batch_seconds == 384.0
+    assert config.pl_module.finite_loss_check_interval == 100
+    assert config.pl_module.residual_retarget is True
+    assert config.callback.performance.enabled is False
+    assert config.trainer.max_steps == 20000
+
+
+def test_residual_retarget_requires_recurrent_factor_predictor() -> None:
+    raw = _compose(
+        "model.feature_adapter=longcat_first_codebook",
+        "model.decoder.fm_mode=anchor",
+        "model.decoder.anchor_target=factor",
+        "pl_module.residual_retarget=true",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="residual_retarget requires factor_predictor=depth_recurrent",
+    ):
+        parse_train_config(raw)
 
 
 def test_longcat_transformer_anchor_experiment_is_frame_aligned() -> None:

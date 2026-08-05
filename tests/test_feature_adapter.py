@@ -284,6 +284,28 @@ def test_longcat_factor_adapter_retargets_later_residual_stages() -> None:
     assert features.shape == (1, 2, 48)
 
 
+def test_longcat_factor_adapter_builds_packed_residual_targeter() -> None:
+    backend = _LongCat()
+    adapted = LongCatCodebookAdapter(backend, codebooks=2)
+    backend._decoder().acoustic_quantizer.quantizers[1].retarget_code = 2 * 90 + 3
+    acoustic = torch.tensor([[[90, 180, 270], [360, 450, 540]]], dtype=torch.long)
+    mask = torch.tensor([[True, False]])
+    converted: list[torch.Size] = []
+    convert = backend.acoustic_codes_to_features
+
+    def capture(codes: torch.Tensor) -> torch.Tensor:
+        converted.append(codes.shape)
+        return convert(codes)
+
+    backend.acoustic_codes_to_features = capture
+    targeter = adapted.residual_factor_targeter(acoustic, mask)
+
+    pair = targeter(1, torch.tensor([[7, 8]], dtype=torch.long))
+
+    assert converted == [torch.Size([1, 1, 3])]
+    assert torch.equal(pair, torch.tensor([[2, 3]]))
+
+
 def test_longcat_first_codebook_adapter_snaps_each_factor_by_cosine() -> None:
     backend = _LongCat()
     adapted = LongCatFirstCodebookAdapter(backend)
@@ -572,3 +594,44 @@ def test_depth_factor_artifact_roundtrip(
         loaded.generator.sample_factor_codes(condition, mask),
         expected,
     )
+
+
+def test_recurrent_factor_artifact_roundtrip(tmp_path) -> None:
+    backend = _LongCat()
+    adapted = LongCatCodebookAdapter(backend, codebooks=2)
+    config = GeneratorConfig(
+        route=Route.FM,
+        condition_dim=4,
+        feature_adapter=FeatureAdapter.LONGCAT_CODEBOOKS,
+        feature_codebooks=2,
+        decoder=DecoderConfig(
+            hidden_dim=4,
+            layers=2,
+            heads=1,
+            ffn_ratio=2,
+            fm_mode=FMMode.ANCHOR,
+            anchor_target=AnchorTarget.FACTOR,
+            factor_predictor=FactorPredictor.DEPTH_RECURRENT,
+            anchor_hidden_dim=4,
+            anchor_layers=1,
+        ),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=adapted.semantic_codebook,
+        codec_spec=semantic_acoustic_spec(adapted),
+        factor_codebooks=adapted.factor_codebooks,
+    )
+    condition = torch.randn(1, 3, 4)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    expected = support.generator.sample_factor_codes(condition, mask)
+    save_artifact(tmp_path, support, backend=backend)
+
+    loaded = load_artifact(tmp_path)
+
+    assert loaded.config is not None
+    assert loaded.config.decoder.factor_predictor is FactorPredictor.DEPTH_RECURRENT
+    assert isinstance(loaded.generator, FMFeatureGenerator)
+    assert loaded.generator.factor_depth is not None
+    assert loaded.generator.factor_depth.recurrent is True
+    torch.testing.assert_close(loaded.generator.sample_factor_codes(condition, mask), expected)

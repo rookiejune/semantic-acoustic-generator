@@ -1,0 +1,83 @@
+# @package _global_
+defaults:
+  - override /backend: longcat
+  - override /datamodule: qwen_fixed_speaker
+  - override /model: default
+  - override /model/route: fm
+  - override /loss: default
+  - override /pl_module: default
+  - override /runtime: default
+  - override /callback: default
+  - override /trainer: default
+  - _self_
+
+output_subdir: 015/depth-recurrent-2cb-${datamodule.sample_limit}-${trainer.max_steps}
+
+datamodule:
+  sample_limit: 10000
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  fixed_batch: false
+  batching:
+    enabled: true
+    max_batch_seconds: 384.0
+    planning_window: 512
+    prefetch_factor: 2
+    drop_distributed_tail: true
+    seed: 0
+
+model:
+  condition_dim: 512
+  feature_adapter: longcat_codebooks
+  feature_codebooks: 2
+  decoder:
+    hidden_dim: 512
+    layers: 2
+    heads: 8
+    ffn_ratio: 2
+    fm_mode: anchor
+    anchor_context: local
+    anchor_target: factor
+    factor_predictor: depth_recurrent
+    anchor_hidden_dim: 512
+    anchor_layers: 4
+    anchor_kernel_size: 3
+
+pl_module:
+  normalize_features: false
+  learning_rate: 1e-3
+  weight_decay: 0.0
+  reference_dropout: 1.0
+  finite_loss_check_interval: 100
+  residual_retarget: true
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  precision: bf16-mixed
+  max_steps: 20000
+  max_epochs: -1
+  log_every_n_steps: 10
+  gradient_clip_val: 1.0
+
+callback:
+  sample:
+    enabled: true
+    every_n_train_steps: 5000
+  performance:
+    enabled: false
+  data_throughput:
+    enabled: true
+    log_every_n_steps: 100
+    warmup_steps: 20
+    measure_window_steps: 100
+  loss_time_bucket:
+    enabled: false
+  checkpoint:
+    enabled: true
+    save_last: true
+    save_top_k: -1
+    every_n_train_steps: 5000

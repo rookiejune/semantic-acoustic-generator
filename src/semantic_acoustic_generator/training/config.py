@@ -91,6 +91,7 @@ class PLModuleConfig:
     reference_dropout: float = 0.5
     validation_seed: int = 0
     finite_loss_check_interval: int = 100
+    residual_retarget: bool = False
     ema_decay: float | None = None
     ema_update_after_step: int = 0
 
@@ -105,6 +106,7 @@ class PLModuleConfig:
             self.finite_loss_check_interval,
             "pl_module.finite_loss_check_interval",
         )
+        _boolean(self.residual_retarget, "pl_module.residual_retarget")
         _optional_positive_number(self.ema_decay, "pl_module.ema_decay")
         _non_negative_integer(self.ema_update_after_step, "pl_module.ema_update_after_step")
 
@@ -348,6 +350,12 @@ class TrainConfig:
             )
         if self.model.route is not Route.FM and self.model.decoder.fm_mode is not FMMode.FLOW:
             raise ValueError("model.decoder.fm_mode is only supported by model.route=fm.")
+        if self.pl_module.residual_retarget and (
+            self.model.decoder.factor_predictor is not FactorPredictor.DEPTH_RECURRENT
+        ):
+            raise ValueError(
+                "pl_module.residual_retarget requires factor_predictor=depth_recurrent."
+            )
 
 
 def parse_train_config(config: DictConfig | TrainConfig) -> TrainConfig:

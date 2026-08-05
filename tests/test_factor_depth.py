@@ -67,6 +67,18 @@ def _predictor(
     )
 
 
+def _recurrent_predictor(*, stages: int = 2) -> FactorDepthPredictor:
+    return FactorDepthPredictor(
+        6,
+        _codebooks(stages),
+        hidden_dim=8,
+        layers=2,
+        heads=1,
+        ffn_ratio=2,
+        recurrent=True,
+    )
+
+
 def test_factor_depth_packs_valid_frames_and_preserves_factor_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -184,6 +196,51 @@ def test_factor_depth_generation_uses_both_greedy_factors_for_the_next_stage(
         (predictor.factor_codebooks[0][1], predictor.factor_codebooks[1][2])
     ).expand(int(mask.sum()), -1)
     torch.testing.assert_close(captured[0], expected_embedding)
+
+
+def test_recurrent_factor_depth_preserves_stage_causality_and_generation() -> None:
+    predictor = _recurrent_predictor()
+    condition = torch.randn(1, 2, 6)
+    targets = torch.tensor([[[0, 0, 0, 0], [1, 1, 1, 1]]])
+    baseline = predictor(condition, targets)
+
+    changed = targets.clone()
+    changed[..., :2] = torch.tensor([2, 3])
+    logits = predictor(condition, changed)
+
+    assert torch.equal(baseline[0], logits[0])
+    assert torch.equal(baseline[1], logits[1])
+    assert not torch.equal(baseline[2], logits[2])
+    assert not torch.equal(baseline[3], logits[3])
+    generated = predictor.generate(condition)
+    assert generated.shape == targets.shape
+    assert predictor.decoder is None
+    assert len(predictor.recurrent_blocks) == 2
+    assert isinstance(predictor.recurrent_output_norm, nn.LayerNorm)
+
+
+def test_recurrent_factor_depth_retargets_labels_from_generated_prefix() -> None:
+    predictor = _recurrent_predictor()
+    with torch.no_grad():
+        for head in predictor.heads:
+            head.weight.zero_()
+            head.bias.zero_()
+        predictor.heads[0].bias[1] = 5
+        predictor.heads[1].bias[2] = 5
+    condition = torch.randn(1, 2, 6)
+    targets = torch.tensor([[[0, 0, 0, 0], [1, 1, 1, 1]]])
+    prefixes: list[torch.Tensor] = []
+
+    def targeter(stage: int, prefix: torch.Tensor) -> torch.Tensor:
+        assert stage == 1
+        prefixes.append(prefix.detach().clone())
+        return torch.tensor([3, 4]).expand(prefix.size(0), -1)
+
+    packed = predictor.forward_packed_retargeted(condition, targets, targeter)
+
+    assert packed.labels is not None
+    assert torch.equal(packed.labels, torch.tensor([[0, 0, 3, 4], [1, 1, 3, 4]]))
+    assert torch.equal(prefixes[0], torch.tensor([[1, 2], [1, 2]]))
 
 
 def test_factor_depth_backpropagates_through_all_parallel_heads_and_moves_buffers(
@@ -327,6 +384,8 @@ def test_factor_depth_loss_keeps_valid_frames_packed(
         mask,
         target_features=None,
         factor_targets=targets,
+        include_details=False,
     )
 
     assert output.loss.isfinite()
+    assert output.items["anchor_factor"].details is None

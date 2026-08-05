@@ -40,6 +40,7 @@ class AnchorTarget(StrEnum):
 class FactorPredictor(StrEnum):
     PARALLEL = auto()
     DEPTH_AR = auto()
+    DEPTH_RECURRENT = auto()
 
 
 class Initialization(StrEnum):
@@ -124,11 +125,10 @@ class DecoderConfig:
             raise ValueError("anchor_factor_temperature must be positive.")
         if self.anchor_target is AnchorTarget.FACTOR and self.fm_mode is not FMMode.ANCHOR:
             raise ValueError("anchor_target=factor requires fm_mode=anchor.")
-        if (
-            self.factor_predictor is FactorPredictor.DEPTH_AR
-            and self.anchor_target is not AnchorTarget.FACTOR
+        if self.factor_predictor is not FactorPredictor.PARALLEL and (
+            self.anchor_target is not AnchorTarget.FACTOR
         ):
-            raise ValueError("factor_predictor=depth_ar requires anchor_target=factor.")
+            raise ValueError("depth factor predictors require anchor_target=factor.")
         if self.fm_mode is not FMMode.FLOW and self.repa_loss_weight > 0:
             raise ValueError("REPA is only supported by fm_mode=flow.")
 

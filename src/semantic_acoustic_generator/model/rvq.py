@@ -10,7 +10,7 @@ from torch import nn
 from semantic_acoustic_generator._tensor import is_signed_integer_dtype
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from torch import Tensor
 
@@ -266,6 +266,7 @@ class FactorDepthPredictor(nn.Module):
         layers: int = 4,
         heads: int = 8,
         ffn_ratio: int = 4,
+        recurrent: bool = False,
     ) -> None:
         super().__init__()
         if condition_dim <= 0:
@@ -275,11 +276,14 @@ class FactorDepthPredictor(nn.Module):
         hidden_dim = condition_dim if hidden_dim is None else hidden_dim
         if hidden_dim <= 0:
             raise ValueError("predictor hidden dimension must be positive.")
+        if not isinstance(recurrent, bool):
+            raise TypeError("recurrent must be a boolean.")
 
         values = tuple(factor_codebooks)
         _validate_factor_codebooks(values)
         self.condition_dim = condition_dim
         self.hidden_dim = hidden_dim
+        self.recurrent = recurrent
         self.stages = len(values) // 2
         self.factors = len(values)
         self.factor_sizes = tuple(value.size(0) for value in values)
@@ -303,13 +307,26 @@ class FactorDepthPredictor(nn.Module):
             )
             for stage in range(self.stages - 1)
         )
-        self.decoder = _qwen3_model(
-            hidden_dim=hidden_dim,
-            ffn_ratio=ffn_ratio,
-            layers=layers,
-            attention_heads=_heads(hidden_dim, heads),
+        self.decoder = (
+            None
+            if recurrent
+            else _qwen3_model(
+                hidden_dim=hidden_dim,
+                ffn_ratio=ffn_ratio,
+                layers=layers,
+                attention_heads=_heads(hidden_dim, heads),
+            )
         )
-        self.decoder.embed_tokens.requires_grad_(False)
+        if self.decoder is not None:
+            self.decoder.embed_tokens.requires_grad_(False)
+        self.recurrent_blocks = (
+            nn.ModuleList(
+                _FactorDepthBlock(hidden_dim, ffn_ratio=ffn_ratio) for _ in range(layers)
+            )
+            if recurrent
+            else nn.ModuleList()
+        )
+        self.recurrent_output_norm = nn.LayerNorm(hidden_dim) if recurrent else nn.Identity()
         self.heads = nn.ModuleList(nn.Linear(hidden_dim, size) for size in self.factor_sizes)
 
     @property
@@ -375,6 +392,77 @@ class FactorDepthPredictor(nn.Module):
         )
         return packed
 
+    def forward_packed_retargeted(
+        self,
+        condition: Tensor,
+        factor_targets: Tensor,
+        targeter: Callable[[int, Tensor], Tensor],
+        *,
+        mask: Tensor | None = None,
+        validate: bool = True,
+    ) -> PackedCodebookLogits:
+        """Train recurrent stages on generated prefixes and recomputed residual labels."""
+        if not self.recurrent:
+            raise RuntimeError("residual retargeting requires the recurrent depth predictor.")
+        if not callable(targeter):
+            raise TypeError("factor targeter must be callable.")
+        if validate:
+            self._validate_condition(condition)
+        frame_mask = _frame_mask(condition, mask, validate=validate)
+        frame_indices = frame_mask.flatten().nonzero().flatten()
+        if validate:
+            _validate_factor_targets(
+                factor_targets,
+                condition,
+                self.factor_sizes,
+                frame_indices,
+            )
+        original = factor_targets.flatten(0, 1).index_select(0, frame_indices)
+        packed_condition = condition.flatten(0, 1).index_select(0, frame_indices)
+        state = self.condition(packed_condition) + self.stage_bos[0]
+        logits: list[Tensor] = []
+        labels: list[Tensor] = []
+        prefix: list[Tensor] = []
+        previous_pair: Tensor | None = None
+        for stage in range(self.stages):
+            if stage > 0:
+                if previous_pair is None:
+                    raise RuntimeError("retargeted factor predictor lost its generated prefix.")
+                state = state + self.stage_bos[stage] + self._stage_embedding(
+                    stage - 1,
+                    previous_pair,
+                )
+            for block in self.recurrent_blocks:
+                state = block(state)
+            head_state = self.recurrent_output_norm(state)
+            pair_logits = tuple(
+                cast(nn.Linear, cast(object, self.heads[stage * 2 + side]))(head_state)
+                for side in range(2)
+            )
+            logits.extend(pair_logits)
+            if stage == 0:
+                pair_labels = original[..., :2]
+            else:
+                pair_labels = targeter(stage, torch.cat(prefix, dim=-1))
+                if validate:
+                    _validate_retargeted_pair(
+                        pair_labels,
+                        rows=state.size(0),
+                        sizes=self.factor_sizes[stage * 2 : stage * 2 + 2],
+                    )
+            labels.append(pair_labels)
+            previous_pair = torch.stack(
+                tuple(value.detach().argmax(dim=-1) for value in pair_logits),
+                dim=-1,
+            )
+            prefix.append(previous_pair)
+        return PackedCodebookLogits(
+            logits=tuple(logits),
+            labels=torch.cat(labels, dim=-1),
+            row_indices=frame_indices.div(condition.size(1), rounding_mode="floor"),
+            batch_size=condition.size(0),
+        )
+
     def _forward_packed(
         self,
         condition: Tensor,
@@ -398,19 +486,11 @@ class FactorDepthPredictor(nn.Module):
         packed_condition = condition.flatten(0, 1).index_select(0, frame_indices)
         condition_hidden = self.condition(packed_condition)
 
-        inputs = [condition_hidden + self.stage_bos[0]]
-        for stage in range(1, self.stages):
-            previous = packed_targets[..., (stage - 1) * 2 : stage * 2]
-            inputs.append(
-                condition_hidden
-                + self.stage_bos[stage]
-                + self._stage_embedding(stage - 1, previous)
-            )
-        hidden = self.decoder(
-            inputs_embeds=torch.stack(inputs, dim=1),
-            use_cache=False,
-            return_dict=True,
-        ).last_hidden_state
+        hidden = (
+            self._recurrent_hidden(condition_hidden, packed_targets)
+            if self.recurrent
+            else self._transformer_hidden(condition_hidden, packed_targets)
+        )
         logits = tuple(
             cast(nn.Linear, cast(object, self.heads[factor]))(
                 hidden[..., factor // 2, :]
@@ -431,6 +511,38 @@ class FactorDepthPredictor(nn.Module):
             frame_indices,
         )
 
+    def _transformer_hidden(self, condition_hidden: Tensor, packed_targets: Tensor) -> Tensor:
+        inputs = [condition_hidden + self.stage_bos[0]]
+        for stage in range(1, self.stages):
+            previous = packed_targets[..., (stage - 1) * 2 : stage * 2]
+            inputs.append(
+                condition_hidden
+                + self.stage_bos[stage]
+                + self._stage_embedding(stage - 1, previous)
+            )
+        if self.decoder is None:
+            raise RuntimeError("transformer factor depth predictor is missing its decoder.")
+        return self.decoder(
+            inputs_embeds=torch.stack(inputs, dim=1),
+            use_cache=False,
+            return_dict=True,
+        ).last_hidden_state
+
+    def _recurrent_hidden(self, condition_hidden: Tensor, packed_targets: Tensor) -> Tensor:
+        output: list[Tensor] = []
+        state = condition_hidden + self.stage_bos[0]
+        for stage in range(self.stages):
+            if stage > 0:
+                previous = packed_targets[..., (stage - 1) * 2 : stage * 2]
+                state = state + self.stage_bos[stage] + self._stage_embedding(
+                    stage - 1,
+                    previous,
+                )
+            for block in self.recurrent_blocks:
+                state = block(state)
+            output.append(self.recurrent_output_norm(state))
+        return torch.stack(output, dim=1)
+
     @torch.no_grad()
     def generate(
         self,
@@ -448,28 +560,47 @@ class FactorDepthPredictor(nn.Module):
         output: list[Tensor] = []
         previous_pair: Tensor | None = None
         past_key_values = None
+        state: Tensor | None = None
         for stage in range(self.stages):
-            decoder_input = condition_hidden + self.stage_bos[stage]
-            if previous_pair is not None:
-                decoder_input = decoder_input + self._stage_embedding(
-                    stage - 1,
-                    previous_pair,
+            if self.recurrent:
+                if state is None:
+                    state = condition_hidden + self.stage_bos[stage]
+                else:
+                    if previous_pair is None:
+                        raise RuntimeError("recurrent factor depth predictor lost its prefix pair.")
+                    state = state + self.stage_bos[stage] + self._stage_embedding(
+                        stage - 1,
+                        previous_pair,
+                    )
+                for block in self.recurrent_blocks:
+                    state = block(state)
+            else:
+                decoder_input = condition_hidden + self.stage_bos[stage]
+                if previous_pair is not None:
+                    decoder_input = decoder_input + self._stage_embedding(
+                        stage - 1,
+                        previous_pair,
+                    )
+                if self.decoder is None:
+                    raise RuntimeError("transformer factor depth predictor is missing its decoder.")
+                state_output = self.decoder(
+                    inputs_embeds=decoder_input[:, None],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
                 )
-            state_output = self.decoder(
-                inputs_embeds=decoder_input[:, None],
-                past_key_values=past_key_values,
-                use_cache=True,
-                return_dict=True,
-            )
-            past_key_values = state_output.past_key_values
-            if past_key_values is None:
-                raise RuntimeError("factor depth predictor did not return a generation cache.")
-            state = state_output.last_hidden_state[:, -1]
+                past_key_values = state_output.past_key_values
+                if past_key_values is None:
+                    raise RuntimeError("factor depth predictor did not return a generation cache.")
+                state = state_output.last_hidden_state[:, -1]
+            if state is None:
+                raise RuntimeError("factor depth predictor did not produce a stage state.")
+            head_state = self.recurrent_output_norm(state) if self.recurrent else state
             pair = torch.stack(
                 tuple(
-                    cast(nn.Linear, cast(object, self.heads[stage * 2 + side]))(state).argmax(
-                        dim=-1
-                    )
+                    cast(nn.Linear, cast(object, self.heads[stage * 2 + side]))(
+                        head_state
+                    ).argmax(dim=-1)
                     for side in range(2)
                 ),
                 dim=-1,
@@ -481,6 +612,19 @@ class FactorDepthPredictor(nn.Module):
             frame_mask,
             frame_indices,
         )
+
+
+class _FactorDepthBlock(nn.Module):
+    def __init__(self, hidden_dim: int, *, ffn_ratio: int) -> None:
+        super().__init__()
+        inner_dim = hidden_dim * ffn_ratio
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.gate = nn.Linear(hidden_dim, inner_dim * 2)
+        self.output = nn.Linear(inner_dim, hidden_dim)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        gate, value = self.gate(self.norm(hidden)).chunk(2, dim=-1)
+        return hidden + self.output(torch.nn.functional.silu(gate) * value)
 
 
 def _qwen3_model(
@@ -576,6 +720,21 @@ def _validate_factor_targets(
     limits = torch.tensor(factor_sizes, device=packed_targets.device, dtype=torch.long)
     if bool(((packed_targets < 0) | (packed_targets >= limits)).any()):
         raise ValueError("factor_targets contains an ID outside its factor codebook.")
+
+
+def _validate_retargeted_pair(
+    pair: Tensor,
+    *,
+    rows: int,
+    sizes: Sequence[int],
+) -> None:
+    if pair.shape != (rows, 2):
+        raise ValueError("retargeted factor pair must have shape [valid_frames, 2].")
+    if not is_signed_integer_dtype(pair.dtype):
+        raise TypeError("retargeted factor pair must use a signed integer dtype.")
+    limits = torch.tensor(sizes, device=pair.device, dtype=torch.long)
+    if bool(((pair < 0) | (pair >= limits)).any()):
+        raise ValueError("retargeted factor pair contains an ID outside its codebooks.")
 
 
 def _heads(hidden_dim: int, requested: int) -> int:
