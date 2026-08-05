@@ -40,6 +40,8 @@ def main() -> None:
                 source="qwen_cross_text",
                 root=str(args.data_root),
                 split=args.split,
+                role=args.role,
+                speaker_id=args.speaker_id,
                 sample_index=sample_index,
                 batching=BatchingConfig(enabled=False),
             ),
@@ -233,6 +235,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--codec", default="longcat")
     parser.add_argument("--split", default="train")
+    parser.add_argument("--role", choices=("source", "target"), default="target")
+    parser.add_argument("--speaker-id", default="vivian")
     parser.add_argument("--sample-start", type=int, default=0)
     parser.add_argument("--sample-limit", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)

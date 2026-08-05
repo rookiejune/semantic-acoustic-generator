@@ -157,6 +157,34 @@ def test_factor_accuracy_names_retargeted_later_codebooks() -> None:
     }
 
 
+def test_artifact_set_args_expose_evaluation_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_artifact_set.py",
+            "--artifact",
+            str(tmp_path / "artifact"),
+            "--data-root",
+            str(tmp_path / "data"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--role",
+            "source",
+            "--speaker-id",
+            "speaker",
+        ],
+    )
+
+    args = eval_artifact_set._args()
+
+    assert args.role == "source"
+    assert args.speaker_id == "speaker"
+
+
 def test_eval_artifact_generates_seeded_pair_metrics() -> None:
     backend = EvalBackend(AcousticLayout.FRAME_ALIGNED)
     batch = _pair(AcousticLayout.FRAME_ALIGNED)
