@@ -1,5 +1,6 @@
 condition_dim: 1024
 feature_adapter: none
+feature_codebooks: 1
 decoder:
   hidden_dim: null
   layers: 8

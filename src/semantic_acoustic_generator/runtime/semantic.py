@@ -68,6 +68,7 @@ class GeneratorConfig:
     seed: int = 0
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     feature_adapter: FeatureAdapter = FeatureAdapter.NONE
+    feature_codebooks: int = 1
     feature_mean: tuple[float, ...] | None = None
     feature_std: tuple[float, ...] | None = None
 
@@ -84,16 +85,33 @@ class GeneratorConfig:
             raise TypeError("sampling must be a SamplingConfig.")
         if not isinstance(self.feature_adapter, FeatureAdapter):
             raise TypeError("feature_adapter must be a FeatureAdapter.")
+        _integer(self.feature_codebooks, name="feature_codebooks")
         if self.condition_dim <= 0:
             raise ValueError("condition_dim must be positive.")
+        if self.feature_codebooks <= 0:
+            raise ValueError("feature_codebooks must be positive.")
         if self.feature_adapter is not FeatureAdapter.NONE and self.route is not Route.FM:
             raise ValueError("feature_adapter requires the FM route.")
+        longcat_adapter = self.feature_adapter in {
+            FeatureAdapter.LONGCAT_FIRST_CODEBOOK,
+            FeatureAdapter.LONGCAT_CODEBOOKS,
+        }
         if (
-            self.decoder.anchor_target is AnchorTarget.FACTOR
-            and self.feature_adapter is not FeatureAdapter.LONGCAT_FIRST_CODEBOOK
+            self.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
+            and self.feature_codebooks != 1
         ):
             raise ValueError(
-                "anchor_target=factor requires feature_adapter=longcat_first_codebook."
+                "feature_adapter=longcat_first_codebook requires feature_codebooks=1."
+            )
+        if self.feature_adapter is FeatureAdapter.NONE and self.feature_codebooks != 1:
+            raise ValueError("feature_codebooks requires a LongCat feature adapter.")
+        if (
+            self.decoder.anchor_target is AnchorTarget.FACTOR
+            and not longcat_adapter
+        ):
+            raise ValueError(
+                "anchor_target=factor requires feature_adapter=longcat_first_codebook "
+                "or longcat_codebooks."
             )
         if (self.feature_mean is None) != (self.feature_std is None):
             raise ValueError("feature_mean and feature_std must be set together.")
@@ -408,7 +426,8 @@ class GeneratorRuntime:
             if support.config is None
             else support.config.feature_adapter
         )
-        self.backend = adapt_backend(backend, adapter)
+        codebooks = 1 if support.config is None else support.config.feature_codebooks
+        self.backend = adapt_backend(backend, adapter, codebooks=codebooks)
         _validate_frame_aligned_spec(semantic_acoustic_spec(self.backend))
         metadata = support.artifact_backend_metadata
         if metadata is None:
@@ -537,10 +556,17 @@ def build_support(
     semantic_codebook: Tensor,
     codec_spec: SemanticAcousticCodecSpec,
     artifact_backend_metadata: Mapping[str, object] | None = None,
-    factor_codebooks: tuple[Tensor, Tensor] | None = None,
+    factor_codebooks: tuple[Tensor, ...] | None = None,
 ) -> GeneratorSupport:
     _validate_frame_aligned_spec(codec_spec)
     _validate_semantic_codebook(semantic_codebook, codec_spec)
+    if config.decoder.anchor_target is AnchorTarget.FACTOR and (
+        factor_codebooks is None
+        or len(factor_codebooks) != config.feature_codebooks * 2
+    ):
+        raise ValueError(
+            "factor target requires two stored factor codebooks per selected acoustic codebook."
+        )
     modules = build_route(
         config.route,
         semantic_codebook,

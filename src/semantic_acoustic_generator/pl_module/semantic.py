@@ -14,7 +14,7 @@ from anytrain.codec import (
 from anytrain.lightning import LightningLogMixin
 from lightning import LightningModule
 
-from semantic_acoustic_generator.backend import LongCatFirstCodebookAdapter, adapt_backend
+from semantic_acoustic_generator.backend import LongCatCodebookAdapter, adapt_backend
 from semantic_acoustic_generator.config import AnchorTarget, Route
 from semantic_acoustic_generator.loss.repa import decode_group_metrics
 from semantic_acoustic_generator.model.decoder import FMFeatureGenerator, RVQCodeGenerator
@@ -514,7 +514,7 @@ class GeneratorModule(LightningLogMixin, LightningModule):
 
     @torch.no_grad()
     def _factor_targets(self, batch: GeneratorBatch) -> Tensor | None:
-        if not isinstance(self.backend, LongCatFirstCodebookAdapter):
+        if not isinstance(self.backend, LongCatCodebookAdapter):
             return None
         codes = batch.acoustic_codes.masked_fill(
             ~batch.acoustic_mask[..., None],
@@ -522,8 +522,8 @@ class GeneratorModule(LightningLogMixin, LightningModule):
         )
         return self.backend.factor_codes(codes)
 
-    def _factor_codebooks(self) -> tuple[Tensor, Tensor] | None:
-        if not isinstance(self.backend, LongCatFirstCodebookAdapter):
+    def _factor_codebooks(self) -> tuple[Tensor, ...] | None:
+        if not isinstance(self.backend, LongCatCodebookAdapter):
             return None
         return self.backend.factor_codebooks
 
@@ -544,7 +544,11 @@ def build_module(
     finite_loss_check_interval: int = 100,
     repa_teacher: Teacher | None = None,
 ) -> GeneratorModule:
-    backend = adapt_backend(backend, config.feature_adapter)
+    backend = adapt_backend(
+        backend,
+        config.feature_adapter,
+        codebooks=config.feature_codebooks,
+    )
     normalize_features = (
         normalize_features
         and config.route is not Route.RVQ
@@ -565,7 +569,7 @@ def build_module(
         codec_spec=semantic_acoustic_spec(backend),
         factor_codebooks=(
             backend.factor_codebooks
-            if isinstance(backend, LongCatFirstCodebookAdapter)
+            if isinstance(backend, LongCatCodebookAdapter)
             and config.decoder.anchor_target is AnchorTarget.FACTOR
             else None
         ),

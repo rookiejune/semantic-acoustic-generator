@@ -30,6 +30,7 @@ from semantic_acoustic_generator.model.decoder import (
     AcousticUnitGenerator,
     FMFeatureGenerator,
     RVQCodeGenerator,
+    factor_codebook_names,
 )
 from semantic_acoustic_generator.runtime.metadata import (
     support_metadata,
@@ -83,6 +84,7 @@ class AcousticGeneratorSpec:
     route: Route
     condition_dim: int
     feature_adapter: FeatureAdapter
+    feature_codebooks: int
     decoder: DecoderConfig
     backend_name: str
     sample_rate: int
@@ -99,6 +101,8 @@ class AcousticGeneratorSpec:
     sampling: SamplingConfig
 
     def __post_init__(self) -> None:
+        if self.feature_codebooks <= 0:
+            raise ValueError("artifact feature_codebooks must be positive.")
         if self.acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
             raise ValueError(
                 "acoustic generator artifacts support only frame-aligned units."
@@ -112,7 +116,11 @@ class AcousticGeneratorSpec:
     def validate_backend(self, backend: SemanticAcousticCodec) -> None:
         validate_backend_metadata(
             self.backend_metadata(),
-            adapt_backend(backend, self.feature_adapter),
+            adapt_backend(
+                backend,
+                self.feature_adapter,
+                codebooks=self.feature_codebooks,
+            ),
         )
 
     def validate_acoustic_backend(self, backend: AcousticGeneratorBackend) -> None:
@@ -155,7 +163,11 @@ def save_artifact(
     artifact_config = support.config
     if artifact_config is None:
         raise ValueError("artifact support must expose its construction config.")
-    backend = adapt_backend(backend, artifact_config.feature_adapter)
+    backend = adapt_backend(
+        backend,
+        artifact_config.feature_adapter,
+        codebooks=artifact_config.feature_codebooks,
+    )
     _validate_support_runtime_config(support, artifact_config)
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
@@ -204,6 +216,7 @@ def load_generator_artifact(
         route=config.route,
         condition_dim=config.condition_dim,
         feature_adapter=config.feature_adapter,
+        feature_codebooks=config.feature_codebooks,
         decoder=config.decoder,
         backend_name=_metadata_string(metadata, "name"),
         sample_rate=codec_spec.sample_rate,
@@ -338,7 +351,7 @@ def _generator(
     config: GeneratorConfig,
     metadata: Mapping[str, object],
     *,
-    factor_codebooks: tuple[Tensor, Tensor] | None = None,
+    factor_codebooks: tuple[Tensor, ...] | None = None,
 ) -> AcousticUnitGenerator:
     codec_spec = _codec_spec(metadata)
     if config.route is Route.FM:
@@ -393,13 +406,15 @@ def _factor_codebooks(
     config: GeneratorConfig,
     *,
     prefix: str,
-) -> tuple[Tensor, Tensor] | None:
+) -> tuple[Tensor, ...] | None:
     if config.decoder.anchor_target is AnchorTarget.FEATURE:
         return None
-    keys = (f"{prefix}factor_codebook_a", f"{prefix}factor_codebook_b")
+    keys = tuple(
+        f"{prefix}{name}" for name in factor_codebook_names(config.feature_codebooks)
+    )
     if any(key not in state for key in keys):
         raise RuntimeError("factor-target artifact is missing stored factor codebooks.")
-    return state[keys[0]], state[keys[1]]
+    return tuple(state[key] for key in keys)
 
 
 def _load_state(path: Path) -> Mapping[str, Tensor]:
@@ -437,6 +452,12 @@ def _config(data: Mapping[str, object]) -> GeneratorConfig:
                 owner="config",
                 default=FeatureAdapter.NONE.value,
             )
+        ),
+        feature_codebooks=_schema_optional_int_default(
+            data,
+            "feature_codebooks",
+            owner="config",
+            default=1,
         ),
         decoder=DecoderConfig(
             hidden_dim=_schema_optional_int(decoder, "hidden_dim", owner="decoder"),

@@ -89,6 +89,21 @@ def test_factor_target_requires_longcat_first_codebook_adapter() -> None:
         )
 
 
+def test_factor_target_accepts_longcat_multi_codebook_adapter() -> None:
+    config = GeneratorConfig(
+        route=Route.FM,
+        condition_dim=4,
+        feature_adapter=FeatureAdapter.LONGCAT_CODEBOOKS,
+        feature_codebooks=3,
+        decoder=DecoderConfig(
+            fm_mode=FMMode.ANCHOR,
+            anchor_target=AnchorTarget.FACTOR,
+        ),
+    )
+
+    assert config.feature_codebooks == 3
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
@@ -432,6 +447,7 @@ def test_schema_eight_artifact_roundtrip_preserves_decoder_fields(
     assert data["backend"]["semantic_frame_rate"] == backend.semantic_frame_rate
     assert data["config"]["decoder"]["rvq_predictor"] == RVQPredictor.MTP.value
     assert data["config"]["feature_adapter"] == FeatureAdapter.NONE.value
+    assert data["config"]["feature_codebooks"] == 1
     assert data["config"]["sampling"]["cfg_scale"] == 1.0
 
     captured: list[GeneratorConfig] = []
@@ -498,6 +514,7 @@ def test_early_schema_eight_artifact_defaults_new_fm_fields(tmp_path) -> None:
     path = tmp_path / "generator.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     del data["config"]["feature_adapter"]
+    del data["config"]["feature_codebooks"]
     for key in (
         "fm_mode",
         "anchor_context",
@@ -516,6 +533,7 @@ def test_early_schema_eight_artifact_defaults_new_fm_fields(tmp_path) -> None:
 
     assert loaded.config is not None
     assert loaded.config.feature_adapter is FeatureAdapter.NONE
+    assert loaded.config.feature_codebooks == 1
     assert loaded.config.decoder.fm_mode is FMMode.FLOW
     assert loaded.config.decoder.anchor_context is AnchorContext.LOCAL
     assert loaded.config.decoder.anchor_target is AnchorTarget.FEATURE

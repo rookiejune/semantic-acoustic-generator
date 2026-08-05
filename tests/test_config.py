@@ -206,6 +206,30 @@ def test_train_config_parses_longcat_first_codebook_adapter() -> None:
     assert config.model.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
 
 
+def test_train_config_parses_longcat_multi_codebook_adapter() -> None:
+    config = parse_train_config(
+        _compose(
+            "model.feature_adapter=longcat_codebooks",
+            "model.feature_codebooks=3",
+            "model.decoder.fm_mode=anchor",
+            "model.decoder.anchor_target=factor",
+        )
+    )
+
+    assert config.model.feature_adapter is FeatureAdapter.LONGCAT_CODEBOOKS
+    assert config.model.feature_codebooks == 3
+
+
+def test_train_config_rejects_multi_count_on_legacy_adapter() -> None:
+    with pytest.raises(ValueError, match="requires feature_codebooks=1"):
+        parse_train_config(
+            _compose(
+                "model.feature_adapter=longcat_first_codebook",
+                "model.feature_codebooks=2",
+            )
+        )
+
+
 def test_train_config_parses_first_codebook_anchor_mode() -> None:
     config = parse_train_config(
         _compose(
@@ -239,6 +263,20 @@ def test_longcat_factor_classifier_experiment_is_frame_aligned() -> None:
     config = parse_train_config(_compose("experiment=012_longcat_factor_classifier"))
 
     assert config.model.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
+    assert config.model.decoder.fm_mode is FMMode.ANCHOR
+    assert config.model.decoder.anchor_context is AnchorContext.LOCAL
+    assert config.model.decoder.anchor_target is AnchorTarget.FACTOR
+    assert config.datamodule.sample_limit == 128
+    assert config.datamodule.batch_size == 16
+    assert config.pl_module.normalize_features is False
+    assert config.trainer.max_steps == 2000
+
+
+def test_longcat_factor_scale_experiment_is_frame_aligned() -> None:
+    config = parse_train_config(_compose("experiment=013_longcat_factor_scale"))
+
+    assert config.model.feature_adapter is FeatureAdapter.LONGCAT_CODEBOOKS
+    assert config.model.feature_codebooks == 2
     assert config.model.decoder.fm_mode is FMMode.ANCHOR
     assert config.model.decoder.anchor_context is AnchorContext.LOCAL
     assert config.model.decoder.anchor_target is AnchorTarget.FACTOR

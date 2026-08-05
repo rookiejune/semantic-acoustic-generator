@@ -253,6 +253,50 @@ def test_factor_anchor_trains_ce_and_returns_original_codebook_embeddings() -> N
     assert torch.equal(sample[~mask], torch.zeros_like(sample[~mask]))
 
 
+def test_factor_anchor_scales_to_multiple_acoustic_codebooks() -> None:
+    condition = torch.randn(1, 3, 6)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    codebooks = tuple(torch.randn(size, 2) for size in (3, 4, 5, 6, 7, 8))
+    generator = FMFeatureGenerator(
+        6,
+        12,
+        DecoderConfig(
+            heads=2,
+            ffn_ratio=2,
+            fm_mode=FMMode.ANCHOR,
+            anchor_target=AnchorTarget.FACTOR,
+            anchor_hidden_dim=8,
+            anchor_layers=1,
+        ),
+        factor_codebooks=codebooks,
+    )
+    labels = torch.stack(
+        tuple(torch.randint(0, value.size(0), (1, 3)) for value in codebooks),
+        dim=-1,
+    )
+
+    output = generator.feature_loss_from_condition(
+        condition,
+        mask,
+        target_features=None,
+        factor_targets=labels,
+    )
+    factors = generator.sample_factor_codes(condition, mask)
+    features = generator.sample_features(
+        condition,
+        mask,
+        feature_mean=torch.zeros(1, 1, 12),
+        feature_std=torch.ones(1, 1, 12),
+        flow_steps=1,
+    )
+
+    assert factors.shape == (1, 3, 6)
+    assert features.shape == (1, 3, 12)
+    assert output.items["anchor_factor"].details is not None
+    assert "codebook_5_top1" in output.items["anchor_factor"].details
+    assert "factor_codebook_2_b" in generator.state_dict()
+
+
 def test_transformer_anchor_preserves_frame_alignment_and_padding() -> None:
     condition = torch.randn(2, 5, 8)
     mask = torch.tensor([[True, True, True, True, True], [True, True, True, False, False]])

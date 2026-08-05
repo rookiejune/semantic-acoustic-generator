@@ -85,7 +85,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         feature_dim: int,
         config: DecoderConfig,
         *,
-        factor_codebooks: tuple[Tensor, Tensor] | None = None,
+        factor_codebooks: tuple[Tensor, ...] | None = None,
     ) -> None:
         super().__init__()
         self.mode = config.fm_mode
@@ -93,18 +93,30 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         self.feature_dim = feature_dim
         self.factor_codebook_a: Tensor | None
         self.factor_codebook_b: Tensor | None
+        self._factor_codebooks: tuple[Tensor, ...]
         if self.anchor_target is AnchorTarget.FACTOR:
             if factor_codebooks is None:
-                raise ValueError("anchor_target=factor requires two factor codebooks.")
+                raise ValueError("anchor_target=factor requires factor codebook pairs.")
             _validate_factor_codebooks(factor_codebooks, feature_dim=feature_dim)
             self.factor_codebook_a = nn.Buffer(factor_codebooks[0].detach().clone())
             self.factor_codebook_b = nn.Buffer(factor_codebooks[1].detach().clone())
+            stored = [self.factor_codebook_a, self.factor_codebook_b]
+            for name, value in zip(
+                factor_codebook_names(len(factor_codebooks) // 2)[2:],
+                factor_codebooks[2:],
+                strict=True,
+            ):
+                buffer = nn.Buffer(value.detach().clone())
+                setattr(self, name, buffer)
+                stored.append(buffer)
+            self._factor_codebooks = tuple(stored)
             anchor_output_dim = sum(value.size(0) for value in factor_codebooks)
         else:
             if factor_codebooks is not None:
                 raise ValueError("factor codebooks require anchor_target=factor.")
             self.factor_codebook_a = None
             self.factor_codebook_b = None
+            self._factor_codebooks = ()
             anchor_output_dim = feature_dim
         self.anchor_output_dim = anchor_output_dim
         self.core = (
@@ -232,7 +244,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         feature_std: Tensor,
         repa_teacher: Teacher | None = None,
         factor_targets: Tensor | None = None,
-        factor_codebooks: tuple[Tensor, Tensor] | None = None,
+        factor_codebooks: tuple[Tensor, ...] | None = None,
     ) -> DecoderLoss:
         target_mask = batch.acoustic_mask
         target_condition, _ = _aligned_condition(
@@ -273,7 +285,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         repa_features: Tensor | None = None,
         flow_runtime: FlowRuntime | None = None,
         factor_targets: Tensor | None = None,
-        factor_codebooks: tuple[Tensor, Tensor] | None = None,
+        factor_codebooks: tuple[Tensor, ...] | None = None,
         validate: bool = True,
         include_details: bool = True,
     ) -> DecoderLoss:
@@ -354,7 +366,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         feature_mean: Tensor | None,
         feature_std: Tensor | None,
         factor_targets: Tensor | None,
-        factor_codebooks: tuple[Tensor, Tensor] | None,
+        factor_codebooks: tuple[Tensor, ...] | None,
         flow_runtime: FlowRuntime | None,
         validate: bool,
         include_details: bool,
@@ -439,9 +451,9 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             return condition.new_zeros(*condition.shape[:2], self.anchor_output_dim)
         return self.anchor(condition, mask)
 
-    def _factor_output(self, logits: Tensor) -> tuple[Tensor, Tensor]:
+    def _factor_output(self, logits: Tensor) -> tuple[Tensor, ...]:
         codebooks = self._stored_factor_codebooks()
-        sizes = (codebooks[0].size(0), codebooks[1].size(0))
+        sizes = tuple(value.size(0) for value in codebooks)
         if logits.size(-1) != sum(sizes):
             raise ValueError("factor logits do not match stored codebook sizes.")
         return logits.split(sizes, dim=-1)  # type: ignore[return-value]
@@ -465,17 +477,17 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         )
         return codes.masked_fill(~mask[..., None], 0)
 
-    def _stored_factor_codebooks(self) -> tuple[Tensor, Tensor]:
-        if self.factor_codebook_a is None or self.factor_codebook_b is None:
+    def _stored_factor_codebooks(self) -> tuple[Tensor, ...]:
+        if not self._factor_codebooks:
             raise RuntimeError("factor target requires stored factor codebooks.")
-        return self.factor_codebook_a, self.factor_codebook_b
+        return self._factor_codebooks
 
     def _factor_logits(
         self,
         features: Tensor,
-        codebooks: tuple[Tensor, Tensor],
-    ) -> tuple[Tensor, Tensor]:
-        dims = (codebooks[0].size(-1), codebooks[1].size(-1))
+        codebooks: tuple[Tensor, ...],
+    ) -> tuple[Tensor, ...]:
+        dims = tuple(value.size(-1) for value in codebooks)
         if sum(dims) != features.size(-1):
             raise ValueError("factor codebook dimensions must match anchor features.")
         split = features.split(dims, dim=-1)
@@ -495,20 +507,35 @@ class FMFeatureGenerator(AcousticUnitGenerator):
 
 
 def _validate_factor_codebooks(
-    codebooks: tuple[Tensor, Tensor],
+    codebooks: tuple[Tensor, ...],
     *,
     feature_dim: int,
 ) -> None:
-    if len(codebooks) != 2:
-        raise ValueError("factor target requires exactly two codebooks.")
+    if len(codebooks) < 2 or len(codebooks) % 2 != 0:
+        raise ValueError("factor target requires one codebook pair per acoustic stage.")
     if any(value.dim() != 2 or value.size(0) < 1 or value.size(1) < 1 for value in codebooks):
-        raise ValueError("factor codebooks must contain two non-empty rank-2 tensors.")
+        raise ValueError("factor codebooks must contain non-empty rank-2 tensors.")
     if any(not value.is_floating_point() or value.is_complex() for value in codebooks):
         raise TypeError("factor codebooks must use a real floating point dtype.")
-    if codebooks[0].device != codebooks[1].device or codebooks[0].dtype != codebooks[1].dtype:
+    if any(
+        value.device != codebooks[0].device or value.dtype != codebooks[0].dtype
+        for value in codebooks[1:]
+    ):
         raise ValueError("factor codebooks must share a device and dtype.")
     if sum(value.size(1) for value in codebooks) != feature_dim:
         raise ValueError("factor codebook dimensions must sum to feature_dim.")
+
+
+def factor_codebook_names(codebooks: int) -> tuple[str, ...]:
+    if isinstance(codebooks, bool) or not isinstance(codebooks, int):
+        raise TypeError("factor codebook count must be an integer.")
+    if codebooks <= 0:
+        raise ValueError("factor codebook count must be positive.")
+    names: list[str] = []
+    for stage in range(codebooks):
+        prefix = "factor_codebook" if stage == 0 else f"factor_codebook_{stage}"
+        names.extend((f"{prefix}_a", f"{prefix}_b"))
+    return tuple(names)
 
 
 class RVQCodeGenerator(AcousticUnitGenerator):

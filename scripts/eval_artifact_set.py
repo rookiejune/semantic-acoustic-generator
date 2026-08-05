@@ -13,7 +13,7 @@ from anytrain.codec import SemanticAcousticCodes, masked_acoustic_features
 
 from semantic_acoustic_generator.backend import (
     BackendConfig,
-    LongCatFirstCodebookAdapter,
+    LongCatCodebookAdapter,
     load_backend,
 )
 from semantic_acoustic_generator.datamodule import BatchingConfig, DataConfig, load_batch
@@ -78,7 +78,12 @@ def main() -> None:
                 name="artifact set raw",
             )
         }
-        if isinstance(runtime.backend, LongCatFirstCodebookAdapter):
+        if isinstance(runtime.backend, LongCatCodebookAdapter):
+            audio["selected_codebook_reconstruction"] = runtime.decode_features(
+                semantic,
+                target,
+                mask=batch.mask,
+            )
             snapped = runtime.backend.snap_features(generated)
             audio["generated_without_reference_snap"] = runtime.decode_features(
                 semantic,
@@ -95,8 +100,15 @@ def main() -> None:
             labels = runtime.backend.factor_codes(batch.acoustic_codes).to(predicted.device)
             valid = batch.acoustic_mask.to(predicted.device)
             accuracy = predicted[valid].eq(labels[valid]).float().mean(dim=0)
-            metrics["factor_a_accuracy"] = float(accuracy[0].cpu())
-            metrics["factor_b_accuracy"] = float(accuracy[1].cpu())
+            for factor, value in enumerate(accuracy):
+                codebook, local = divmod(factor, 2)
+                suffix = "a" if local == 0 else "b"
+                name = (
+                    f"factor_{suffix}_accuracy"
+                    if codebook == 0
+                    else f"codebook_{codebook}_factor_{suffix}_accuracy"
+                )
+                metrics[name] = float(value.cpu())
         text = batch.metadata[0].target_text
         for group, waveform in audio.items():
             path = output / group / f"sample-{sample_index:04d}.wav"

@@ -137,7 +137,11 @@ def build_session(config: DictConfig | TrainConfig) -> TrainingSession:
     route = config.model.route
     repa_teacher = build_repa_teacher(config, backend, device=device, route=route)
     support_config = build_support_config(config, seed=seed, repa_teacher=repa_teacher)
-    backend = adapt_backend(backend, support_config.feature_adapter)
+    backend = adapt_backend(
+        backend,
+        support_config.feature_adapter,
+        codebooks=support_config.feature_codebooks,
+    )
     ckpt_path = config.trainer.ckpt_path
     normalize_features = (
         config.pl_module.normalize_features
@@ -235,6 +239,7 @@ def build_support_config(
         route=config.model.route,
         condition_dim=config.model.condition_dim,
         feature_adapter=config.model.feature_adapter,
+        feature_codebooks=config.model.feature_codebooks,
         decoder=DecoderConfig(
             hidden_dim=decoder.hidden_dim,
             layers=decoder.layers,

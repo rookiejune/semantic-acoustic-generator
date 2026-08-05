@@ -39,7 +39,7 @@ def build_route(
     seed: int = 0,
     acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
     acoustic_unit_length: int | None = None,
-    factor_codebooks: tuple[Tensor, Tensor] | None = None,
+    factor_codebooks: tuple[Tensor, ...] | None = None,
 ) -> RouteModules:
     if not isinstance(acoustic_layout, AcousticLayout):
         raise TypeError("acoustic_layout must be an AcousticLayout.")

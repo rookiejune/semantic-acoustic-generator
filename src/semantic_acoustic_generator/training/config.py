@@ -43,6 +43,7 @@ class ModelConfig:
     condition_dim: int = 1024
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     feature_adapter: FeatureAdapter = FeatureAdapter.NONE
+    feature_codebooks: int = 1
 
     def __post_init__(self) -> None:
         if isinstance(self.condition_dim, bool) or not isinstance(self.condition_dim, int):
@@ -51,6 +52,7 @@ class ModelConfig:
             raise ValueError("model.condition_dim must be positive.")
         if not isinstance(self.feature_adapter, FeatureAdapter):
             raise TypeError("model.feature_adapter must be a FeatureAdapter.")
+        _positive_integer(self.feature_codebooks, "model.feature_codebooks")
 
 
 @dataclass(frozen=True)
@@ -320,20 +322,28 @@ class TrainConfig:
             and self.model.route is not Route.FM
         ):
             raise ValueError("model.feature_adapter requires model.route=fm.")
+        longcat_adapter = self.model.feature_adapter in {
+            FeatureAdapter.LONGCAT_FIRST_CODEBOOK,
+            FeatureAdapter.LONGCAT_CODEBOOKS,
+        }
+        if longcat_adapter and self.backend.name != "longcat":
+            raise ValueError("LongCat feature adapter requires backend=longcat.")
         if (
             self.model.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
-            and self.backend.name != "longcat"
+            and self.model.feature_codebooks != 1
         ):
             raise ValueError(
-                "model.feature_adapter=longcat_first_codebook requires backend=longcat."
+                "model.feature_adapter=longcat_first_codebook requires feature_codebooks=1."
             )
+        if self.model.feature_adapter is FeatureAdapter.NONE and self.model.feature_codebooks != 1:
+            raise ValueError("model.feature_codebooks requires a LongCat feature adapter.")
         if (
             self.model.decoder.fm_mode is not FMMode.FLOW
-            and self.model.feature_adapter is not FeatureAdapter.LONGCAT_FIRST_CODEBOOK
+            and not longcat_adapter
         ):
             raise ValueError(
                 "model.decoder.fm_mode=anchor|residual requires "
-                "model.feature_adapter=longcat_first_codebook."
+                "model.feature_adapter=longcat_first_codebook or longcat_codebooks."
             )
         if self.model.route is not Route.FM and self.model.decoder.fm_mode is not FMMode.FLOW:
             raise ValueError("model.decoder.fm_mode is only supported by model.route=fm.")

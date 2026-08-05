@@ -18,6 +18,7 @@ class Route(StrEnum):
 class FeatureAdapter(StrEnum):
     NONE = auto()
     LONGCAT_FIRST_CODEBOOK = auto()
+    LONGCAT_CODEBOOKS = auto()
 
 
 class FMMode(StrEnum):

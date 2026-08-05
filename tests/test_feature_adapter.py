@@ -10,6 +10,7 @@ from anytrain.codec import (
 from torch import nn
 
 from semantic_acoustic_generator.backend import (
+    LongCatCodebookAdapter,
     LongCatFirstCodebookAdapter,
     adapt_backend,
 )
@@ -49,20 +50,26 @@ class _Stage(nn.Module):
 class _Quantizer(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.quantizers = nn.ModuleList([_Stage()])
+        self.quantizers = nn.ModuleList([_Stage(), _Stage(), _Stage()])
 
     def from_codes(self, codes: torch.Tensor):
-        stage = self.quantizers[0]
-        composite = codes[:, 0]
-        codes_a = torch.div(composite, stage.codebook_size_b, rounding_mode="floor")
-        codes_b = composite.remainder(stage.codebook_size_b)
-        features_a = stage.codebook_a(codes_a).transpose(1, 2)
-        features_b = stage.codebook_b(codes_b).transpose(1, 2)
-        projected = torch.cat(
-            (stage.out_proj_a(features_a), stage.out_proj_b(features_b)),
-            dim=1,
-        )
-        return projected, torch.cat((features_a, features_b), dim=1), codes
+        projected: torch.Tensor | None = None
+        features = []
+        for index in range(codes.size(1)):
+            stage = self.quantizers[index]
+            composite = codes[:, index]
+            codes_a = torch.div(composite, stage.codebook_size_b, rounding_mode="floor")
+            codes_b = composite.remainder(stage.codebook_size_b)
+            features_a = stage.codebook_a(codes_a).transpose(1, 2)
+            features_b = stage.codebook_b(codes_b).transpose(1, 2)
+            value = torch.cat(
+                (stage.out_proj_a(features_a), stage.out_proj_b(features_b)),
+                dim=1,
+            )
+            projected = value if projected is None else projected + value
+            features.extend((features_a, features_b))
+        assert projected is not None
+        return projected, torch.cat(features, dim=1), codes
 
 
 class _Decoder(nn.Module):
@@ -168,6 +175,28 @@ def test_longcat_first_codebook_adapter_projects_features_before_decode() -> Non
     assert backend.decoded_features is not None
     torch.testing.assert_close(backend.decoded_features, expected)
     torch.testing.assert_close(waveform, expected.transpose(1, 2))
+
+
+def test_longcat_factor_adapter_sums_multiple_stage_projections() -> None:
+    backend = _LongCat()
+    adapted = LongCatCodebookAdapter(backend, codebooks=3)
+    semantic = torch.tensor([[[1], [2]]], dtype=torch.long)
+    codes = torch.tensor(
+        [[[90, 180, 270], [360, 450, 540]]],
+        dtype=torch.long,
+    )
+
+    features = adapted.acoustic_codes_to_features(codes)
+    waveform = adapted.decode_features(semantic, features)
+    native = adapted.native_features(codes)
+
+    assert adapted.feature_codebooks == 3
+    assert adapted.acoustic_feature_dim == 48
+    assert len(adapted.factor_codebooks) == 6
+    assert adapted.factor_codes(codes).shape == (1, 2, 6)
+    assert backend.decoded_features is not None
+    torch.testing.assert_close(backend.decoded_features, native)
+    torch.testing.assert_close(waveform, native.transpose(1, 2))
 
 
 def test_longcat_first_codebook_adapter_snaps_each_factor_by_cosine() -> None:
@@ -361,3 +390,49 @@ def test_factor_artifact_restores_codebook_buffers_without_codec_weights(tmp_pat
         assert restored.factor_codebook_b is not None
         torch.testing.assert_close(restored.factor_codebook_a, adapted.factor_codebooks[0])
         torch.testing.assert_close(restored.factor_codebook_b, adapted.factor_codebooks[1])
+
+
+def test_multi_codebook_factor_artifact_roundtrip(tmp_path) -> None:
+    backend = _LongCat()
+    adapted = LongCatCodebookAdapter(backend, codebooks=3)
+    config = GeneratorConfig(
+        route=Route.FM,
+        condition_dim=4,
+        feature_adapter=FeatureAdapter.LONGCAT_CODEBOOKS,
+        feature_codebooks=3,
+        decoder=DecoderConfig(
+            hidden_dim=4,
+            layers=1,
+            heads=1,
+            ffn_ratio=2,
+            fm_mode=FMMode.ANCHOR,
+            anchor_target=AnchorTarget.FACTOR,
+            anchor_hidden_dim=4,
+            anchor_layers=1,
+        ),
+    )
+    support = build_support(
+        config,
+        semantic_codebook=adapted.semantic_codebook,
+        codec_spec=semantic_acoustic_spec(adapted),
+        factor_codebooks=adapted.factor_codebooks,
+    )
+    save_artifact(tmp_path, support, backend=backend)
+
+    loaded = load_artifact(tmp_path)
+    runtime = GeneratorRuntime(loaded, backend)
+    acoustic = load_generator_artifact(tmp_path)
+
+    assert loaded.config is not None
+    assert loaded.config.feature_codebooks == 3
+    assert isinstance(runtime.backend, LongCatCodebookAdapter)
+    assert runtime.backend.feature_codebooks == 3
+    assert acoustic.spec.feature_codebooks == 3
+    assert "factor_codebook_2_b" in loaded.generator.state_dict()
+    for index, codebook in enumerate(adapted.factor_codebooks):
+        key = (
+            ("factor_codebook_a", "factor_codebook_b")[index]
+            if index < 2
+            else f"factor_codebook_{index // 2}_{'a' if index % 2 == 0 else 'b'}"
+        )
+        torch.testing.assert_close(loaded.generator.state_dict()[key], codebook)
