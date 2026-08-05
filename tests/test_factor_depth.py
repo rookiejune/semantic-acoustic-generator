@@ -282,3 +282,51 @@ def test_factor_depth_integrates_with_aligned_factor_generator(
     assert all(head.weight.grad is not None for head in generator.factor_depth.heads)
     assert "factor_codebook_1_b" in generator.state_dict()
     assert "factor_depth.factor_codebook_1_b" in generator.state_dict()
+
+
+def test_factor_depth_loss_keeps_valid_frames_packed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        rvq_module,
+        "_qwen3_model",
+        lambda **options: _CausalDepthCore(options["hidden_dim"]),
+    )
+    generator = FMFeatureGenerator(
+        6,
+        32,
+        DecoderConfig(
+            hidden_dim=8,
+            layers=1,
+            heads=1,
+            ffn_ratio=2,
+            fm_mode=FMMode.ANCHOR,
+            anchor_target=AnchorTarget.FACTOR,
+            factor_predictor=FactorPredictor.DEPTH_AR,
+            anchor_hidden_dim=8,
+            anchor_layers=1,
+        ),
+        factor_codebooks=_codebooks(),
+    )
+    condition = torch.randn(2, 3, 6)
+    mask = torch.tensor([[True, True, True], [True, False, False]])
+    targets = torch.tensor(
+        [
+            [[0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5]],
+            [[1, 2, 3, 4], [0, 0, 0, 0], [0, 0, 0, 0]],
+        ]
+    )
+    monkeypatch.setattr(
+        rvq_module,
+        "_scatter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected scatter")),
+    )
+
+    output = generator.feature_loss_from_condition(
+        condition,
+        mask,
+        target_features=None,
+        factor_targets=targets,
+    )
+
+    assert output.loss.isfinite()

@@ -46,11 +46,22 @@ class _Stage(nn.Module):
         self.codebook_b = nn.Embedding(90, 8)
         self.out_proj_a = nn.Conv1d(8, 512, kernel_size=1, bias=True)
         self.out_proj_b = nn.Conv1d(8, 512, kernel_size=1, bias=True)
+        self.retarget_code = 0
         with torch.no_grad():
             self.codebook_a.weight.copy_(torch.arange(90 * 8).view(90, 8) / 100)
             self.codebook_b.weight.copy_(torch.arange(90 * 8).view(90, 8) / 50 + 20)
             self.out_proj_a.bias.fill_(0.1)
             self.out_proj_b.bias.fill_(-0.2)
+
+    def forward(self, residual: torch.Tensor):
+        indices = torch.full(
+            residual.shape[:1] + residual.shape[2:],
+            self.retarget_code,
+            dtype=torch.long,
+            device=residual.device,
+        )
+        zero = residual.new_zeros(residual.size(0))
+        return torch.zeros_like(residual), zero, zero, indices, residual
 
 
 class _DepthCore(nn.Module):
@@ -149,11 +160,10 @@ class _LongCat(nn.Module):
         return self.decode_features(codes.semantic, features)
 
     def acoustic_codes_to_features(self, acoustic_codes: torch.Tensor) -> torch.Tensor:
-        return torch.zeros(
-            *acoustic_codes.shape[:2],
-            self.acoustic_feature_dim,
-            device=acoustic_codes.device,
+        projected, _, _ = self.model.acoustic_quantizer.from_codes(
+            acoustic_codes.transpose(1, 2).contiguous()
         )
+        return projected.transpose(1, 2).contiguous()
 
     def decode_features(
         self,
@@ -251,6 +261,27 @@ def test_longcat_factor_adapter_skips_inactive_projection_bias() -> None:
 
     torch.testing.assert_close(stage0, expected)
     assert not torch.allclose(stage0, zero_embedding_projection)
+
+
+def test_longcat_factor_adapter_retargets_later_residual_stages() -> None:
+    backend = _LongCat()
+    adapted = LongCatCodebookAdapter(backend, codebooks=3)
+    stages = backend._decoder().acoustic_quantizer.quantizers
+    stages[1].retarget_code = 2 * 90 + 3
+    stages[2].retarget_code = 4 * 90 + 5
+    acoustic = torch.tensor([[[90, 180, 270], [360, 450, 540]]], dtype=torch.long)
+    predicted = torch.tensor(
+        [[[7, 8, 9, 10, 11, 12], [13, 14, 15, 16, 17, 18]]],
+        dtype=torch.long,
+    )
+
+    retargeted = adapted.retarget_factor_codes(acoustic, predicted)
+    features = adapted.factor_codes_to_features(retargeted)
+
+    assert torch.equal(retargeted[..., :2], predicted[..., :2])
+    assert torch.equal(retargeted[..., 2:4], torch.tensor([2, 3]).expand(1, 2, 2))
+    assert torch.equal(retargeted[..., 4:6], torch.tensor([4, 5]).expand(1, 2, 2))
+    assert features.shape == (1, 2, 48)
 
 
 def test_longcat_first_codebook_adapter_snaps_each_factor_by_cosine() -> None:

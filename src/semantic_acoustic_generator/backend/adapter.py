@@ -122,18 +122,68 @@ class LongCatCodebookAdapter(nn.Module):
 
     @torch.no_grad()
     def acoustic_codes_to_features(self, acoustic_codes: Tensor) -> Tensor:
-        factors = self.factor_codes(acoustic_codes)
+        return self.factor_codes_to_features(self.factor_codes(acoustic_codes))
+
+    @torch.no_grad()
+    def factor_codes_to_features(self, factor_codes: Tensor) -> Tensor:
+        self._validate_factor_codes(factor_codes, stages=self.feature_codebooks)
         return torch.cat(
             tuple(
                 F.embedding(code.to(device=weight.device), weight)
                 for code, weight in zip(
-                    factors.unbind(dim=-1),
+                    factor_codes.unbind(dim=-1),
                     self.factor_codebooks,
                     strict=True,
                 )
             ),
             dim=-1,
         )
+
+    @torch.no_grad()
+    def retarget_factor_codes(
+        self,
+        acoustic_codes: Tensor,
+        predicted_factors: Tensor,
+    ) -> Tensor:
+        """Requantize each later residual after the generated prefix.
+
+        This is an oracle diagnostic because the residual is measured against the
+        target utterance's full acoustic reconstruction.
+        """
+        _ = self.factor_codes(acoustic_codes)
+        self._validate_factor_codes(predicted_factors, stages=self.feature_codebooks)
+        if predicted_factors.shape[:2] != acoustic_codes.shape[:2]:
+            raise ValueError("predicted factors and acoustic codes must align on batch and time.")
+        if self.feature_codebooks == 1:
+            return predicted_factors.clone()
+
+        target = self.backend.acoustic_codes_to_features(acoustic_codes)
+        output = predicted_factors.clone()
+        for stage_index in range(1, self.feature_codebooks):
+            prefix = output[..., : stage_index * 2]
+            projected = self._project_factor_codes(prefix, stages=stage_index)
+            residual = (target - projected).transpose(1, 2).contiguous()
+            stage = self._stages()[stage_index]
+            result = stage(residual)
+            if (
+                not isinstance(result, tuple)
+                or len(result) < 4
+                or not isinstance(result[3], Tensor)
+            ):
+                raise TypeError("LongCat quantizer stage must return code indices at position 3.")
+            composite = result[3]
+            if composite.shape != acoustic_codes.shape[:2]:
+                raise ValueError("LongCat residual code indices must align on batch and time.")
+            size_b = self._factor_sizes[stage_index][1]
+            output[..., stage_index * 2] = torch.div(
+                composite,
+                size_b,
+                rounding_mode="floor",
+            ).to(device=output.device)
+            output[..., stage_index * 2 + 1] = composite.remainder(size_b).to(
+                device=output.device
+            )
+        return output
 
     @torch.no_grad()
     def factor_codes(self, acoustic_codes: Tensor) -> Tensor:
@@ -229,6 +279,37 @@ class LongCatCodebookAdapter(nn.Module):
         if projected is None:
             raise RuntimeError("LongCat factor adapter must contain at least one stage.")
         return projected.transpose(1, 2).contiguous()
+
+    def _project_factor_codes(self, factor_codes: Tensor, *, stages: int) -> Tensor:
+        self._validate_factor_codes(factor_codes, stages=stages)
+        selected = self._stages()[:stages]
+        projected: Tensor | None = None
+        for index, stage in enumerate(selected):
+            code_a = factor_codes[..., index * 2].to(device=stage.codebook_a.weight.device)
+            code_b = factor_codes[..., index * 2 + 1].to(device=stage.codebook_b.weight.device)
+            features_a = F.embedding(code_a, stage.codebook_a.weight).transpose(1, 2).contiguous()
+            features_b = F.embedding(code_b, stage.codebook_b.weight).transpose(1, 2).contiguous()
+            value = torch.cat(
+                (stage.out_proj_a(features_a), stage.out_proj_b(features_b)),
+                dim=1,
+            )
+            projected = value if projected is None else projected + value
+        if projected is None:
+            raise RuntimeError("LongCat factor projection requires at least one stage.")
+        return projected.transpose(1, 2).contiguous()
+
+    def _validate_factor_codes(self, factor_codes: Tensor, *, stages: int) -> None:
+        if factor_codes.dim() != 3 or factor_codes.size(-1) != stages * 2:
+            raise ValueError("factor codes must have shape [batch, time, 2 * stages].")
+        if factor_codes.is_floating_point() or factor_codes.is_complex():
+            raise TypeError("factor codes must be an integer tensor.")
+        limits = torch.tensor(
+            [size for pair in self._factor_sizes[:stages] for size in pair],
+            device=factor_codes.device,
+            dtype=torch.long,
+        )
+        if bool(((factor_codes < 0) | (factor_codes >= limits)).any()):
+            raise ValueError("factor codes contain an ID outside the selected codebooks.")
 
     @torch.no_grad()
     def native_features(self, acoustic_codes: Tensor) -> Tensor:

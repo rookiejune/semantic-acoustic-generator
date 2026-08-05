@@ -129,6 +129,31 @@ def main() -> None:
                     generated,
                     active_codebooks=1,
                 )
+                retargeted = runtime.backend.retarget_factor_codes(
+                    batch.acoustic_codes,
+                    predicted,
+                )
+                retargeted_features = runtime.backend.factor_codes_to_features(retargeted)
+                audio["generated_residual_oracle"] = runtime.decode_features(
+                    semantic,
+                    retargeted_features,
+                    mask=batch.mask,
+                )
+                full_target = runtime.backend.backend.acoustic_codes_to_features(
+                    batch.acoustic_codes
+                )
+                metrics["generated_projected_mse"] = masked_feature_mse(
+                    runtime.backend.project_features(generated),
+                    full_target,
+                    batch.acoustic_mask,
+                    name="artifact set generated projection",
+                )
+                metrics["residual_oracle_projected_mse"] = masked_feature_mse(
+                    runtime.backend.project_features(retargeted_features),
+                    full_target,
+                    batch.acoustic_mask,
+                    name="artifact set residual oracle projection",
+                )
         text = batch.metadata[0].target_text
         for group, waveform in audio.items():
             path = output / group / f"sample-{sample_index:04d}.wav"

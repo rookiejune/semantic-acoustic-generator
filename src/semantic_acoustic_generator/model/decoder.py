@@ -471,24 +471,29 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         if factor_targets is None:
             raise ValueError("anchor_target=factor requires factor targets.")
         anchor = self._anchor(condition, target_mask)
-        logits = (
-            self._factor_output(anchor)
-            if self.factor_depth is None
-            else self.factor_depth(
+        if self.factor_depth is None:
+            logits = self._factor_output(anchor)
+            factor = self.anchor_factor_loss(
+                logits,
+                factor_targets,
+                target_mask,
+                validate=validate,
+                include_top1=include_details,
+                include_details=include_details,
+            )
+        else:
+            packed = self.factor_depth.forward_packed(
                 anchor,
                 factor_targets,
                 mask=target_mask,
                 validate=validate,
             )
-        )
-        factor = self.anchor_factor_loss(
-            logits,
-            factor_targets,
-            target_mask,
-            validate=validate,
-            include_top1=include_details,
-            include_details=include_details,
-        )
+            factor = self.anchor_factor_loss.forward_packed(
+                packed,
+                validate=False,
+                include_top1=include_details,
+                include_details=include_details,
+            )
         loss = factor.loss.mean()
         return DecoderLoss(
             loss=loss,
