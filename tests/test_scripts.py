@@ -10,7 +10,7 @@ import pytest
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
-from scripts import eval_artifact, smoke
+from scripts import eval_artifact, eval_artifact_set, eval_speech_manifest, smoke
 from semantic_acoustic_generator.backend import BackendConfig
 from semantic_acoustic_generator.config import DecoderConfig
 from semantic_acoustic_generator.evaluation import seeded_generator
@@ -115,6 +115,25 @@ class EvalRuntime:
 def test_seeded_generator_rejects_invalid_device() -> None:
     with pytest.raises(RuntimeError, match="device type"):
         seeded_generator("invalid", 0)
+
+
+def test_speech_manifest_falls_back_to_pcm16_wav(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sample.wav"
+    expected = torch.tensor([[[-1.0, -0.25, 0.0, 0.5, 1.0]]])
+    eval_artifact_set._write_wav(path, expected, sample_rate=16_000)
+
+    def fail_torchcodec(*args: object, **kwargs: object) -> tuple[torch.Tensor, int]:
+        del args, kwargs
+        raise RuntimeError("libtorchcodec unavailable")
+
+    monkeypatch.setattr(eval_speech_manifest.torchaudio, "load", fail_torchcodec)
+    audio, sample_rate = eval_speech_manifest._load_audio(path)
+
+    assert sample_rate == 16_000
+    torch.testing.assert_close(audio, expected[0], atol=1 / 32_768, rtol=0)
 
 
 def test_eval_artifact_generates_seeded_pair_metrics() -> None:

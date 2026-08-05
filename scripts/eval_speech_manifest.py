@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import wave
+from array import array
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+import torch
 import torchaudio
 from anytrain.evaluator.speech import SpeechEvaluator, UTMOSEvaluator, WhisperASREvaluator
 from anytrain.evaluator.text import TextComparisonEvaluator
@@ -45,7 +49,7 @@ def main() -> None:
         wav = item.get("wav")
         if not isinstance(group, str) or not isinstance(text, str) or not isinstance(wav, str):
             raise TypeError("speech manifest group, target_text, and wav must be strings.")
-        audio, sample_rate = torchaudio.load(wav)
+        audio, sample_rate = _load_audio(Path(wav))
         prediction = evaluator.asr.transcribe(audio, sample_rate)
         if not isinstance(prediction, str):
             if len(prediction) != 1:
@@ -95,6 +99,36 @@ def main() -> None:
         encoding="utf-8",
     )
     print(json.dumps({"summary": summary}, sort_keys=True))
+
+
+def _load_audio(path: Path) -> tuple[torch.Tensor, int]:
+    try:
+        return torchaudio.load(path)
+    except RuntimeError:
+        try:
+            return _load_pcm16_wav(path)
+        except (OSError, ValueError, wave.Error) as fallback_error:
+            raise RuntimeError(
+                f"failed to load {path} with torchaudio or the PCM16 WAV fallback"
+            ) from fallback_error
+
+
+def _load_pcm16_wav(path: Path) -> tuple[torch.Tensor, int]:
+    with wave.open(str(path), "rb") as source:
+        channels = source.getnchannels()
+        sample_width = source.getsampwidth()
+        sample_rate = source.getframerate()
+        frames = source.readframes(source.getnframes())
+    if channels <= 0 or sample_width != 2:
+        raise ValueError("PCM WAV fallback requires at least one channel and 16-bit samples.")
+    pcm = array("h")
+    pcm.frombytes(frames)
+    if sys.byteorder == "big":
+        pcm.byteswap()
+    if len(pcm) % channels:
+        raise ValueError("PCM WAV samples are not divisible by the channel count.")
+    audio = torch.tensor(pcm, dtype=torch.float32).view(-1, channels).transpose(0, 1)
+    return audio.div_(32_768), sample_rate
 
 
 def _args() -> argparse.Namespace:
