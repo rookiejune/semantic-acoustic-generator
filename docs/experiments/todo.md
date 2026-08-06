@@ -2,20 +2,24 @@
 
 本文只记录未完成事项。完成项应移动到 `docs/experiments/results/` 或由 git 历史保留。
 
-## P0: 014 LongCat Factor Depth-AR Probe
+## P0: 015 LongCat Factor Depth Formal Comparison
 
-- id: sac-014-longcat-factor-depth
+- id: sac-015-longcat-factor-depth-formal
 - state: running
-- entry: jobs/014/01_factor_depth.sh
+- entry: jobs/015/01_factor_recurrent.sh; jobs/015/02_factor_qwen_baseline.sh
 - num_gpus: 1
 - gpu: 1x4090-24GB
-- min_vram_gb_per_gpu: 12
-- preferred_hosts: 144,145,125
+- min_vram_gb_per_gpu: 18; Qwen batch96 probe measured 13.99GiB reserved peak with margin
+- preferred_hosts: 145,144,125
 - estimated_hours: 2
-- monitor: TensorBoard factor loss/top-1 and performance metrics + training log + nvidia-smi
-- ready_gate: passed; 128-sample/2k overfit reached at least 99.7% teacher-forced top-1 on all factors, with about 0.3pp stage-1 free-running gap
-- output_root: $SEMANTIC_ACOUSTIC_GENERATOR_TRAIN_ROOT/014
-- task: N2 depth-AR 10k/2k main 已完成；heldout factor/feature 已导出，Anytrain Whisper large-v3/UTMOS 正在 `121`/GPU1 评估 full N2 与 stage0-only，随后与 N1 和 013 parallel N2 对照。
+- monitor: TensorBoard factor loss/top-1 + valid frames/s/padding + training log + nvidia-smi
+- ready_gate: passed; strict target-role 9984/16 split, recurrent-original and Qwen-original 2k full-N2 both beat their stage0-only UTMOS with unchanged WER; batch96/1152s probe passed with margin
+- output_root: $SEMANTIC_ACOUSTIC_GENERATOR_TRAIN_ROOT/015
+- host: 145
+- cuda_visible_devices: 0
+- started_at: 2026-08-06T04:41:57+08:00
+- run: recurrent-original 正在运行，成功后由同一 tmux controller 串行启动 Qwen-original
+- task: 监控两组 20k 正式训练；checkpoint 先写本机盘，完成后用同一 heldout manifest 和 Anytrain evaluator 统一评估。
 
 ## P0: 006/007 Fixed Eval Review
 
