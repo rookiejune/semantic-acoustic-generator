@@ -22,7 +22,7 @@ from semantic_acoustic_generator.config import (
     Initialization,
     Route,
 )
-from semantic_acoustic_generator.model.decoder import AcousticCodeSampler, FeatureSampler
+from semantic_acoustic_generator.model.generator import AcousticCodeSampler, FeatureSampler
 from semantic_acoustic_generator.model.routes import RouteModules, build_route
 from semantic_acoustic_generator.runtime.metadata import (
     support_metadata,

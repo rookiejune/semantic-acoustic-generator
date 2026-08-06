@@ -15,7 +15,7 @@ from semantic_acoustic_generator.backend.adapter import (
     LongCatCodebookAdapter,
     LongCatFirstCodebookAdapter,
 )
-from semantic_acoustic_generator.model.decoder import FMFeatureGenerator
+from semantic_acoustic_generator.model.feature import FMFeatureGenerator
 from semantic_acoustic_generator.types import GeneratorBatch
 
 if TYPE_CHECKING:

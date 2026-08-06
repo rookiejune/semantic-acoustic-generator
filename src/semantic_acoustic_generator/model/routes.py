@@ -6,17 +6,13 @@ from typing import TYPE_CHECKING
 from anytrain.codec import AcousticLayout
 
 from semantic_acoustic_generator.config import DecoderConfig, FMMode, Initialization, Route
+from semantic_acoustic_generator.model.code import RVQCodeGenerator
 from semantic_acoustic_generator.model.condition import ReferenceConditioner, SemanticConditioner
-from semantic_acoustic_generator.model.decoder import (
-    AcousticUnitGenerator,
-    FMFeatureGenerator,
-    RVQCodeGenerator,
-)
+from semantic_acoustic_generator.model.feature import FMFeatureGenerator
+from semantic_acoustic_generator.model.generator import AcousticUnitGenerator
 
 if TYPE_CHECKING:
     from torch import Tensor
-
-
 
 @dataclass(frozen=True)
 class RouteModules:

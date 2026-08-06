@@ -17,7 +17,8 @@ from lightning import LightningModule
 from semantic_acoustic_generator.backend import LongCatCodebookAdapter, adapt_backend
 from semantic_acoustic_generator.config import AnchorTarget, FactorPredictor, Route
 from semantic_acoustic_generator.loss.repa import decode_group_metrics
-from semantic_acoustic_generator.model.decoder import FMFeatureGenerator, RVQCodeGenerator
+from semantic_acoustic_generator.model.code import RVQCodeGenerator
+from semantic_acoustic_generator.model.feature import FMFeatureGenerator
 from semantic_acoustic_generator.runtime.artifact import save_artifact
 from semantic_acoustic_generator.runtime.semantic import (
     GeneratorConfig,

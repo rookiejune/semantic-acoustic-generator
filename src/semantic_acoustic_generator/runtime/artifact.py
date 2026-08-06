@@ -27,12 +27,9 @@ from semantic_acoustic_generator.config import (
     Route,
     RVQPredictor,
 )
-from semantic_acoustic_generator.model.decoder import (
-    AcousticUnitGenerator,
-    FMFeatureGenerator,
-    RVQCodeGenerator,
-    factor_codebook_names,
-)
+from semantic_acoustic_generator.model.code import RVQCodeGenerator
+from semantic_acoustic_generator.model.feature import FMFeatureGenerator, factor_codebook_names
+from semantic_acoustic_generator.model.generator import AcousticUnitGenerator
 from semantic_acoustic_generator.runtime.metadata import (
     support_metadata,
     validate_backend_metadata,
