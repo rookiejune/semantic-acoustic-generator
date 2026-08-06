@@ -44,6 +44,19 @@ parameters，local-4 anchor 为 `3.690M`，treatment 反而少约 `10%`；远端
 5. 5k full-N2 WER 不恶化、UTMOS 高于 015 local-5k，才保留 Qwen-FiLM；否则回到 local anchor，
    后续只做更轻量的 dilation/gated temporal mixer。
 
+## Probe 结果
+
+2026-08-06 在 125/RTX 3090 GPU0 做了同卡、同 batch96 / 1152 seconds、同 130-step callback
+口径的严格校准：
+
+| anchor | params | step time | valid frames/s | peak allocated / reserved |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen-FiLM-1 | 17.8M | `54.8 ms` | `136.47k` | `5.15 / 5.95 GiB` |
+| local-4 | 18.2M | `49.8 ms` | `150.18k` | `5.15 / 5.92 GiB` |
+
+Qwen-FiLM 保留 local baseline `90.9%` 的吞吐，step time 高 `10.1%`，显存基本相同；2-step
+LongCat artifact export/reload 和 heldout decode 同时通过，因此进入 5k gate。
+
 ## 入口
 
 - treatment: `jobs/016/01_qwen_film_recurrent.sh`
