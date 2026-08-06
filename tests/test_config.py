@@ -113,6 +113,20 @@ def test_decoder_options_parses_recurrent_factor_predictor() -> None:
     assert config.factor_predictor is FactorPredictor.DEPTH_RECURRENT
 
 
+def test_decoder_options_parses_qwen_film_anchor() -> None:
+    config = decoder_options(
+        {
+            "layers": 2,
+            "heads": 8,
+            "ffn_ratio": 2,
+            "fm_mode": "anchor",
+            "anchor_context": "qwen_film",
+        }
+    )
+
+    assert config.anchor_context is AnchorContext.QWEN_FILM
+
+
 def test_decoder_options_rejects_non_finite_repa_weight() -> None:
     with pytest.raises(ValueError, match="repa_loss_weight must be finite"):
         decoder_options(
@@ -130,6 +144,13 @@ def test_transformer_anchor_requires_heads_to_divide_hidden_dim() -> None:
         DecoderConfig(
             heads=3,
             anchor_context=AnchorContext.TRANSFORMER,
+            anchor_hidden_dim=8,
+        )
+
+    with pytest.raises(ValueError, match="divisible by heads"):
+        DecoderConfig(
+            heads=3,
+            anchor_context=AnchorContext.QWEN_FILM,
             anchor_hidden_dim=8,
         )
 
@@ -361,6 +382,21 @@ def test_longcat_factor_recurrent_experiment_is_formal_and_frame_aligned() -> No
     assert config.pl_module.residual_retarget is False
     assert config.callback.performance.enabled is False
     assert config.trainer.max_steps == 20000
+
+
+def test_longcat_qwen_film_experiment_is_frame_aligned() -> None:
+    config = parse_train_config(_compose("experiment=016_longcat_qwen_film_anchor"))
+
+    assert config.model.feature_adapter is FeatureAdapter.LONGCAT_CODEBOOKS
+    assert config.model.feature_codebooks == 2
+    assert config.model.decoder.anchor_context is AnchorContext.QWEN_FILM
+    assert config.model.decoder.anchor_layers == 1
+    assert config.model.decoder.factor_predictor is FactorPredictor.DEPTH_RECURRENT
+    assert config.datamodule.sample_limit == 9984
+    assert config.datamodule.batch_size == 96
+    assert config.datamodule.batching.max_batch_seconds == 1152.0
+    assert config.pl_module.residual_retarget is False
+    assert config.trainer.max_steps == 5000
 
 
 def test_residual_retarget_requires_recurrent_factor_predictor() -> None:

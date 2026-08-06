@@ -30,6 +30,7 @@ class FMMode(StrEnum):
 class AnchorContext(StrEnum):
     LOCAL = auto()
     TRANSFORMER = auto()
+    QWEN_FILM = auto()
 
 
 class AnchorTarget(StrEnum):
@@ -113,10 +114,10 @@ class DecoderConfig:
         if self.anchor_hidden_dim <= 0 or self.anchor_layers <= 0:
             raise ValueError("anchor hidden_dim and layers must be positive.")
         if (
-            self.anchor_context is AnchorContext.TRANSFORMER
+            self.anchor_context in {AnchorContext.TRANSFORMER, AnchorContext.QWEN_FILM}
             and self.anchor_hidden_dim % self.heads != 0
         ):
-            raise ValueError("transformer anchor hidden_dim must be divisible by heads.")
+            raise ValueError("attention anchor hidden_dim must be divisible by heads.")
         if self.anchor_kernel_size <= 0 or self.anchor_kernel_size % 2 == 0:
             raise ValueError("anchor_kernel_size must be a positive odd integer.")
         if self.anchor_cosine_weight < 0 or self.anchor_factor_weight < 0:

@@ -337,6 +337,54 @@ def test_transformer_anchor_preserves_frame_alignment_and_padding() -> None:
     assert torch.equal(sample[1, 3:], torch.zeros_like(sample[1, 3:]))
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("transformers") is None,
+    reason="Qwen FiLM anchor requires transformers",
+)
+def test_qwen_film_anchor_preserves_alignment_and_uses_full_time_context() -> None:
+    torch.manual_seed(0)
+    condition = torch.randn(2, 5, 8)
+    mask = torch.tensor([[True, True, True, True, True], [True, True, True, False, False]])
+    generator = FMFeatureGenerator(
+        8,
+        6,
+        DecoderConfig(
+            heads=2,
+            ffn_ratio=2,
+            fm_mode=FMMode.ANCHOR,
+            anchor_context=AnchorContext.QWEN_FILM,
+            anchor_hidden_dim=8,
+            anchor_layers=1,
+        ),
+    )
+
+    sample = generator.sample_features(
+        condition,
+        mask,
+        feature_mean=torch.zeros(1, 1, 6),
+        feature_std=torch.ones(1, 1, 6),
+        flow_steps=1,
+    )
+    changed = condition.clone()
+    changed[0, -1] += 10
+    changed_sample = generator.sample_features(
+        changed,
+        mask,
+        feature_mean=torch.zeros(1, 1, 6),
+        feature_std=torch.ones(1, 1, 6),
+        flow_steps=1,
+    )
+
+    assert sample.shape == (2, 5, 6)
+    assert generator.anchor is not None
+    generator.anchor(condition, mask).square().mean().backward()
+    assert generator.anchor.context is AnchorContext.QWEN_FILM
+    assert not torch.allclose(sample[0, 0], changed_sample[0, 0])
+    assert torch.equal(sample[1, 3:], torch.zeros_like(sample[1, 3:]))
+    film_weight = dict(generator.named_parameters())["anchor.blocks.0.film.2.weight"]
+    assert film_weight.grad is not None
+
+
 def test_residual_fm_trains_flow_and_anchor() -> None:
     condition = torch.randn(1, 3, 4)
     target = torch.randn(1, 3, 4)

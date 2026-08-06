@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -11,6 +11,10 @@ from semantic_acoustic_generator.config import AnchorContext, Initialization
 
 if TYPE_CHECKING:
     from torch import Tensor
+    from transformers.models.qwen3.modeling_qwen3 import (
+        Qwen3DecoderLayer,
+        Qwen3RotaryEmbedding,
+    )
 
 
 class SemanticConditioner(nn.Module):
@@ -203,17 +207,33 @@ class AlignedAnchor(nn.Module):
             raise TypeError("aligned anchor context must be an AnchorContext.")
         if heads <= 0 or ffn_ratio <= 0:
             raise ValueError("aligned anchor heads and ffn_ratio must be positive.")
-        if context is AnchorContext.TRANSFORMER and hidden_dim % heads != 0:
-            raise ValueError("transformer anchor hidden_dim must be divisible by heads.")
+        if (
+            context in {AnchorContext.TRANSFORMER, AnchorContext.QWEN_FILM}
+            and hidden_dim % heads != 0
+        ):
+            raise ValueError("attention anchor hidden_dim must be divisible by heads.")
         self.context = context
         self.input = nn.Linear(condition_dim, hidden_dim)
         if context is AnchorContext.LOCAL:
             blocks = [_LocalAnchorBlock(hidden_dim, kernel_size=kernel_size) for _ in range(layers)]
-        else:
+            self.qwen_rotary = None
+        elif context is AnchorContext.TRANSFORMER:
             blocks = [
                 _TransformerAnchorBlock(hidden_dim, heads=heads, ffn_ratio=ffn_ratio)
                 for _ in range(layers)
             ]
+            self.qwen_rotary = None
+        else:
+            blocks = [
+                _QwenFiLMAnchorBlock(
+                    hidden_dim,
+                    heads=heads,
+                    ffn_ratio=ffn_ratio,
+                    layer=layer,
+                )
+                for layer in range(layers)
+            ]
+            self.qwen_rotary = _qwen_rotary(hidden_dim // heads)
         self.blocks = nn.ModuleList(blocks)
         self.norm = nn.LayerNorm(hidden_dim)
         self.output = nn.Linear(hidden_dim, feature_dim)
@@ -223,14 +243,35 @@ class AlignedAnchor(nn.Module):
             raise ValueError("aligned anchor condition and mask must align on [batch, frame].")
         if mask.dtype != torch.bool:
             raise TypeError("aligned anchor mask must be boolean.")
-        hidden = self.input(condition).masked_fill(~mask[..., None], 0)
+        aligned = self.input(condition).masked_fill(~mask[..., None], 0)
+        hidden = aligned
         if self.context is AnchorContext.TRANSFORMER:
             hidden = (hidden + _sinusoidal_positions(hidden)).masked_fill(
                 ~mask[..., None],
                 0,
             )
-        for block in self.blocks:
-            hidden = block(hidden, mask)
+        if self.context is AnchorContext.QWEN_FILM:
+            if self.qwen_rotary is None:
+                raise RuntimeError("Qwen FiLM anchor is missing rotary embeddings.")
+            positions = torch.arange(hidden.size(1), device=hidden.device, dtype=torch.long)
+            position_ids = positions[None].expand(hidden.size(0), -1)
+            position_embeddings = cast(
+                "tuple[Tensor, Tensor]",
+                self.qwen_rotary(hidden, position_ids),
+            )
+            attention_mask = _qwen_attention_mask(mask, dtype=hidden.dtype)
+            for block in self.blocks:
+                qwen = cast(_QwenFiLMAnchorBlock, block)
+                hidden = qwen(
+                    hidden,
+                    aligned,
+                    mask,
+                    attention_mask=attention_mask,
+                    position_embeddings=position_embeddings,
+                )
+        else:
+            for block in self.blocks:
+                hidden = block(hidden, mask)
         return self.output(self.norm(hidden)).masked_fill(~mask[..., None], 0)
 
 
@@ -285,6 +326,117 @@ class _TransformerAnchorBlock(nn.Module):
         hidden = (hidden + value).masked_fill(~mask[..., None], 0)
         value = self.ffn(self.ffn_norm(hidden))
         return (hidden + value).masked_fill(~mask[..., None], 0)
+
+
+class _QwenFiLMAnchorBlock(nn.Module):
+    """Bidirectional Qwen temporal block with frame-aligned semantic FiLM."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        heads: int,
+        ffn_ratio: int,
+        layer: int,
+    ) -> None:
+        super().__init__()
+        self.layer = _qwen_layer(
+            hidden_dim,
+            heads=heads,
+            ffn_ratio=ffn_ratio,
+            layer=layer,
+        )
+        film_dim = max(hidden_dim // 8, 8)
+        self.film = nn.Sequential(
+            nn.Linear(hidden_dim, film_dim),
+            nn.SiLU(),
+            nn.Linear(film_dim, hidden_dim * 4),
+        )
+        output = cast(nn.Linear, self.film[-1])
+        nn.init.zeros_(output.weight)
+        nn.init.zeros_(output.bias)
+
+    def forward(
+        self,
+        hidden: Tensor,
+        condition: Tensor,
+        mask: Tensor,
+        *,
+        attention_mask: Tensor,
+        position_embeddings: tuple[Tensor, Tensor],
+    ) -> Tensor:
+        attention_shift, attention_scale, ffn_shift, ffn_scale = self.film(condition).chunk(
+            4,
+            dim=-1,
+        )
+        residual = hidden
+        value = self.layer.input_layernorm(hidden)
+        value = value * (1 + attention_scale) + attention_shift
+        value, _ = self.layer.self_attn(
+            hidden_states=value,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            use_cache=False,
+            cache_position=None,
+            position_embeddings=position_embeddings,
+        )
+        hidden = (residual + value).masked_fill(~mask[..., None], 0)
+
+        residual = hidden
+        value = self.layer.post_attention_layernorm(hidden)
+        value = value * (1 + ffn_scale) + ffn_shift
+        value = self.layer.mlp(value)
+        return (residual + value).masked_fill(~mask[..., None], 0)
+
+
+def _qwen_layer(
+    hidden_dim: int,
+    *,
+    heads: int,
+    ffn_ratio: int,
+    layer: int,
+) -> Qwen3DecoderLayer:
+    try:
+        from anytrain.module.qwen import build_qwen3_decoder_layer
+
+        return cast(
+            "Qwen3DecoderLayer",
+            build_qwen3_decoder_layer(
+                hidden_dim,
+                hidden_dim * ffn_ratio,
+                num_attention_heads=heads,
+                num_key_value_heads=heads,
+                head_dim=hidden_dim // heads,
+                layer_idx=layer,
+                _attn_implementation="sdpa",
+            ),
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "Qwen FiLM anchors require transformers>=4.51.0; "
+            "install semantic-acoustic-generator[rvq]."
+        ) from exc
+
+
+def _qwen_rotary(head_dim: int) -> Qwen3RotaryEmbedding:
+    try:
+        from anytrain.module.qwen import build_qwen3_rotary_embedding
+
+        return cast("Qwen3RotaryEmbedding", build_qwen3_rotary_embedding(head_dim))
+    except ImportError as exc:
+        raise ImportError(
+            "Qwen FiLM anchors require transformers>=4.51.0; "
+            "install semantic-acoustic-generator[rvq]."
+        ) from exc
+
+
+def _qwen_attention_mask(mask: Tensor, *, dtype: torch.dtype) -> Tensor:
+    attention_mask = torch.zeros(
+        (mask.size(0), 1, 1, mask.size(1)),
+        device=mask.device,
+        dtype=dtype,
+    )
+    return attention_mask.masked_fill(~mask[:, None, None, :], torch.finfo(dtype).min)
 
 
 def _sinusoidal_positions(hidden: Tensor) -> Tensor:
