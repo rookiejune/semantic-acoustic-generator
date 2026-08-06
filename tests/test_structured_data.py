@@ -157,7 +157,7 @@ def test_batch_shape_validation_precedes_codebook_axis_access() -> None:
         )
 
 
-def test_semantic_codec_batch_to_moves_reference_tensors() -> None:
+def test_generator_batch_to_moves_reference_tensors() -> None:
     batch = _paired_batch()
 
     moved = batch.to("cpu")
@@ -172,6 +172,16 @@ def test_semantic_codec_batch_to_moves_reference_tensors() -> None:
     assert moved.reference_acoustic_codes.device.type == "cpu"
     assert moved.reference_mask.device.type == "cpu"
     assert moved.reference_acoustic_mask.device.type == "cpu"
+
+
+def test_batch_structure_is_read_only_after_validation() -> None:
+    batch = _paired_batch()
+
+    with pytest.raises(AttributeError):
+        batch.mask = torch.zeros_like(batch.mask)
+
+    with pytest.raises(AttributeError):
+        batch.metadata = ()
 
 
 def test_batch_tensor_transforms_do_not_repeat_value_validation(

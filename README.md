@@ -3,7 +3,7 @@
 `semantic-acoustic-generator` 是 reference-optional 的 semantic-to-acoustic 生成扩展：输入 semantic
 codes 和可选 reference acoustic features，生成外部 codec backend 解码所需的 acoustic features 或 codes。
 codec 的编码、解码、码本结构和 backend 实现不属于本仓库；主力实现由 AnyCodec 持有，当前代码通过
-`anytrain.codec.SemanticAcousticCodec` 契约接入 LongCat / BiCodec。
+`anytrain.codec.SemanticAcousticCodec` 契约接入 frame-aligned LongCat backend。
 
 训练主线消费 workspace 离线生成的 Qwen speaker grid codec units；`qwen_cross_text` 为每个 target 选择同
 speaker、不同 utterance 和不同文本的 reference。推理可以只使用 semantic codes 和 learned null
@@ -12,7 +12,7 @@ condition，也可以额外提供 reference acoustic features。
 仓库边界：
 
 - 不实现或封装新的 codec；只消费外部 backend 契约，并提供薄 runtime composition。
-- 支持 FM 与 RVQ 两条 generator 路线；BiCodec RVQ 通过 temporal MTP 沿 32-slot 轴生成。
+- 支持 FM 与 RVQ 两条 frame-aligned generator 路线；BiCodec 的 semantic/global layout 不属于本工程。
 - 持有 generator 的数据适配、训练、with-reference / without-reference 评估和 artifact 导出。
 - 不依赖 `speech-to-speech`；下游由 `speech-to-speech` 依赖本仓库。
 
@@ -129,14 +129,11 @@ jobs/010/02_anchor_overfit.sh
 jobs/010/03_eval_artifact_set.sh
 ```
 
-四条正式路线分别由 `experiment=001_longcat_fm|001_longcat_rvq|001_bicodec_fm|001_bicodec_rvq`
-完整组合，也有对应的 job wrapper：
+两条正式路线分别由 `experiment=001_longcat_fm|001_longcat_rvq` 完整组合，也有对应的 job wrapper：
 
 ```text
 jobs/001/01_longcat_dit.sh
 jobs/001/02_longcat_rvq.sh
-jobs/001/03_bicodec_dit.sh
-jobs/001/04_bicodec_rvq.sh
 ```
 
 训练输出目录默认由 `SEMANTIC_ACOUSTIC_GENERATOR_TRAIN_ROOT` 和 `output_subdir` 决定，也可以用

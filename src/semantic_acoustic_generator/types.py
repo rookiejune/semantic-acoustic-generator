@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from anytrain.codec import AcousticLayout
 from torch import Tensor
 
 from semantic_acoustic_generator._tensor import is_signed_integer_dtype
+
+_VALIDATED_BATCH_COPY = object()
 
 
 @dataclass(frozen=True)
@@ -97,77 +99,175 @@ class BatchSide:
     acoustic_mask: Tensor
 
 
-@dataclass(eq=False)
 class GeneratorBatch:
-    semantic_codes: Tensor
-    acoustic_codes: Tensor
-    mask: Tensor
-    semantic_pad_id: int
-    acoustic_pad_ids: tuple[int, ...]
-    acoustic_mask: Tensor
-    acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED
-    reference_semantic_codes: Tensor | None = None
-    reference_acoustic_codes: Tensor | None = None
-    reference_mask: Tensor | None = None
-    reference_acoustic_mask: Tensor | None = None
-    metadata: tuple[PairMetadata, ...] = ()
-    _semantic_valid_frames: int = field(init=False, repr=False)
-    _semantic_padded_frames: int = field(init=False, repr=False)
-    _acoustic_valid_units: int = field(init=False, repr=False)
+    """Validated frame-aligned batch with a read-only public structure.
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.acoustic_layout, AcousticLayout):
+    Tensor contents remain ordinary PyTorch values, but callers cannot replace a field and
+    silently detach the cached unit counts from the masks they describe.
+    """
+
+    __slots__ = (
+        "_semantic_codes",
+        "_acoustic_codes",
+        "_mask",
+        "_semantic_pad_id",
+        "_acoustic_pad_ids",
+        "_acoustic_mask",
+        "_acoustic_layout",
+        "_reference_semantic_codes",
+        "_reference_acoustic_codes",
+        "_reference_mask",
+        "_reference_acoustic_mask",
+        "_metadata",
+        "_semantic_valid_frames",
+        "_semantic_padded_frames",
+        "_acoustic_valid_units",
+    )
+
+    def __init__(
+        self,
+        *,
+        semantic_codes: Tensor,
+        acoustic_codes: Tensor,
+        mask: Tensor,
+        semantic_pad_id: int,
+        acoustic_pad_ids: tuple[int, ...],
+        acoustic_mask: Tensor,
+        acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
+        reference_semantic_codes: Tensor | None = None,
+        reference_acoustic_codes: Tensor | None = None,
+        reference_mask: Tensor | None = None,
+        reference_acoustic_mask: Tensor | None = None,
+        metadata: tuple[PairMetadata, ...] = (),
+        _validated_counts: tuple[int, int, int] | None = None,
+        _copy_token: object | None = None,
+    ) -> None:
+        if _validated_counts is not None and _copy_token is not _VALIDATED_BATCH_COPY:
+            raise TypeError("validated batch counts are private to tensor-preserving copies.")
+        if not isinstance(acoustic_layout, AcousticLayout):
             raise TypeError("acoustic_layout must be an AcousticLayout.")
-        if self.acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
+        if acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
             raise ValueError(
                 "GeneratorBatch supports only frame-aligned semantic/acoustic units."
             )
-        _check_positive_int(self.semantic_pad_id, name="semantic_pad_id")
-        for index, pad_id in enumerate(self.acoustic_pad_ids):
+        _check_positive_int(semantic_pad_id, name="semantic_pad_id")
+        for index, pad_id in enumerate(acoustic_pad_ids):
             _check_positive_int(pad_id, name=f"acoustic_pad_ids[{index}]")
-        _validate_side(
-            semantic_codes=self.semantic_codes,
-            acoustic_codes=self.acoustic_codes,
-            mask=self.mask,
-            acoustic_mask=self.acoustic_mask,
-            semantic_pad_id=self.semantic_pad_id,
-            acoustic_pad_ids=self.acoustic_pad_ids,
-            acoustic_layout=self.acoustic_layout,
-            name="target",
-        )
-        self._semantic_valid_frames = int(self.mask.sum().item())
-        self._semantic_padded_frames = self.mask.numel()
-        self._acoustic_valid_units = int(self.acoustic_mask.sum().item())
+        if _validated_counts is None:
+            _validate_side(
+                semantic_codes=semantic_codes,
+                acoustic_codes=acoustic_codes,
+                mask=mask,
+                acoustic_mask=acoustic_mask,
+                semantic_pad_id=semantic_pad_id,
+                acoustic_pad_ids=acoustic_pad_ids,
+                acoustic_layout=acoustic_layout,
+                name="target",
+            )
+            counts = (
+                int(mask.sum().item()),
+                mask.numel(),
+                int(acoustic_mask.sum().item()),
+            )
+        else:
+            counts = _validated_counts
         references = (
-            self.reference_semantic_codes,
-            self.reference_acoustic_codes,
-            self.reference_mask,
-            self.reference_acoustic_mask,
+            reference_semantic_codes,
+            reference_acoustic_codes,
+            reference_mask,
+            reference_acoustic_mask,
         )
         if all(value is None for value in references):
-            if self.metadata:
+            if metadata:
                 raise ValueError("pair metadata requires reference codec units.")
-            return
-        if any(value is None for value in references):
+        elif any(value is None for value in references):
             raise ValueError("reference codec units and masks must be provided together.")
-        reference_semantic = _tensor(self.reference_semantic_codes)
-        reference_acoustic = _tensor(self.reference_acoustic_codes)
-        reference_mask = _tensor(self.reference_mask)
-        reference_acoustic_mask = _tensor(self.reference_acoustic_mask)
-        _validate_side(
-            semantic_codes=reference_semantic,
-            acoustic_codes=reference_acoustic,
-            mask=reference_mask,
-            acoustic_mask=reference_acoustic_mask,
-            semantic_pad_id=self.semantic_pad_id,
-            acoustic_pad_ids=self.acoustic_pad_ids,
-            acoustic_layout=self.acoustic_layout,
-            name="reference",
-        )
-        if reference_semantic.size(0) != self.semantic_codes.size(0):
-            raise ValueError("target and reference batch sizes must match.")
-        if len(self.metadata) != self.semantic_codes.size(0):
-            raise ValueError("pair metadata must contain one item per batch row.")
+        else:
+            reference_semantic = _tensor(reference_semantic_codes)
+            reference_acoustic = _tensor(reference_acoustic_codes)
+            required_reference_mask = _tensor(reference_mask)
+            required_reference_acoustic_mask = _tensor(reference_acoustic_mask)
+            if _validated_counts is None:
+                _validate_side(
+                    semantic_codes=reference_semantic,
+                    acoustic_codes=reference_acoustic,
+                    mask=required_reference_mask,
+                    acoustic_mask=required_reference_acoustic_mask,
+                    semantic_pad_id=semantic_pad_id,
+                    acoustic_pad_ids=acoustic_pad_ids,
+                    acoustic_layout=acoustic_layout,
+                    name="reference",
+                )
+            if reference_semantic.size(0) != semantic_codes.size(0):
+                raise ValueError("target and reference batch sizes must match.")
+            if len(metadata) != semantic_codes.size(0):
+                raise ValueError("pair metadata must contain one item per batch row.")
+
+        self._semantic_codes = semantic_codes
+        self._acoustic_codes = acoustic_codes
+        self._mask = mask
+        self._semantic_pad_id = semantic_pad_id
+        self._acoustic_pad_ids = acoustic_pad_ids
+        self._acoustic_mask = acoustic_mask
+        self._acoustic_layout = acoustic_layout
+        self._reference_semantic_codes = reference_semantic_codes
+        self._reference_acoustic_codes = reference_acoustic_codes
+        self._reference_mask = reference_mask
+        self._reference_acoustic_mask = reference_acoustic_mask
+        self._metadata = metadata
+        (
+            self._semantic_valid_frames,
+            self._semantic_padded_frames,
+            self._acoustic_valid_units,
+        ) = counts
+
+    @property
+    def semantic_codes(self) -> Tensor:
+        return self._semantic_codes
+
+    @property
+    def acoustic_codes(self) -> Tensor:
+        return self._acoustic_codes
+
+    @property
+    def mask(self) -> Tensor:
+        return self._mask
+
+    @property
+    def semantic_pad_id(self) -> int:
+        return self._semantic_pad_id
+
+    @property
+    def acoustic_pad_ids(self) -> tuple[int, ...]:
+        return self._acoustic_pad_ids
+
+    @property
+    def acoustic_mask(self) -> Tensor:
+        return self._acoustic_mask
+
+    @property
+    def acoustic_layout(self) -> AcousticLayout:
+        return self._acoustic_layout
+
+    @property
+    def reference_semantic_codes(self) -> Tensor | None:
+        return self._reference_semantic_codes
+
+    @property
+    def reference_acoustic_codes(self) -> Tensor | None:
+        return self._reference_acoustic_codes
+
+    @property
+    def reference_mask(self) -> Tensor | None:
+        return self._reference_mask
+
+    @property
+    def reference_acoustic_mask(self) -> Tensor | None:
+        return self._reference_acoustic_mask
+
+    @property
+    def metadata(self) -> tuple[PairMetadata, ...]:
+        return self._metadata
 
     @property
     def semantic_valid_frames(self) -> int:
@@ -238,7 +338,7 @@ class GeneratorBatch:
         def optional(value: Tensor | None) -> Tensor | None:
             return None if value is None else required(value)
 
-        return self._from_validated(
+        return GeneratorBatch(
             semantic_codes=required(self.semantic_codes),
             acoustic_codes=required(self.acoustic_codes),
             mask=required(self.mask),
@@ -251,49 +351,13 @@ class GeneratorBatch:
             reference_mask=optional(self.reference_mask),
             reference_acoustic_mask=optional(self.reference_acoustic_mask),
             metadata=self.metadata,
-            semantic_valid_frames=self.semantic_valid_frames,
-            semantic_padded_frames=self.semantic_padded_frames,
-            acoustic_valid_units=self.acoustic_valid_units,
+            _validated_counts=(
+                self.semantic_valid_frames,
+                self.semantic_padded_frames,
+                self.acoustic_valid_units,
+            ),
+            _copy_token=_VALIDATED_BATCH_COPY,
         )
-
-    @classmethod
-    def _from_validated(
-        cls,
-        *,
-        semantic_codes: Tensor,
-        acoustic_codes: Tensor,
-        mask: Tensor,
-        semantic_pad_id: int,
-        acoustic_pad_ids: tuple[int, ...],
-        acoustic_mask: Tensor,
-        acoustic_layout: AcousticLayout,
-        reference_semantic_codes: Tensor | None,
-        reference_acoustic_codes: Tensor | None,
-        reference_mask: Tensor | None,
-        reference_acoustic_mask: Tensor | None,
-        metadata: tuple[PairMetadata, ...],
-        semantic_valid_frames: int,
-        semantic_padded_frames: int,
-        acoustic_valid_units: int,
-    ) -> GeneratorBatch:
-        """Copy an already validated batch after a tensor-preserving transform."""
-        batch = object.__new__(cls)
-        batch.semantic_codes = semantic_codes
-        batch.acoustic_codes = acoustic_codes
-        batch.mask = mask
-        batch.semantic_pad_id = semantic_pad_id
-        batch.acoustic_pad_ids = acoustic_pad_ids
-        batch.acoustic_mask = acoustic_mask
-        batch.acoustic_layout = acoustic_layout
-        batch.reference_semantic_codes = reference_semantic_codes
-        batch.reference_acoustic_codes = reference_acoustic_codes
-        batch.reference_mask = reference_mask
-        batch.reference_acoustic_mask = reference_acoustic_mask
-        batch.metadata = metadata
-        batch._semantic_valid_frames = semantic_valid_frames
-        batch._semantic_padded_frames = semantic_padded_frames
-        batch._acoustic_valid_units = acoustic_valid_units
-        return batch
 
 
 def _validate_side(
@@ -333,7 +397,7 @@ def _validate_side(
     if not is_signed_integer_dtype(acoustic_codes.dtype):
         raise TypeError(f"{name} acoustic_codes must use a signed integer dtype.")
     if semantic_codes.size(0) < 1 or semantic_codes.size(1) < 1:
-        raise ValueError(f"{name} codec batch must not be empty.")
+        raise ValueError(f"{name} generator batch must not be empty.")
     if not bool(mask.any(dim=1).all()):
         raise ValueError(f"each {name} batch row must contain at least one valid frame.")
     if not bool(acoustic_mask.any(dim=1).all()):
@@ -364,7 +428,7 @@ def _tensor(value: Tensor | None) -> Tensor:
 
 def _required_reference(value: Tensor | None, *, name: str) -> Tensor:
     if value is None:
-        raise RuntimeError(f"{name} is required for paired semantic codec batches.")
+        raise RuntimeError(f"{name} is required for paired generator batches.")
     return value
 
 

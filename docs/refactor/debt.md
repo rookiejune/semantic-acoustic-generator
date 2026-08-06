@@ -25,9 +25,7 @@ Do not use this file for experiment logs, benchmark results, private paths, remo
 
 ## Debt Index
 
-| ID | Priority | Summary |
-|---|---|---|
-| [R001](R001-generator-naming.md) | P1 | Retire legacy codec-owned package and runtime identifiers after active training closes. |
+There is no open refactor debt currently tracked for this repository.
 
 ## Item Template
 

@@ -15,11 +15,12 @@ from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 from lightning import pytorch as pl
 from torch.utils.data import DataLoader, Dataset
 
-from semantic_acoustic_generator.datamodule.source import (
-    DataSource,
+from semantic_acoustic_generator.datamodule.dataset import (
+    DatasetName,
+    GeneratorSample,
     Overlong,
-    SourceAdapter,
-    source_adapter,
+    Pairing,
+    build_dataset,
 )
 from semantic_acoustic_generator.datamodule.structured import collate_structured_codes
 from semantic_acoustic_generator.types import GeneratorBatch
@@ -54,7 +55,8 @@ class BatchingConfig:
 
 @dataclass(frozen=True)
 class DataConfig:
-    source: str = DataSource.QWEN_CROSS_TEXT.value
+    dataset: str = DatasetName.QWEN.value
+    pairing: str = Pairing.CROSS_TEXT.value
     root: str | None = None
     split: str = "train"
     validation_split: str | None = None
@@ -72,14 +74,23 @@ class DataConfig:
     batching: BatchingConfig = field(default_factory=BatchingConfig)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.source, str):
-            raise TypeError("source must be a string.")
+        if not isinstance(self.dataset, str):
+            raise TypeError("dataset must be a string.")
         try:
-            _ = self.source_type
+            _ = self.dataset_type
         except ValueError as error:
-            supported = ", ".join(repr(source.value) for source in DataSource)
+            supported = ", ".join(repr(dataset.value) for dataset in DatasetName)
             raise NotImplementedError(
-                f"data.source={self.source!r} is not wired yet; supported sources are {supported}."
+                f"data.dataset={self.dataset!r} is not wired yet; supported datasets are {supported}."
+            ) from error
+        if not isinstance(self.pairing, str):
+            raise TypeError("pairing must be a string.")
+        try:
+            _ = self.pairing_type
+        except ValueError as error:
+            supported = ", ".join(repr(pairing.value) for pairing in Pairing)
+            raise ValueError(
+                f"data.pairing must be one of: {supported}; got {self.pairing!r}."
             ) from error
         if not isinstance(self.split, str) or not self.split:
             raise ValueError("split must be a non-empty string.")
@@ -136,8 +147,12 @@ class DataConfig:
                 raise TypeError(f"{name} must be a boolean.")
 
     @property
-    def source_type(self) -> DataSource:
-        return DataSource(self.source)
+    def dataset_type(self) -> DatasetName:
+        return DatasetName(self.dataset)
+
+    @property
+    def pairing_type(self) -> Pairing:
+        return Pairing(self.pairing)
 
     @property
     def overlong_policy(self) -> Overlong:
@@ -150,12 +165,22 @@ class _IndexOrderedDataset(Protocol):
     def index_order(self) -> MapStyleABC: ...
 
 
+@runtime_checkable
+class _RawLengthDataset(Protocol):
+    def raw_length(self, index: int) -> int: ...
+
+
+@runtime_checkable
+class _DurationDataset(Protocol):
+    def duration(self, index: int) -> float: ...
+
+
 class _PreparedDataset(MapStyleABC):
     """Expose preplanned source indexes without retaining materialized samples."""
 
     def __init__(
         self,
-        source: Dataset[Any],
+        source: Dataset[GeneratorSample],
         *,
         indexes: Sequence[int],
         costs: Sequence[int],
@@ -164,7 +189,7 @@ class _PreparedDataset(MapStyleABC):
         if len(indexes) != len(costs):
             raise ValueError("prepared dataset indexes and costs must have equal length.")
         if not isinstance(source, _IndexOrderedDataset):
-            raise TypeError("semantic codec source must expose a map-style index_order.")
+            raise TypeError("generator data source must expose a map-style index_order.")
         self.source = source
         self.indexes = tuple(indexes)
         self.index_order = IndexSelection(source.index_order, self.indexes)
@@ -174,7 +199,7 @@ class _PreparedDataset(MapStyleABC):
     def __len__(self) -> int:
         return len(self.indexes)
 
-    def __getitem__(self, index: int) -> Any:
+    def __getitem__(self, index: int) -> GeneratorSample:
         return self.source[self.indexes[index]]
 
     def _shuffle(
@@ -223,10 +248,9 @@ class _DurationCosts(Sequence[int]):
 
     def __init__(
         self,
-        source: Dataset[Any],
+        source: Dataset[GeneratorSample],
         *,
         indexes: Sequence[int],
-        adapter: SourceAdapter,
         max_frames: int | None,
         batch_frames: int,
         frame_rate: float,
@@ -235,7 +259,6 @@ class _DurationCosts(Sequence[int]):
     ) -> None:
         self.source = source
         self.indexes = indexes
-        self.adapter = adapter
         self.max_frames = max_frames
         self.batch_frames = batch_frames
         self.frame_rate = frame_rate
@@ -264,7 +287,7 @@ class _DurationCosts(Sequence[int]):
         if cached is not None:
             self._cache.move_to_end(resolved)
             return cached
-        duration = self.adapter.duration(self.source, self.indexes[resolved])
+        duration = _duration(self.source, self.indexes[resolved])
         frames = _planning_frames(duration, self.frame_rate)
         if self.truncate and self.max_frames is not None:
             frames = min(frames, self.max_frames)
@@ -298,7 +321,6 @@ class DataModule(pl.LightningDataModule):
         if acoustic_layout is not AcousticLayout.FRAME_ALIGNED:
             raise ValueError("generator data requires frame-aligned acoustic units.")
         self.data = data
-        self.adapter = source_adapter(data.source_type)
         self.codec = codec
         self.acoustic_layout = acoustic_layout
         self.frame_rate = frame_rate
@@ -339,14 +361,7 @@ class DataModule(pl.LightningDataModule):
         *,
         label: str,
     ) -> tuple[_PreparedDataset, int]:
-        source = self.adapter.dataset(
-            codec=self.codec,
-            root=data.root,
-            split=data.split,
-            role=Role(data.role),
-            speaker_id=data.speaker_id,
-            sample_limit=data.sample_limit,
-        )
+        source = _dataset(data, codec=self.codec)
         size = len(cast(Sized, cast(object, source)))
         sample_limit = data.sample_limit
         if sample_limit is not None:
@@ -371,7 +386,6 @@ class DataModule(pl.LightningDataModule):
                 lazy_costs = _DurationCosts(
                     source,
                     indexes=lazy_indexes,
-                    adapter=self.adapter,
                     max_frames=max_frames,
                     batch_frames=batch_frames,
                     frame_rate=self.frame_rate,
@@ -389,7 +403,7 @@ class DataModule(pl.LightningDataModule):
         costs: list[int] = []
         filtered = 0
         for index in candidates:
-            frames = self.adapter.raw_length(source, index)
+            frames = _raw_length(source, index)
             if max_frames is not None and frames > max_frames:
                 filtered += 1
                 continue
@@ -398,12 +412,12 @@ class DataModule(pl.LightningDataModule):
             indexes.append(index)
             costs.append(frames)
         if not indexes:
-            raise ValueError("semantic codec duration filter removed every sample.")
+            raise ValueError("generator duration filter removed every sample.")
         if filtered:
             if max_seconds is None:
                 raise RuntimeError("duration filtering requires a hard limit.")
             warnings.warn(
-                f"filtered {filtered} {label} semantic codec samples longer "
+                f"filtered {filtered} {label} generator samples longer "
                 f"than {max_seconds:g} seconds.",
                 stacklevel=2,
             )
@@ -426,7 +440,7 @@ class DataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         if self.dataset is None:
-            raise RuntimeError("semantic codec DataModule.setup() must run first.")
+            raise RuntimeError("generator DataModule.setup() must run first.")
         data = self.data
         batching = data.batching
         collate_fn = self._collate(data)
@@ -463,7 +477,7 @@ class DataModule(pl.LightningDataModule):
         if self.data.validation_split is None:
             return []
         if self.val_dataset is None or self.validation_data is None:
-            raise RuntimeError("semantic codec DataModule.setup() must run first.")
+            raise RuntimeError("generator DataModule.setup() must run first.")
         data = self.validation_data
         return DataLoader(
             self.val_dataset,
@@ -478,7 +492,7 @@ class DataModule(pl.LightningDataModule):
     def feature_stats_dataloader(self) -> DataLoader[GeneratorBatch]:
         """Iterate the effective training subset once without shuffle or dynamic batching."""
         if self.dataset is None:
-            raise RuntimeError("semantic codec DataModule.setup() must run first.")
+            raise RuntimeError("generator DataModule.setup() must run first.")
         data = self.data
         return DataLoader(
             self.dataset,
@@ -493,7 +507,7 @@ class DataModule(pl.LightningDataModule):
     def sample_batch(self) -> GeneratorBatch:
         """Load one fixed sample from the effective training subset."""
         if self.dataset is None:
-            raise RuntimeError("semantic codec DataModule.setup() must run first.")
+            raise RuntimeError("generator DataModule.setup() must run first.")
         size = len(cast(Sized, cast(object, self.dataset)))
         index = self.data.sample_index
         if index >= size:
@@ -510,8 +524,7 @@ def load_codes(
     frame_rate: float,
     acoustic_layout: AcousticLayout,
 ) -> SemanticAcousticCodes:
-    adapter = source_adapter(data.source_type)
-    dataset = _dataset(data, codec=codec, adapter=adapter)
+    dataset = _dataset(data, codec=codec)
     return sample_codes(
         dataset[data.sample_index],
         data=data,
@@ -529,8 +542,7 @@ def load_batch(
     semantic_pad_id: int,
     acoustic_pad_ids: Sequence[int],
 ) -> GeneratorBatch:
-    adapter = source_adapter(data.source_type)
-    dataset = _dataset(data, codec=codec, adapter=adapter)
+    dataset = _dataset(data, codec=codec)
     return collate_samples(
         [dataset[data.sample_index]],
         data=data,
@@ -548,7 +560,7 @@ def sample_codes(
     frame_rate: float,
     acoustic_layout: AcousticLayout,
 ) -> SemanticAcousticCodes:
-    value = source_adapter(data.source_type).adapt(sample).target
+    value = _sample(sample).target
     return _limit_codes(
         value,
         data=data,
@@ -592,7 +604,7 @@ def length(
     frame_rate: float,
     acoustic_layout: AcousticLayout = AcousticLayout.FRAME_ALIGNED,
 ) -> int:
-    adapted = source_adapter(data.source_type).adapt(sample)
+    adapted = _sample(sample)
     target = _limit_codes(
         adapted.target,
         data=data,
@@ -620,9 +632,8 @@ def collate_samples(
     acoustic_pad_ids: Sequence[int],
 ) -> GeneratorBatch:
     if not samples:
-        raise ValueError("cannot collate an empty semantic codec batch.")
-    adapter = source_adapter(data.source_type)
-    adapted = tuple(adapter.adapt(sample) for sample in samples)
+        raise ValueError("cannot collate an empty generator batch.")
+    adapted = tuple(_sample(sample) for sample in samples)
     target = collate_structured_codes(
         [
             _limit_codes(
@@ -637,8 +648,11 @@ def collate_samples(
         acoustic_pad_ids=acoustic_pad_ids,
         acoustic_layout=acoustic_layout,
     )
-    if not adapter.paired:
+    paired = tuple(sample.reference is not None for sample in adapted)
+    if not any(paired):
         return target
+    if not all(paired):
+        raise ValueError("generator batch cannot mix paired and unpaired samples.")
     pairs = tuple(sample.pair() for sample in adapted)
     reference = collate_structured_codes(
         [
@@ -713,9 +727,10 @@ def _dataset(
     data: DataConfig,
     *,
     codec: str,
-    adapter: SourceAdapter,
-) -> Dataset[Any]:
-    return adapter.dataset(
+) -> Dataset[GeneratorSample]:
+    return build_dataset(
+        data.dataset_type,
+        pairing=data.pairing_type,
         codec=codec,
         root=data.root,
         split=data.split,
@@ -723,6 +738,37 @@ def _dataset(
         speaker_id=data.speaker_id,
         sample_limit=data.sample_limit,
     )
+
+
+def _sample(value: object) -> GeneratorSample:
+    if not isinstance(value, GeneratorSample):
+        raise TypeError(f"generator datasets must yield GeneratorSample; got {type(value)!r}.")
+    return value
+
+
+def _raw_length(dataset: Dataset[GeneratorSample], index: int) -> int:
+    value = (
+        dataset.raw_length(index)
+        if isinstance(dataset, _RawLengthDataset)
+        else dataset[index].raw_length
+    )
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("dataset raw_length() must return an integer.")
+    if value < 1:
+        raise ValueError("dataset raw_length() must be positive.")
+    return value
+
+
+def _duration(dataset: Dataset[GeneratorSample], index: int) -> float:
+    if not isinstance(dataset, _DurationDataset):
+        raise TypeError("dynamic batching requires dataset duration() metadata.")
+    value = dataset.duration(index)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("dataset duration() must return a number.")
+    duration = float(value)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("dataset duration() must be finite and positive.")
+    return duration
 
 
 __all__ = [

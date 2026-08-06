@@ -8,7 +8,6 @@ source "${SCRIPT_DIR}/../env.sh"
 : "${LONGCAT_FIRST_CODEBOOK_OUTPUT_DIR:?Set LONGCAT_FIRST_CODEBOOK_OUTPUT_DIR}"
 
 cd "${SEMANTIC_ACOUSTIC_GENERATOR_ROOT}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONUNBUFFERED=1
 
 echo '{"event":"job.launch","project":"semantic-acoustic-generator","experiment":"010","stage":"representation-oracle"}'

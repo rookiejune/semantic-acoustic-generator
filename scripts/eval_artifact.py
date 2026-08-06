@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
-import wave
-from array import array
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -17,7 +14,11 @@ from semantic_acoustic_generator.datamodule import (
     DataConfig,
     load_batch,
 )
-from semantic_acoustic_generator.evaluation import evaluate_feature_pair
+from semantic_acoustic_generator.evaluation import (
+    evaluate_feature_pair,
+    waveform_summary,
+    write_pcm16_wav,
+)
 from semantic_acoustic_generator.runtime import GeneratorRuntime
 from semantic_acoustic_generator.runtime.artifact import load_artifact
 
@@ -190,7 +191,7 @@ def _summary(
     reference_semantic = reference.semantic_codes
     reference_acoustic = reference.acoustic_codes
     summaries = {
-        name: _waveform_summary(value, sample_rate=sample_rate) for name, value in audio.items()
+        name: waveform_summary(value, sample_rate=sample_rate) for name, value in audio.items()
     }
     result = {
         "artifact": _path_value(args.artifact, include_private=_include_private(args)),
@@ -239,46 +240,8 @@ def _write_outputs(
     for name, path in paths.items():
         if path is None:
             continue
-        _write_wav(path, audio[name], sample_rate=sample_rate)
+        write_pcm16_wav(path, audio[name], sample_rate=sample_rate)
         cast(dict[str, Any], result[name])["output_wav"] = str(path)
-
-
-def _waveform_summary(waveform: Tensor, *, sample_rate: int) -> dict[str, Any]:
-    audio = waveform.detach().float().cpu()
-    finite = bool(torch.isfinite(audio).all())
-    if audio.dim() != 3:
-        raise ValueError("decoded waveform must have shape [batch, channel, samples].")
-    samples = int(audio.size(-1))
-    return {
-        "finite": finite,
-        "seconds": samples / sample_rate,
-        "waveform_max": float(audio.max()),
-        "waveform_min": float(audio.min()),
-        "waveform_rms": float(audio.square().mean().sqrt()),
-        "waveform_shape": list(audio.shape),
-    }
-
-
-def _write_wav(path: Path, waveform: Tensor, *, sample_rate: int) -> None:
-    audio = waveform.detach().float().cpu()[0]
-    pcm = (
-        audio.clamp(-1, 1)
-        .mul(32_767)
-        .round()
-        .to(torch.int16)
-        .transpose(0, 1)
-        .contiguous()
-        .reshape(-1)
-    )
-    frames = array("h", pcm.tolist())
-    if sys.byteorder == "big":
-        frames.byteswap()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(path), "wb") as output:
-        output.setnchannels(audio.size(0))
-        output.setsampwidth(2)
-        output.setframerate(sample_rate)
-        output.writeframes(frames.tobytes())
 
 
 if __name__ == "__main__":

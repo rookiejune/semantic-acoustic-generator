@@ -401,7 +401,7 @@ class GeneratorModule(LightningLogMixin, LightningModule):
         reference_mask = reference_mask.to(device=batch.semantic_codes.device)
         reference_features = self._reference_features(batch, indices=indices)
         if reference_features is None:
-            raise RuntimeError("paired semantic codec batch is missing reference features.")
+            raise RuntimeError("paired generator batch is missing reference features.")
         condition = self.support.condition(
             batch.semantic_codes,
             mask=batch.mask,

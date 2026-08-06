@@ -40,7 +40,7 @@ def batch_codes(
     acoustic_pad_ids: Sequence[int],
 ) -> GeneratorBatch:
     if not values:
-        raise ValueError("cannot batch an empty semantic codec code sequence.")
+        raise ValueError("cannot batch an empty LongCat code sequence.")
     acoustic_pads = tuple(int(pad_id) for pad_id in acoustic_pad_ids)
     _check_pad_id(semantic_pad_id, name="semantic_pad_id")
     _check_pad_ids(acoustic_pads)
@@ -69,7 +69,7 @@ def batch_samples(
     acoustic_pad_ids: Sequence[int],
 ) -> GeneratorBatch:
     if not samples:
-        raise ValueError("cannot batch an empty semantic codec sample sequence.")
+        raise ValueError("cannot batch an empty LongCat sample sequence.")
     return batch_codes(
         [codes(sample, role=role) for sample in samples],
         semantic_pad_id=semantic_pad_id,

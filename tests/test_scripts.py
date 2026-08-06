@@ -13,7 +13,12 @@ from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 from scripts import eval_artifact, eval_artifact_set, eval_speech_manifest, smoke
 from semantic_acoustic_generator.backend import BackendConfig
 from semantic_acoustic_generator.config import DecoderConfig
-from semantic_acoustic_generator.evaluation import seeded_generator
+from semantic_acoustic_generator.evaluation import (
+    evaluate_artifact_sample,
+    factor_accuracy,
+    seeded_generator,
+    write_pcm16_wav,
+)
 from semantic_acoustic_generator.runtime import GeneratorRuntime
 from semantic_acoustic_generator.types import GeneratorBatch, PairMetadata
 
@@ -65,8 +70,9 @@ class EvalBackend:
 class EvalRuntime:
     sample_rate = EvalBackend.sample_rate
 
-    def __init__(self, units: int) -> None:
+    def __init__(self, units: int, *, backend: EvalBackend | None = None) -> None:
         self.units = units
+        self.backend = backend
         self.calls: list[dict[str, Any]] = []
         self.generated: list[torch.Tensor] = []
 
@@ -107,8 +113,10 @@ class EvalRuntime:
         self,
         semantic_codes: torch.Tensor,
         features: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del semantic_codes
+        del semantic_codes, mask
         return features.transpose(1, 2).contiguous()
 
 
@@ -123,7 +131,7 @@ def test_speech_manifest_falls_back_to_pcm16_wav(
 ) -> None:
     path = tmp_path / "sample.wav"
     expected = torch.tensor([[[-1.0, -0.25, 0.0, 0.5, 1.0]]])
-    eval_artifact_set._write_wav(path, expected, sample_rate=16_000)
+    write_pcm16_wav(path, expected, sample_rate=16_000)
 
     def fail_torchcodec(*args: object, **kwargs: object) -> tuple[torch.Tensor, int]:
         del args, kwargs
@@ -137,13 +145,11 @@ def test_speech_manifest_falls_back_to_pcm16_wav(
 
 
 def test_factor_accuracy_names_retargeted_later_codebooks() -> None:
-    metrics: dict[str, float] = {}
     predicted = torch.tensor([[[1, 2], [3, 4], [5, 6]]])
     labels = torch.tensor([[[1, 0], [3, 4], [0, 6]]])
     valid = torch.tensor([[True, True, False]])
 
-    eval_artifact_set._factor_accuracy(
-        metrics,
+    metrics = factor_accuracy(
         predicted,
         labels,
         valid,
@@ -155,6 +161,25 @@ def test_factor_accuracy_names_retargeted_later_codebooks() -> None:
         "retargeted_codebook_1_factor_a_accuracy": 1.0,
         "retargeted_codebook_1_factor_b_accuracy": 0.5,
     }
+
+
+def test_artifact_sample_evaluation_owns_generic_domain_logic() -> None:
+    backend = EvalBackend(AcousticLayout.FRAME_ALIGNED)
+    runtime = EvalRuntime(units=2, backend=backend)
+    batch = _pair(AcousticLayout.FRAME_ALIGNED)
+
+    result = evaluate_artifact_sample(
+        cast(GeneratorRuntime, cast(object, runtime)),
+        batch,
+        seed=13,
+    )
+
+    assert set(result.audio) == {
+        "target_reconstruction",
+        "generated_without_reference_raw",
+    }
+    assert set(result.metrics) == {"raw_feature_mse"}
+    assert len(runtime.calls) == 1
 
 
 def test_artifact_set_args_expose_evaluation_role(

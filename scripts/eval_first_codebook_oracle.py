@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
-import wave
-from array import array
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +15,10 @@ from semantic_acoustic_generator.backend import (
 )
 from semantic_acoustic_generator.config import FeatureAdapter
 from semantic_acoustic_generator.datamodule import BatchingConfig, DataConfig, load_batch
-from semantic_acoustic_generator.evaluation import evaluate_first_codebook_oracle
+from semantic_acoustic_generator.evaluation import (
+    evaluate_first_codebook_oracle,
+    write_pcm16_wav,
+)
 
 
 def main() -> None:
@@ -57,7 +57,7 @@ def main() -> None:
         metadata = batch.metadata[0]
         for group, waveform in evaluation.audio.items():
             path = output / group / f"sample-{sample_index:04d}.wav"
-            _write_wav(path, waveform, sample_rate=adapted.sample_rate)
+            write_pcm16_wav(path, waveform, sample_rate=adapted.sample_rate)
             manifest.append(
                 {
                     "group": group,
@@ -129,31 +129,5 @@ def _summary(samples: list[dict[str, Any]], *, sigmas: tuple[float, ...]) -> dic
         "exact_snap_max_abs": max(exact_snap),
         "groups": groups,
     }
-
-
-def _write_wav(path: Path, waveform: torch.Tensor, *, sample_rate: int) -> None:
-    audio = waveform.detach().float().cpu()[0]
-    if audio.dim() != 2:
-        raise ValueError("decoded waveform must have shape [batch, channel, samples].")
-    pcm = (
-        audio.clamp(-1, 1)
-        .mul(32_767)
-        .round()
-        .to(torch.int16)
-        .transpose(0, 1)
-        .contiguous()
-        .reshape(-1)
-    )
-    frames = array("h", pcm.tolist())
-    if sys.byteorder == "big":
-        frames.byteswap()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(path), "wb") as output:
-        output.setnchannels(audio.size(0))
-        output.setsampwidth(2)
-        output.setframerate(sample_rate)
-        output.writeframes(frames.tobytes())
-
-
 if __name__ == "__main__":
     main()

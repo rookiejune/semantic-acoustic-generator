@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import sys
+import wave
+from array import array
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import torch
 from anytrain.codec import SemanticAcousticCodes, masked_acoustic_features
 from torch import Tensor
 
-from semantic_acoustic_generator.backend.adapter import LongCatFirstCodebookAdapter
+from semantic_acoustic_generator.backend.adapter import (
+    LongCatCodebookAdapter,
+    LongCatFirstCodebookAdapter,
+)
+from semantic_acoustic_generator.model.decoder import FMFeatureGenerator
 from semantic_acoustic_generator.types import GeneratorBatch
 
 if TYPE_CHECKING:
@@ -32,6 +40,12 @@ class PairedFeatureEvaluation:
 class FirstCodebookOracleEvaluation:
     audio: dict[str, Tensor]
     metrics: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ArtifactSampleEvaluation:
+    audio: dict[str, Tensor]
+    metrics: dict[str, float]
 
 
 @torch.no_grad()
@@ -136,8 +150,191 @@ def evaluate_feature_pair(
     )
 
 
+@torch.no_grad()
+def evaluate_artifact_sample(
+    runtime: GeneratorRuntime,
+    batch: GeneratorBatch,
+    *,
+    seed: int,
+) -> ArtifactSampleEvaluation:
+    """Evaluate one fixed artifact sample, including supported LongCat diagnostics."""
+    backend = runtime.backend
+    target = target_acoustic_features(backend, batch)
+    generated = runtime.sample_features(
+        batch.semantic_codes,
+        mask=batch.mask,
+        generator=seeded_generator(batch.semantic_codes.device, seed),
+    )
+    semantic = batch.semantic_codes.masked_fill(~batch.mask[..., None], 0)
+    acoustic = batch.acoustic_codes.masked_fill(~batch.acoustic_mask[..., None], 0)
+    audio = {
+        "target_reconstruction": backend.detokenize(
+            SemanticAcousticCodes(semantic=semantic, acoustic=acoustic)
+        ),
+        "generated_without_reference_raw": runtime.decode_features(
+            semantic,
+            generated,
+            mask=batch.mask,
+        ),
+    }
+    metrics = {
+        "raw_feature_mse": masked_feature_mse(
+            generated,
+            target,
+            batch.acoustic_mask,
+            name="artifact set raw",
+        )
+    }
+    if not isinstance(backend, LongCatCodebookAdapter):
+        return ArtifactSampleEvaluation(audio=audio, metrics=metrics)
+
+    audio["selected_codebook_reconstruction"] = runtime.decode_features(
+        semantic,
+        target,
+        mask=batch.mask,
+    )
+    snapped = backend.snap_features(generated)
+    audio["generated_without_reference_snap"] = runtime.decode_features(
+        semantic,
+        snapped,
+        mask=batch.mask,
+    )
+    metrics["snap_feature_mse"] = masked_feature_mse(
+        snapped,
+        target,
+        batch.acoustic_mask,
+        name="artifact set snap",
+    )
+    predicted = backend.features_to_factor_codes(generated)
+    labels = backend.factor_codes(batch.acoustic_codes).to(predicted.device)
+    valid = batch.acoustic_mask.to(predicted.device)
+    metrics.update(factor_accuracy(predicted, labels, valid))
+
+    feature_generator = runtime.support.generator
+    if isinstance(feature_generator, FMFeatureGenerator) and feature_generator.factor_depth is not None:
+        condition = runtime.support.condition(batch.semantic_codes, mask=batch.mask)
+        teacher_logits = feature_generator.factor_logits(
+            condition,
+            batch.mask,
+            factor_targets=labels,
+        )
+        teacher = torch.stack(
+            tuple(value.argmax(dim=-1) for value in teacher_logits),
+            dim=-1,
+        )
+        metrics.update(factor_accuracy(teacher, labels, valid, prefix="teacher_forced_"))
+
+    if backend.feature_codebooks <= 1:
+        return ArtifactSampleEvaluation(audio=audio, metrics=metrics)
+
+    full_target = backend.backend.acoustic_codes_to_features(batch.acoustic_codes)
+    audio["generated_stage0_only"] = backend.decode_features(
+        semantic,
+        generated,
+        active_codebooks=1,
+    )
+    metrics["stage0_projected_mse"] = masked_feature_mse(
+        backend.project_features(generated, active_codebooks=1),
+        full_target,
+        batch.acoustic_mask,
+        name="artifact set stage0 projection",
+    )
+    retargeted = backend.retarget_factor_codes(batch.acoustic_codes, predicted)
+    metrics.update(
+        factor_accuracy(
+            predicted[..., 2:],
+            retargeted[..., 2:],
+            valid,
+            prefix="retargeted_",
+            codebook_offset=1,
+        )
+    )
+    retargeted_features = backend.factor_codes_to_features(retargeted)
+    audio["generated_residual_oracle"] = runtime.decode_features(
+        semantic,
+        retargeted_features,
+        mask=batch.mask,
+    )
+    metrics["generated_projected_mse"] = masked_feature_mse(
+        backend.project_features(generated),
+        full_target,
+        batch.acoustic_mask,
+        name="artifact set generated projection",
+    )
+    metrics["residual_oracle_projected_mse"] = masked_feature_mse(
+        backend.project_features(retargeted_features),
+        full_target,
+        batch.acoustic_mask,
+        name="artifact set residual oracle projection",
+    )
+    return ArtifactSampleEvaluation(audio=audio, metrics=metrics)
+
+
+def factor_accuracy(
+    predicted: Tensor,
+    labels: Tensor,
+    valid: Tensor,
+    *,
+    prefix: str = "",
+    codebook_offset: int = 0,
+) -> dict[str, float]:
+    accuracy = predicted[valid].eq(labels[valid]).float().mean(dim=0)
+    metrics: dict[str, float] = {}
+    for factor, value in enumerate(accuracy):
+        codebook, local = divmod(factor, 2)
+        codebook += codebook_offset
+        suffix = "a" if local == 0 else "b"
+        name = (
+            f"factor_{suffix}_accuracy"
+            if codebook == 0
+            else f"codebook_{codebook}_factor_{suffix}_accuracy"
+        )
+        metrics[f"{prefix}{name}"] = float(value.cpu())
+    return metrics
+
+
 def seeded_generator(device: torch.device | str, seed: int) -> torch.Generator:
     return torch.Generator(device=device).manual_seed(seed)
+
+
+def waveform_summary(waveform: Tensor, *, sample_rate: int) -> dict[str, Any]:
+    audio = waveform.detach().float().cpu()
+    finite = bool(torch.isfinite(audio).all())
+    if audio.dim() != 3:
+        raise ValueError("decoded waveform must have shape [batch, channel, samples].")
+    samples = int(audio.size(-1))
+    return {
+        "finite": finite,
+        "seconds": samples / sample_rate,
+        "waveform_max": float(audio.max()),
+        "waveform_min": float(audio.min()),
+        "waveform_rms": float(audio.square().mean().sqrt()),
+        "waveform_shape": list(audio.shape),
+    }
+
+
+def write_pcm16_wav(path: Path, waveform: Tensor, *, sample_rate: int) -> None:
+    audio = waveform.detach().float().cpu()[0]
+    if audio.dim() != 2:
+        raise ValueError("decoded waveform must have shape [batch, channel, samples].")
+    pcm = (
+        audio.clamp(-1, 1)
+        .mul(32_767)
+        .round()
+        .to(torch.int16)
+        .transpose(0, 1)
+        .contiguous()
+        .reshape(-1)
+    )
+    frames = array("h", pcm.tolist())
+    if sys.byteorder == "big":
+        frames.byteswap()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(audio.size(0))
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(frames.tobytes())
 
 
 @torch.no_grad()
@@ -218,12 +415,17 @@ def _sigma_key(value: float) -> str:
 
 
 __all__ = [
-    "PairedFeatureEvaluation",
+    "ArtifactSampleEvaluation",
     "FirstCodebookOracleEvaluation",
+    "PairedFeatureEvaluation",
+    "evaluate_artifact_sample",
     "evaluate_first_codebook_oracle",
     "evaluate_feature_pair",
+    "factor_accuracy",
     "masked_feature_mse",
     "reference_acoustic_condition",
     "seeded_generator",
     "target_acoustic_features",
+    "waveform_summary",
+    "write_pcm16_wav",
 ]
