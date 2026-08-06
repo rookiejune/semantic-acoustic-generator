@@ -57,6 +57,14 @@ parameters，local-4 anchor 为 `3.690M`，treatment 反而少约 `10%`；远端
 Qwen-FiLM 保留 local baseline `90.9%` 的吞吐，step time 高 `10.1%`，显存基本相同；2-step
 LongCat artifact export/reload 和 heldout decode 同时通过，因此进入 5k gate。
 
+## 正式结果
+
+5k endpoint 上，Qwen-FiLM full-N2 为 WER `0.007916`、UTMOS `3.00069`，低于 local-4
+baseline 的 `0.005277 / 3.03872`，因此语音 gate 失败。Qwen-FiLM 虽提高四个 factor
+accuracy，但 generated/stage0 projected MSE 均更差；当前没有证据把主要瓶颈归因于 local
+anchor 的有限 receptive field。详细结果见
+[`016_longcat_qwen_film_anchor.md`](../results/016_longcat_qwen_film_anchor.md)。
+
 ## 入口
 
 - treatment: `jobs/016/01_qwen_film_recurrent.sh`
