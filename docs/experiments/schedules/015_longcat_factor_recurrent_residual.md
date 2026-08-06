@@ -34,6 +34,17 @@
 `41%/35%`，Qwen reserved 仍保留超过 40% 的 24GB 显存余量。128 档对 recurrent 仅再提升约 3%，
 不值得增加 Qwen OOM 风险和 padding。
 
+正式代码 revision 上补做了严格同口径的 130-step 性能校准（两者均关闭 sample、checkpoint、
+codebook usage 和 loss summary，只开启同一性能计时器）：
+
+| model | step time | valid frames/s | peak allocated / reserved |
+| --- | ---: | ---: | ---: |
+| recurrent, 96 / 1152 s | `38.5 ms` | `193.97k` | `5.15 / 5.86 GiB` |
+| Qwen, 96 / 1152 s | `65.3 ms` | `114.67k` | `8.34 / 14.00 GiB` |
+
+详细正式质量曲线和结论见
+[`015_longcat_factor_formal_comparison.md`](../results/015_longcat_factor_formal_comparison.md)。
+
 ## 严格数据口径
 
 - 唯一 store 是 target-role `train_0_10000`。
