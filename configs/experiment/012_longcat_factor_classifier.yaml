@@ -24,9 +24,10 @@ datamodule:
     enabled: false
 
 model:
-  condition_dim: 512
+  backbone:
+    hidden_dim: 512
   feature_adapter: longcat_first_codebook
-  decoder:
+  head:
     hidden_dim: 512
     layers: 4
     heads: 8
@@ -43,7 +44,6 @@ pl_module:
   learning_rate: 1e-3
   weight_decay: 0.0
   reference_dropout: 1.0
-  finite_loss_check_interval: 1
 
 trainer:
   accelerator: gpu
@@ -56,6 +56,8 @@ trainer:
   gradient_clip_val: 1.0
 
 callback:
+  debug:
+    enabled: true
   sample:
     enabled: false
   performance:
@@ -64,7 +66,7 @@ callback:
     log_every_n_steps: 10
     warmup_steps: 10
     measure_window_steps: 50
-  loss_time_bucket:
+  observation:
     enabled: false
   checkpoint:
     enabled: true

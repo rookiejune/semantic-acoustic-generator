@@ -1,3 +1,5 @@
+debug:
+  enabled: false
 sample:
   enabled: true
   every_n_train_steps: 10000
@@ -16,23 +18,22 @@ performance:
   measure_window_steps: 100
 data_throughput:
   enabled: true
-  log_every_n_steps: 100
-  warmup_steps: 20
-  measure_window_steps: 100
+  # null follows the Trainer logger cadence; otherwise the unit is semantic frames.
+  log_every_n_units: null
+  measure_window_batches: 100
+  sync_cuda: true
+  sync_distributed: true
 codebook_usage:
   enabled: true
   every_n_steps: 100
 loss_summary:
   enabled: true
   window_capacity: 20
-loss_time_bucket:
+observation:
   enabled: true
-  item_name: flow
-  detail_key: t
-  histogram_tag: train/flow_loss/t_hist
-  scalar_template: "train/flow_loss/t/{lower:.1f}_{upper:.1f}"
   every_n_steps: 100
-  bucket_count: 10
+  half_life_steps: 1000
+  sync_distributed: false
 checkpoint:
   enabled: true
   filename: step-{step:08d}

@@ -49,20 +49,37 @@ class Initialization(StrEnum):
     RANDOM = auto()
 
 
-class RVQPredictor(StrEnum):
-    CODEBOOK_AR = auto()
-    MTP = auto()
+@dataclass(frozen=True)
+class BackboneConfig:
+    hidden_dim: int = 1024
+    layers: int = 4
+    heads: int = 8
+    ffn_ratio: int = 4
+    embedding_initialization: Initialization = Initialization.CODEC
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        _int(self.hidden_dim, name="hidden_dim")
+        _int(self.layers, name="layers")
+        _int(self.heads, name="heads")
+        _int(self.ffn_ratio, name="ffn_ratio")
+        if not isinstance(self.embedding_initialization, Initialization):
+            raise TypeError("embedding_initialization must be an Initialization.")
+        _int(self.seed, name="seed")
+        if min(self.hidden_dim, self.layers, self.heads, self.ffn_ratio) <= 0:
+            raise ValueError("backbone dimensions, depth, heads, and FFN ratio must be positive.")
+        if self.seed < 0:
+            raise ValueError("backbone seed must be non-negative.")
 
 
 @dataclass(frozen=True)
-class DecoderConfig:
+class HeadConfig:
+    codebook_initialization: Initialization = Initialization.CODEC
+    seed: int = 0
     hidden_dim: int | None = None
     layers: int = 8
     heads: int = 8
     ffn_ratio: int = 4
-    rvq_predictor: RVQPredictor = RVQPredictor.MTP
-    mtp_layers: int = 2
-    mtp_heads: int = 4
     repa_feature_dim: int | None = None
     repa_student_layer: int | None = None
     repa_loss_weight: float = 0.0
@@ -78,14 +95,15 @@ class DecoderConfig:
     anchor_factor_temperature: float = 0.1
 
     def __post_init__(self) -> None:
+        if not isinstance(self.codebook_initialization, Initialization):
+            raise TypeError("codebook_initialization must be an Initialization.")
+        _int(self.seed, name="head seed")
+        if self.seed < 0:
+            raise ValueError("head seed must be non-negative.")
         _optional_int(self.hidden_dim, name="hidden_dim")
         _int(self.layers, name="layers")
         _int(self.heads, name="heads")
         _int(self.ffn_ratio, name="ffn_ratio")
-        if not isinstance(self.rvq_predictor, RVQPredictor):
-            raise TypeError("rvq_predictor must be an RVQPredictor.")
-        _int(self.mtp_layers, name="mtp_layers")
-        _int(self.mtp_heads, name="mtp_heads")
         _optional_int(self.repa_feature_dim, name="repa_feature_dim")
         _optional_int(self.repa_student_layer, name="repa_student_layer")
         _float(self.repa_loss_weight, name="repa_loss_weight")
@@ -105,8 +123,6 @@ class DecoderConfig:
         _float(self.anchor_factor_temperature, name="anchor_factor_temperature")
         if self.layers <= 0 or self.heads <= 0 or self.ffn_ratio <= 0:
             raise ValueError("decoder depth, heads, and FFN ratio must be positive.")
-        if self.mtp_layers <= 0 or self.mtp_heads <= 0:
-            raise ValueError("MTP depth and heads must be positive.")
         if self.repa_loss_weight < 0:
             raise ValueError("repa_loss_weight must be non-negative.")
         if self.repa_loss_weight > 0 and self.repa_feature_dim is None:
@@ -126,24 +142,20 @@ class DecoderConfig:
             raise ValueError("anchor_factor_temperature must be positive.")
         if self.anchor_target is AnchorTarget.FACTOR and self.fm_mode is not FMMode.ANCHOR:
             raise ValueError("anchor_target=factor requires fm_mode=anchor.")
-        if self.factor_predictor is not FactorPredictor.PARALLEL and (
-            self.anchor_target is not AnchorTarget.FACTOR
-        ):
-            raise ValueError("depth factor predictors require anchor_target=factor.")
         if self.fm_mode is not FMMode.FLOW and self.repa_loss_weight > 0:
             raise ValueError("REPA is only supported by fm_mode=flow.")
 
 
-def decoder_options(
-    config: DecoderConfig | Mapping[str, object] | None,
-) -> DecoderConfig:
+def head_options(
+    config: HeadConfig | Mapping[str, object] | None,
+) -> HeadConfig:
     if config is None:
-        return DecoderConfig()
-    if isinstance(config, DecoderConfig):
+        return HeadConfig()
+    if isinstance(config, HeadConfig):
         return config
-    predictor = config.get("rvq_predictor", RVQPredictor.MTP.value)
-    if not isinstance(predictor, str):
-        raise TypeError("rvq_predictor must be a string.")
+    initialization = config.get("codebook_initialization", Initialization.CODEC.value)
+    if not isinstance(initialization, str):
+        raise TypeError("codebook_initialization must be a string.")
     fm_mode = config.get("fm_mode", FMMode.FLOW.value)
     if not isinstance(fm_mode, str):
         raise TypeError("fm_mode must be a string.")
@@ -156,14 +168,13 @@ def decoder_options(
     factor_predictor = config.get("factor_predictor", FactorPredictor.PARALLEL.value)
     if not isinstance(factor_predictor, str):
         raise TypeError("factor_predictor must be a string.")
-    return DecoderConfig(
+    return HeadConfig(
+        codebook_initialization=Initialization(initialization),
+        seed=_int(config.get("seed", 0), name="head seed"),
         hidden_dim=_optional_int(config.get("hidden_dim"), name="hidden_dim"),
         layers=_int(config["layers"], name="layers"),
         heads=_int(config["heads"], name="heads"),
         ffn_ratio=_int(config["ffn_ratio"], name="ffn_ratio"),
-        rvq_predictor=RVQPredictor(predictor),
-        mtp_layers=_int(config.get("mtp_layers", 2), name="mtp_layers"),
-        mtp_heads=_int(config.get("mtp_heads", 4), name="mtp_heads"),
         repa_feature_dim=_optional_int(config.get("repa_feature_dim"), name="repa_feature_dim"),
         repa_student_layer=_optional_int(
             config.get("repa_student_layer"),
@@ -195,6 +206,10 @@ def decoder_options(
     )
 
 
+DecoderConfig = HeadConfig
+decoder_options = head_options
+
+
 def _optional_int(value: object, *, name: str) -> int | None:
     if value is None:
         return None
@@ -221,12 +236,14 @@ def _float(value: object, *, name: str) -> float:
 __all__ = [
     "AnchorContext",
     "AnchorTarget",
+    "BackboneConfig",
     "DecoderConfig",
     "FactorPredictor",
     "FeatureAdapter",
     "FMMode",
+    "HeadConfig",
     "Initialization",
-    "RVQPredictor",
     "Route",
     "decoder_options",
+    "head_options",
 ]

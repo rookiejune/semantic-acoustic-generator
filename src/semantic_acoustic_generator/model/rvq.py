@@ -61,8 +61,9 @@ class AcousticRVQDecoder(nn.Module):
         self.codebooks = codebooks
         self.codebook_sizes = sizes
         self.embedding_dim = embedding_dim
+        used_sizes = sizes[:-1]
         self.codebook_embeddings = nn.ModuleList(
-            nn.Embedding(size, embedding_dim) for size in sizes
+            nn.Embedding(size, embedding_dim) for size in used_sizes
         )
         if codebook_embeddings is None:
             for module in self.codebook_embeddings:
@@ -76,7 +77,7 @@ class AcousticRVQDecoder(nn.Module):
 
         self.embedding_projections = nn.ModuleList(
             nn.Identity() if embedding_dim == hidden_dim else nn.Linear(embedding_dim, hidden_dim)
-            for _ in range(codebooks)
+            for _ in used_sizes
         )
         self.condition = (
             nn.Identity() if condition_dim == hidden_dim else nn.Linear(condition_dim, hidden_dim)
@@ -88,9 +89,7 @@ class AcousticRVQDecoder(nn.Module):
             layers=layers,
             attention_heads=attention_heads,
         )
-        self.decoder.embed_tokens.requires_grad_(False)
-        self.codebook_embeddings[-1].requires_grad_(False)
-        self.embedding_projections[-1].requires_grad_(False)
+        self.decoder.embed_tokens = nn.Identity()
         self.heads = nn.ModuleList(nn.Linear(hidden_dim, size) for size in sizes)
 
     def _validate_condition(self, condition: Tensor) -> None:
@@ -196,11 +195,6 @@ class AcousticRVQDecoder(nn.Module):
             PackedCodebookLogits(
                 logits=packed_logits,
                 labels=packed_targets,
-                row_indices=frame_indices.div(
-                    condition.size(1),
-                    rounding_mode="floor",
-                ),
-                batch_size=condition.size(0),
             ),
             frame_mask,
             frame_indices,
@@ -318,7 +312,7 @@ class FactorDepthPredictor(nn.Module):
             )
         )
         if self.decoder is not None:
-            self.decoder.embed_tokens.requires_grad_(False)
+            self.decoder.embed_tokens = nn.Identity()
         self.recurrent_blocks = (
             nn.ModuleList(
                 _FactorDepthBlock(hidden_dim, ffn_ratio=ffn_ratio) for _ in range(layers)
@@ -459,8 +453,6 @@ class FactorDepthPredictor(nn.Module):
         return PackedCodebookLogits(
             logits=tuple(logits),
             labels=torch.cat(labels, dim=-1),
-            row_indices=frame_indices.div(condition.size(1), rounding_mode="floor"),
-            batch_size=condition.size(0),
         )
 
     def _forward_packed(
@@ -501,11 +493,6 @@ class FactorDepthPredictor(nn.Module):
             PackedCodebookLogits(
                 logits=logits,
                 labels=packed_targets,
-                row_indices=frame_indices.div(
-                    condition.size(1),
-                    rounding_mode="floor",
-                ),
-                batch_size=condition.size(0),
             ),
             frame_mask,
             frame_indices,

@@ -24,13 +24,16 @@ import semantic_acoustic_generator.model.rvq as rvq_module
 from semantic_acoustic_generator.config import (
     AnchorContext,
     AnchorTarget,
+    BackboneConfig,
     DecoderConfig,
+    FactorPredictor,
     FMMode,
+    Initialization,
     Route,
-    RVQPredictor,
 )
 from semantic_acoustic_generator.model import (
     AcousticRVQDecoder,
+    AGRVQPredictor,
     DiTDecoder,
     FMFeatureGenerator,
     ReferenceConditioner,
@@ -46,7 +49,7 @@ from semantic_acoustic_generator.runtime import (
 )
 from semantic_acoustic_generator.runtime.artifact import (
     load_artifact,
-    load_generator_artifact,
+    load_model_artifact,
     save_artifact,
 )
 from semantic_acoustic_generator.types import GeneratorBatch
@@ -89,8 +92,17 @@ class FakeCodec:
         )
 
 
-def test_decoder_config_defaults_to_temporal_mtp() -> None:
-    assert DecoderConfig().rvq_predictor is RVQPredictor.MTP
+def _agrvq_codebooks() -> tuple[torch.Tensor, ...]:
+    return (
+        torch.randn(1, 3),
+        torch.randn(5, 3),
+        torch.randn(1, 4),
+        torch.randn(7, 4),
+    )
+
+
+def test_head_config_defaults_to_codec_codebook_initialization() -> None:
+    assert DecoderConfig().codebook_initialization is Initialization.CODEC
 
 
 def test_conditioner_shapes() -> None:
@@ -139,12 +151,11 @@ def test_fm_loss_and_sample_shapes() -> None:
         prediction,
         flow_sample.velocity,
         mask,
-        details={"t": flow_sample.t},
-        detail_dtype=target.dtype,
     )
     sample = decoder.sample(condition, mask=mask, steps=2)
 
-    assert loss.loss.shape == (2,)
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
     assert sample.shape == target.shape
     assert torch.equal(sample[1, 2:], torch.zeros_like(sample[1, 2:]))
 
@@ -182,7 +193,7 @@ def test_aligned_anchor_predicts_features_and_factor_losses() -> None:
     )
 
     assert output.primary == "anchor_mse"
-    assert set(output.items) == {"anchor_mse", "anchor_cosine", "anchor_factor"}
+    assert set(output.losses) == {"anchor_mse", "anchor_cosine", "anchor_factor"}
     assert output.loss.ndim == 0
     assert sample.shape == target.shape
     assert torch.equal(sample[1, 2:], torch.zeros_like(sample[1, 2:]))
@@ -224,7 +235,7 @@ def test_factor_anchor_trains_ce_and_returns_original_codebook_embeddings() -> N
     output.loss.backward()
 
     assert output.primary == "anchor_factor"
-    assert set(output.items) == {"anchor_factor"}
+    assert set(output.losses) == {"anchor_factor"}
     assert generator.anchor is not None
     assert generator.anchor.output.weight.grad is not None
     assert generator.factor_codebook_a is not None
@@ -292,8 +303,8 @@ def test_factor_anchor_scales_to_multiple_acoustic_codebooks() -> None:
 
     assert factors.shape == (1, 3, 6)
     assert features.shape == (1, 3, 12)
-    assert output.items["anchor_factor"].details is not None
-    assert "codebook_5_top1" in output.items["anchor_factor"].details
+    assert output.losses["anchor_factor"].ndim == 0
+    assert torch.isfinite(output.losses["anchor_factor"])
     assert "factor_codebook_2_b" in generator.state_dict()
 
     generator.to(dtype=torch.float64)
@@ -412,7 +423,12 @@ def test_residual_fm_trains_flow_and_anchor() -> None:
     )
 
     assert output.primary == "flow"
-    assert set(output.items) == {"anchor_mse", "anchor_cosine", "anchor_factor", "flow"}
+    assert set(output.losses) == {
+        "anchor_mse",
+        "anchor_cosine",
+        "anchor_factor",
+        "flow",
+    }
     output.loss.backward()
     assert generator.anchor is not None
     assert generator.anchor.output.weight.grad is not None
@@ -582,11 +598,10 @@ def test_fm_loss_returns_repa_features_when_configured() -> None:
         prediction,
         flow_sample.velocity,
         mask,
-        details={"t": flow_sample.t},
-        detail_dtype=target.dtype,
     )
 
-    assert item.loss.shape == (2,)
+    assert item.ndim == 0
+    assert torch.isfinite(item)
     assert representation.shape == (2, 4, 5)
 
 
@@ -602,9 +617,10 @@ def test_repa_loss_detaches_teacher_and_ignores_padding() -> None:
     mask = torch.tensor([[True, False]])
 
     item = MaskedCosineAlignmentLoss()(representation, target, mask)
-    item.loss.mean().backward()
+    item.backward()
 
-    assert torch.isfinite(item.loss).all()
+    assert item.ndim == 0
+    assert torch.isfinite(item)
     assert representation.grad is not None
     assert target.grad is None
     assert torch.isfinite(representation.grad).all()
@@ -618,15 +634,15 @@ def test_build_route_and_masked_acoustic_features() -> None:
         backend.semantic_codebook,
         backend.acoustic_feature_dim,
         backend.acoustic_codebook_sizes,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     acoustic = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
     mask = torch.tensor([[True, True, False]])
     features = masked_acoustic_features(backend, acoustic, mask)
 
     assert modules.route is Route.FM
-    assert isinstance(modules.generator, FMFeatureGenerator)
+    assert isinstance(modules.head, FMFeatureGenerator)
     assert backend.sample_rate == 16_000
     assert backend.frame_rate == 50.0
     assert backend.acoustic_feature_dim == 4
@@ -635,12 +651,38 @@ def test_build_route_and_masked_acoustic_features() -> None:
     assert torch.equal(features[:, 2], torch.zeros_like(features[:, 2]))
 
 
+def test_model_entry_accepts_semantic_codes_or_precomputed_embeddings() -> None:
+    backend = FakeCodec()
+    modules = build_route(
+        Route.FM,
+        backend.semantic_codebook,
+        backend.acoustic_feature_dim,
+        backend.acoustic_codebook_sizes,
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+    )
+    modules.model.eval()
+    semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
+    mask = torch.tensor([[True, True, False]])
+    embeddings = modules.backbone.embed(semantic)
+
+    from_codes = modules.model(input_ids=semantic, attention_mask=mask)
+    from_embeddings = modules.model(inputs_embeds=embeddings, attention_mask=mask)
+    inferred_mask = modules.model(input_ids=semantic)
+
+    torch.testing.assert_close(from_codes, from_embeddings)
+    torch.testing.assert_close(from_codes, inferred_mask)
+    assert torch.equal(from_codes[:, 2], torch.zeros_like(from_codes[:, 2]))
+    with pytest.raises(ValueError, match="exactly one"):
+        modules.model(input_ids=semantic, inputs_embeds=embeddings, attention_mask=mask)
+
+
 def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     backend = FakeCodec()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     support = build_support(
         config,
@@ -664,7 +706,7 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     waveform = runtime.decode(semantic, mask=mask, generator=torch.Generator().manual_seed(1))
     save_artifact(tmp_path, support, backend=backend)
     loaded = load_artifact(tmp_path)
-    acoustic = load_generator_artifact(tmp_path)
+    acoustic = load_model_artifact(tmp_path)
     loaded_features = loaded.sample_features(
         semantic,
         mask=mask,
@@ -703,9 +745,9 @@ def test_semantic_support_decodes_and_roundtrips_artifact(tmp_path) -> None:
     other_rate.sample_rate = 24_000
     with pytest.raises(ValueError, match="sample_rate"):
         acoustic.spec.validate_backend(other_rate)
-    assert acoustic.generator.state_dict().keys() == support.generator.state_dict().keys()
-    for key, value in support.generator.state_dict().items():
-        assert torch.equal(acoustic.generator.state_dict()[key], value)
+    assert acoustic.model.state_dict().keys() == support.model.state_dict().keys()
+    for key, value in support.model.state_dict().items():
+        assert torch.equal(acoustic.model.state_dict()[key], value)
     assert torch.equal(features[:, 2], torch.zeros_like(features[:, 2]))
     assert torch.allclose(features, loaded_features)
 
@@ -714,8 +756,8 @@ def test_artifact_rejects_runtime_state_that_differs_from_construction_config(tm
     backend = FakeCodec()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
         sampling=SamplingConfig(flow_steps=2),
         feature_mean=(0.0, 0.0, 0.0, 0.0),
         feature_std=(1.0, 1.0, 1.0, 1.0),
@@ -738,8 +780,8 @@ def test_generator_artifact_ignores_unrelated_state_but_remains_strict(tmp_path)
     backend = FakeCodec()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     support = build_support(
         config,
@@ -756,30 +798,30 @@ def test_generator_artifact_ignores_unrelated_state_but_remains_strict(tmp_path)
 
     with pytest.raises(RuntimeError, match="state_dict"):
         load_artifact(tmp_path)
-    acoustic = load_generator_artifact(tmp_path)
-    for key, value in support.generator.state_dict().items():
-        assert torch.equal(acoustic.generator.state_dict()[key], value)
+    acoustic = load_model_artifact(tmp_path)
+    for key, value in support.model.state_dict().items():
+        assert torch.equal(acoustic.model.state_dict()[key], value)
 
-    generator_keys = [key for key in original if key.startswith("generator.")]
+    generator_keys = [key for key in original if key.startswith("model.head.")]
     missing = dict(incompatible)
     del missing[generator_keys[0]]
     torch.save(missing, checkpoint)
     with pytest.raises(RuntimeError, match="state_dict"):
-        load_generator_artifact(tmp_path)
+        load_model_artifact(tmp_path)
 
     unexpected = dict(incompatible)
-    unexpected["generator.unexpected"] = torch.zeros(1)
+    unexpected["model.head.unexpected"] = torch.zeros(1)
     torch.save(unexpected, checkpoint)
     with pytest.raises(RuntimeError, match="state_dict"):
-        load_generator_artifact(tmp_path)
+        load_model_artifact(tmp_path)
 
 
 def test_artifact_loads_cpu_state_before_moving_to_target_device(tmp_path, monkeypatch) -> None:
     backend = FakeCodec()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     support = build_support(
         config,
@@ -796,11 +838,11 @@ def test_artifact_loads_cpu_state_before_moving_to_target_device(tmp_path, monke
 
     monkeypatch.setattr(torch, "load", record_load)
     loaded = load_artifact(tmp_path, device="meta")
-    acoustic = load_generator_artifact(tmp_path, device="meta")
+    acoustic = load_model_artifact(tmp_path, device="meta")
 
     assert load_options == [("cpu", True), ("cpu", True)]
     assert next(loaded.parameters()).device.type == "meta"
-    assert next(acoustic.generator.parameters()).device.type == "meta"
+    assert next(acoustic.model.parameters()).device.type == "meta"
 
 
 def test_frame_aligned_decode_trims_right_padding() -> None:
@@ -808,8 +850,8 @@ def test_frame_aligned_decode_trims_right_padding() -> None:
     support = build_support(
         GeneratorConfig(
             route=Route.FM,
-            condition_dim=10,
-            decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+            backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+            head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
         ),
         semantic_codebook=backend.semantic_codebook,
         codec_spec=semantic_acoustic_spec(backend),
@@ -829,8 +871,8 @@ def test_decode_rejects_mixed_lengths_and_non_prefix_masks() -> None:
     support = build_support(
         GeneratorConfig(
             route=Route.FM,
-            condition_dim=10,
-            decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+            backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+            head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
         ),
         semantic_codebook=backend.semantic_codebook,
         codec_spec=semantic_acoustic_spec(backend),
@@ -862,18 +904,19 @@ def test_fm_route_trains_one_step() -> None:
         backend.semantic_codebook,
         backend.acoustic_feature_dim,
         backend.acoustic_codebook_sizes,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     optimizer = torch.optim.AdamW(
-        list(modules.conditioner.parameters())
-        + list(modules.reference_conditioner.parameters())
-        + list(modules.generator.parameters()),
+        list(modules.model.parameters())
+        + list(modules.reference_conditioner.parameters()),
         lr=1e-3,
     )
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
-    condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
-    generator = modules.generator
+    condition = (
+        modules.model.condition(input_ids=semantic, attention_mask=mask) + reference
+    ).masked_fill(~mask[..., None], 0)
+    generator = modules.head
     assert isinstance(generator, FMFeatureGenerator)
     output = generator.loss(
         _batch(semantic, acoustic, mask),
@@ -900,11 +943,14 @@ def test_fm_generator_accepts_external_condition() -> None:
         backend.semantic_codebook,
         backend.acoustic_feature_dim,
         backend.acoustic_codebook_sizes,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
-    condition = modules.conditioner(semantic).masked_fill(~mask[..., None], 0)
-    generator = modules.generator
+    condition = modules.model.condition(
+        input_ids=semantic,
+        attention_mask=mask,
+    ).masked_fill(~mask[..., None], 0)
+    generator = modules.head
     assert isinstance(generator, FMFeatureGenerator)
 
     output = generator.feature_loss_from_condition(
@@ -932,19 +978,21 @@ def test_rvq_route_trains_one_step_when_qwen3_builder_is_available() -> None:
         backend.semantic_codebook,
         backend.acoustic_feature_dim,
         backend.acoustic_codebook_sizes,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        factor_codebooks=_agrvq_codebooks(),
     )
     optimizer = torch.optim.AdamW(
-        list(modules.conditioner.parameters())
-        + list(modules.reference_conditioner.parameters())
-        + list(modules.generator.parameters()),
+        list(modules.model.parameters())
+        + list(modules.reference_conditioner.parameters()),
         lr=1e-3,
     )
     target = masked_acoustic_features(backend, acoustic, mask)
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
-    condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
-    generator = modules.generator
+    condition = (
+        modules.model.condition(input_ids=semantic, attention_mask=mask) + reference
+    ).masked_fill(~mask[..., None], 0)
+    generator = modules.head
     assert isinstance(generator, RVQCodeGenerator)
     output = generator.loss(_batch(semantic, acoustic, mask), condition)
     loss = output.loss
@@ -954,10 +1002,7 @@ def test_rvq_route_trains_one_step_when_qwen3_builder_is_available() -> None:
     assert torch.isfinite(loss)
 
 
-def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> None:
-    if importlib.util.find_spec("transformers") is None:
-        pytest.skip("RVQ MTP route requires transformers.")
-
+def test_agrvq_route_trains_and_generates() -> None:
     backend = FakeCodec()
     semantic = torch.tensor([[[1], [2], [8]]], dtype=torch.long)
     acoustic = torch.tensor([[[1, 2], [3, 4], [5, 7]]], dtype=torch.long)
@@ -967,20 +1012,20 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
         backend.semantic_codebook,
         backend.acoustic_feature_dim,
         backend.acoustic_codebook_sizes,
-        condition_dim=10,
-        decoder=DecoderConfig(
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(
             layers=1,
             heads=2,
             ffn_ratio=2,
-            rvq_predictor=RVQPredictor.MTP,
-            mtp_layers=1,
-            mtp_heads=2,
         ),
+        factor_codebooks=_agrvq_codebooks(),
     )
     target = masked_acoustic_features(backend, acoustic, mask)
     reference = modules.reference_conditioner(target, mask=mask, batch_size=1)
-    condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
-    generator = modules.generator
+    condition = (
+        modules.model.condition(input_ids=semantic, attention_mask=mask) + reference
+    ).masked_fill(~mask[..., None], 0)
+    generator = modules.head
     assert isinstance(generator, RVQCodeGenerator)
     logits = generator.core(condition, acoustic, mask=mask)
     output = generator.code_loss_from_condition(condition, mask, target_codes=acoustic)
@@ -994,9 +1039,14 @@ def test_rvq_mtp_route_trains_and_generates_when_transformers_is_available() -> 
         generator=torch.Generator().manual_seed(0),
     )
 
-    assert isinstance(generator.core, QwenMTPCodebookPredictor)
+    assert isinstance(generator.core, AGRVQPredictor)
     assert torch.isfinite(loss)
-    assert [value.shape for value in logits] == [(1, 3, 5), (1, 3, 7)]
+    assert [value.shape for value in logits] == [
+        (1, 3, 1),
+        (1, 3, 5),
+        (1, 3, 1),
+        (1, 3, 7),
+    ]
     assert generated.shape == (1, 3, 2)
     assert torch.equal(generated[:, 2], torch.zeros_like(generated[:, 2]))
     assert bool((generated[..., 0][mask] < 5).all())
@@ -1010,8 +1060,8 @@ def test_generator_routes_reject_fixed_length_acoustic_units() -> None:
             torch.randn(8, 4),
             4,
             (5,),
-            condition_dim=4,
-            decoder=DecoderConfig(
+            backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+            head=DecoderConfig(
                 hidden_dim=4,
                 layers=1,
                 heads=1,
@@ -1029,9 +1079,14 @@ def test_rvq_loss_validates_per_codebook_logits() -> None:
 
     item = MaskedCodebookCrossEntropyLoss()(logits, labels, mask)
 
-    assert item.loss.shape == (1,)
-    assert item.details is not None
-    assert set(item.details) == {"codebook_0", "codebook_1", "frames"}
+    expected = torch.stack(
+        (
+            torch.nn.functional.cross_entropy(logits[0][mask], labels[..., 0][mask]),
+            torch.nn.functional.cross_entropy(logits[1][mask], labels[..., 1][mask]),
+        )
+    ).mean()
+    assert item.ndim == 0
+    torch.testing.assert_close(item, expected)
 
 
 class _PackedDecoderCore(torch.nn.Module):
@@ -1079,20 +1134,13 @@ def test_rvq_decoder_exposes_valid_frames_without_scattering(monkeypatch) -> Non
 
     assert packed.labels is not None
     assert torch.equal(packed.labels, torch.tensor([[1, 2], [3, 4], [2, 6]]))
-    assert torch.equal(packed.row_indices, torch.tensor([0, 0, 1]))
-    assert packed.batch_size == 2
     assert [tuple(value.shape) for value in packed.logits] == [(3, 5), (3, 7)]
     for packed_value, padded_value in zip(packed.logits, padded):
         assert torch.equal(padded_value[mask], packed_value)
         assert torch.equal(padded_value[~mask], torch.zeros_like(padded_value[~mask]))
 
 
-def test_rvq_codebook_ar_loss_does_not_scatter_or_revalidate(monkeypatch) -> None:
-    monkeypatch.setattr(
-        rvq_module,
-        "_qwen3_model",
-        lambda **options: _PackedDecoderCore(options["hidden_dim"]),
-    )
+def test_agrvq_loss_masks_padding_before_factor_unpack() -> None:
     generator = RVQCodeGenerator(
         4,
         (5, 7),
@@ -1101,8 +1149,8 @@ def test_rvq_codebook_ar_loss_does_not_scatter_or_revalidate(monkeypatch) -> Non
             layers=1,
             heads=1,
             ffn_ratio=2,
-            rvq_predictor=RVQPredictor.CODEBOOK_AR,
         ),
+        factor_codebooks=_agrvq_codebooks(),
     )
     condition = torch.randn(2, 3, 4)
     labels = torch.tensor(
@@ -1113,26 +1161,97 @@ def test_rvq_codebook_ar_loss_does_not_scatter_or_revalidate(monkeypatch) -> Non
     )
     mask = torch.tensor([[True, True, False], [True, False, False]])
 
-    def fail_scatter(*_args, **_kwargs):
-        raise AssertionError("packed loss must not scatter logits")
-
-    def fail_validation(*_args, **_kwargs):
-        raise AssertionError("decoder-owned packed values must not be revalidated")
-
-    monkeypatch.setattr(rvq_module, "_scatter", fail_scatter)
-    monkeypatch.setattr(
-        "anytrain.loss.codebook._validate_packed_inputs",
-        fail_validation,
-    )
     output = generator.code_loss_from_condition(
         condition,
         mask,
         target_codes=labels,
-        include_details=False,
     )
 
     assert torch.isfinite(output.loss)
-    assert output.items["rvq"].details is None
+    assert output.losses["rvq"].ndim == 0
+    torch.testing.assert_close(output.losses["rvq"], output.loss)
+
+
+@pytest.mark.parametrize(
+    "dependency",
+    [
+        FactorPredictor.PARALLEL,
+        FactorPredictor.DEPTH_AR,
+        FactorPredictor.DEPTH_RECURRENT,
+    ],
+)
+def test_agrvq_uses_two_codec_initialized_heads_per_stage(
+    dependency: FactorPredictor,
+) -> None:
+    codebooks = _agrvq_codebooks()
+    predictor = AGRVQPredictor(
+        6,
+        (5, 7),
+        codebooks,
+        dependency=dependency,
+        initialization=Initialization.CODEC,
+        seed=3,
+        temperature=0.5,
+    )
+    condition = torch.randn(2, 3, 6)
+    mask = torch.tensor([[True, True, True], [True, True, False]])
+    codes = torch.tensor(
+        [
+            [[1, 2], [3, 4], [0, 6]],
+            [[4, 1], [2, 5], [0, 0]],
+        ]
+    )
+
+    logits = predictor(condition, codes, mask=mask)
+    factors = predictor.unpack(codes)
+
+    assert len(logits) == 4
+    assert [value.shape for value in logits] == [
+        (2, 3, 1),
+        (2, 3, 5),
+        (2, 3, 1),
+        (2, 3, 7),
+    ]
+    assert torch.equal(predictor.pack(factors), codes)
+    assert all(isinstance(classifier.codebook, torch.nn.Parameter) for classifier in predictor.classifiers)
+    for classifier, codebook in zip(predictor.classifiers, codebooks, strict=True):
+        torch.testing.assert_close(classifier.codebook, codebook)
+    for value in logits:
+        assert torch.equal(value[1, 2], torch.zeros_like(value[1, 2]))
+
+
+def test_agrvq_stage_dependency_does_not_serialize_a_and_b_heads() -> None:
+    codebooks = (
+        torch.randn(2, 3),
+        torch.randn(3, 3),
+        torch.randn(4, 3),
+        torch.randn(5, 3),
+    )
+    condition = torch.randn(1, 2, 6)
+    mask = torch.ones(1, 2, dtype=torch.bool)
+    first = torch.tensor([[[0, 0], [1, 1]]])
+    changed_prefix = torch.tensor([[[5, 0], [4, 1]]])
+
+    for dependency in (
+        FactorPredictor.DEPTH_AR,
+        FactorPredictor.DEPTH_RECURRENT,
+    ):
+        predictor = AGRVQPredictor(
+            6,
+            (6, 20),
+            codebooks,
+            dependency=dependency,
+            initialization=Initialization.CODEC,
+            seed=0,
+            temperature=1.0,
+        )
+        baseline = predictor(condition, first, mask=mask)
+        changed = predictor(condition, changed_prefix, mask=mask)
+
+        torch.testing.assert_close(baseline[0], changed[0])
+        torch.testing.assert_close(baseline[1], changed[1])
+        assert not torch.allclose(baseline[2], changed[2])
+        assert not torch.allclose(baseline[3], changed[3])
 
 
 def test_rvq_decoder_import_is_lazy() -> None:

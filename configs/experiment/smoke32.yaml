@@ -31,9 +31,6 @@ datamodule:
     enabled: false
   fixed_batch: false
 
-pl_module:
-  finite_loss_check_interval: 1
-
 trainer:
   accelerator: gpu
   devices: 1
@@ -45,6 +42,8 @@ trainer:
   gradient_clip_val: 1.0
 
 callback:
+  debug:
+    enabled: true
   performance:
     enabled: true
     profile_flops: true

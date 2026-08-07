@@ -210,7 +210,7 @@ def evaluate_artifact_sample(
     valid = batch.acoustic_mask.to(predicted.device)
     metrics.update(factor_accuracy(predicted, labels, valid))
 
-    feature_generator = runtime.support.generator
+    feature_generator = runtime.support.head
     if isinstance(feature_generator, FMFeatureGenerator) and feature_generator.factor_depth is not None:
         condition = runtime.support.condition(batch.semantic_codes, mask=batch.mask)
         teacher_logits = feature_generator.factor_logits(

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
-from anytrain.loss import LossItem
 from torch import nn
 
 from semantic_acoustic_generator.config import Route
@@ -17,12 +16,11 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class DecoderLoss:
-    """Generator step loss with named anytrain ``LossItem`` outputs."""
+    """Generator step loss with named scalar component losses."""
 
     loss: Tensor
-    items: dict[str, LossItem]
+    losses: dict[str, Tensor]
     primary: str
-    scalars: dict[str, Tensor | float] = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -54,8 +52,11 @@ class AcousticCodeSampler(Protocol):
     ) -> Tensor: ...
 
 
-class AcousticUnitGenerator(nn.Module):
+class AcousticHead(nn.Module):
     route: Route
+
+
+AcousticUnitGenerator = AcousticHead
 
 
 def aligned_condition(
@@ -97,6 +98,7 @@ def normalized_features(
 
 __all__ = [
     "AcousticCodeSampler",
+    "AcousticHead",
     "AcousticUnitGenerator",
     "DecoderLoss",
     "FeatureSampler",

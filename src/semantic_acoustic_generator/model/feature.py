@@ -15,16 +15,16 @@ from torch import nn
 
 from semantic_acoustic_generator.config import (
     AnchorTarget,
-    DecoderConfig,
     FactorPredictor,
     FMMode,
+    HeadConfig,
     Route,
 )
 from semantic_acoustic_generator.loss.flow import FlowLoss, FlowRuntime
 from semantic_acoustic_generator.model.condition import AlignedAnchor
 from semantic_acoustic_generator.model.dit import DiTDecoder
 from semantic_acoustic_generator.model.generator import (
-    AcousticUnitGenerator,
+    AcousticHead,
     DecoderLoss,
     aligned_condition,
     normalized_features,
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from semantic_acoustic_generator.types import GeneratorBatch
 
 
-class FMFeatureGenerator(AcousticUnitGenerator):
+class FMFeatureGenerator(AcousticHead):
     """Common FM generator contract with construction dispatched by behavior."""
 
     route = Route.FM
@@ -61,7 +61,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         cls,
         condition_dim: int,
         feature_dim: int,
-        config: DecoderConfig,
+        config: HeadConfig,
         *,
         factor_codebooks: tuple[Tensor, ...] | None = None,
     ) -> FMFeatureGenerator:
@@ -76,7 +76,7 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             return cast(FMFeatureGenerator, object.__new__(implementation))
         return super().__new__(cls)
 
-    def _init_common(self, feature_dim: int, config: DecoderConfig) -> None:
+    def _init_common(self, feature_dim: int, config: HeadConfig) -> None:
         super().__init__()
         self.mode = config.fm_mode
         self.anchor_target = config.anchor_target
@@ -166,7 +166,6 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         factor_targets: Tensor | None = None,
         factor_codebooks: tuple[Tensor, ...] | None = None,
         factor_targeter: Callable[[int, Tensor], Tensor] | None = None,
-        include_details: bool = True,
     ) -> DecoderLoss:
         target_mask = batch.acoustic_mask
         target_condition, _ = aligned_condition(
@@ -195,7 +194,6 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             factor_codebooks=factor_codebooks,
             factor_targeter=factor_targeter,
             validate=False,
-            include_details=include_details,
         )
 
     def feature_loss_from_condition(
@@ -212,7 +210,6 @@ class FMFeatureGenerator(AcousticUnitGenerator):
         factor_codebooks: tuple[Tensor, ...] | None = None,
         factor_targeter: Callable[[int, Tensor], Tensor] | None = None,
         validate: bool = True,
-        include_details: bool = True,
     ) -> DecoderLoss:
         del (
             condition,
@@ -226,7 +223,6 @@ class FMFeatureGenerator(AcousticUnitGenerator):
             factor_codebooks,
             factor_targeter,
             validate,
-            include_details,
         )
         raise NotImplementedError
 
@@ -241,7 +237,7 @@ class _FlowFeatureGenerator(FMFeatureGenerator):
         self,
         condition_dim: int,
         feature_dim: int,
-        config: DecoderConfig,
+        config: HeadConfig,
         *,
         factor_codebooks: tuple[Tensor, ...] | None = None,
     ) -> None:
@@ -311,7 +307,6 @@ class _FlowFeatureGenerator(FMFeatureGenerator):
         factor_codebooks: tuple[Tensor, ...] | None = None,
         factor_targeter: Callable[[int, Tensor], Tensor] | None = None,
         validate: bool = True,
-        include_details: bool = True,
     ) -> DecoderLoss:
         del factor_targets, factor_codebooks, factor_targeter
         if repa_features is not None and self.repa_loss_weight <= 0:
@@ -324,35 +319,30 @@ class _FlowFeatureGenerator(FMFeatureGenerator):
         if core is None:
             raise RuntimeError("flow generator is missing its DiT decoder.")
         if self.repa_loss_weight <= 0:
-            item = self.flow_loss(
+            flow = self.flow_loss(
                 core,
                 condition,
                 target,
                 target_mask,
                 runtime,
                 validate=validate,
-                include_details=include_details,
             )
-            return DecoderLoss(loss=item.loss.mean(), items={"flow": item}, primary="flow")
+            return DecoderLoss(loss=flow, losses={"flow": flow}, primary="flow")
         if repa_features is None:
             raise RuntimeError("REPA requires precomputed teacher features.")
-        item, representation = self.flow_loss.forward_with_features(
+        flow, representation = self.flow_loss.forward_with_features(
             core,
             condition,
             target,
             target_mask,
             runtime,
             validate=validate,
-            include_details=include_details,
         )
         repa = self.repa_loss(representation, repa_features, target_mask)
-        flow_loss = item.loss.mean()
-        repa_loss = repa.loss.mean()
         return DecoderLoss(
-            loss=flow_loss + self.repa_loss_weight * repa_loss,
-            items={"flow": item, "repa": repa},
+            loss=flow + self.repa_loss_weight * repa,
+            losses={"flow": flow, "repa": repa},
             primary="flow",
-            scalars={"repa_weight": self.repa_loss_weight},
         )
 
 
@@ -361,7 +351,7 @@ class _AlignedFeatureGenerator(FMFeatureGenerator):
         self,
         condition_dim: int,
         feature_dim: int,
-        config: DecoderConfig,
+        config: HeadConfig,
         *,
         factor_codebooks: tuple[Tensor, ...] | None = None,
     ) -> None:
@@ -453,7 +443,6 @@ class _AlignedFeatureGenerator(FMFeatureGenerator):
         factor_codebooks: tuple[Tensor, ...] | None = None,
         factor_targeter: Callable[[int, Tensor], Tensor] | None = None,
         validate: bool = True,
-        include_details: bool = True,
     ) -> DecoderLoss:
         del factor_targeter
         if repa_features is not None:
@@ -490,19 +479,14 @@ class _AlignedFeatureGenerator(FMFeatureGenerator):
             factor_targets,
             target_mask,
             validate=validate,
-            include_top1=include_details,
-            include_details=include_details,
+            include_top1=False,
         )
         loss = (
-            mse.loss.mean()
-            + self.anchor_cosine_weight * cosine.loss.mean()
-            + self.anchor_factor_weight * factor.loss.mean()
+            mse
+            + self.anchor_cosine_weight * cosine
+            + self.anchor_factor_weight * factor
         )
-        items = {"anchor_mse": mse, "anchor_cosine": cosine, "anchor_factor": factor}
-        scalars: dict[str, Tensor | float] = {
-            "anchor_cosine_weight": self.anchor_cosine_weight,
-            "anchor_factor_weight": self.anchor_factor_weight,
-        }
+        losses = {"anchor_mse": mse, "anchor_cosine": cosine, "anchor_factor": factor}
         primary = "anchor_mse"
         if self.core is not None:
             runtime = self._flow_runtime() if flow_runtime is None else flow_runtime
@@ -513,13 +497,11 @@ class _AlignedFeatureGenerator(FMFeatureGenerator):
                 target_mask,
                 runtime,
                 validate=validate,
-                include_details=include_details,
             )
-            items["flow"] = flow
-            loss = loss + flow.loss.mean()
+            losses["flow"] = flow
+            loss = loss + flow
             primary = "flow"
-        scalars["total_loss"] = loss.detach()
-        return DecoderLoss(loss=loss, items=items, primary=primary, scalars=scalars)
+        return DecoderLoss(loss=loss, losses=losses, primary=primary)
 
 
 class _FactorAnchorFeatureGenerator(FMFeatureGenerator):
@@ -527,7 +509,7 @@ class _FactorAnchorFeatureGenerator(FMFeatureGenerator):
         self,
         condition_dim: int,
         feature_dim: int,
-        config: DecoderConfig,
+        config: HeadConfig,
         *,
         factor_codebooks: tuple[Tensor, ...] | None = None,
     ) -> None:
@@ -636,7 +618,6 @@ class _FactorAnchorFeatureGenerator(FMFeatureGenerator):
         factor_codebooks: tuple[Tensor, ...] | None = None,
         factor_targeter: Callable[[int, Tensor], Tensor] | None = None,
         validate: bool = True,
-        include_details: bool = True,
     ) -> DecoderLoss:
         del target_features, feature_mean, feature_std, flow_runtime, factor_codebooks
         if repa_features is not None:
@@ -653,8 +634,7 @@ class _FactorAnchorFeatureGenerator(FMFeatureGenerator):
                 factor_targets,
                 target_mask,
                 validate=validate,
-                include_top1=include_details,
-                include_details=include_details,
+                include_top1=False,
             )
         else:
             packed = (
@@ -673,18 +653,16 @@ class _FactorAnchorFeatureGenerator(FMFeatureGenerator):
                     validate=validate,
                 )
             )
-            factor = self.anchor_factor_loss.forward_packed(
+            factor = self.anchor_factor_loss(
                 packed,
                 validate=False,
-                include_top1=include_details,
-                include_details=include_details,
+                include_top1=False,
             )
-        loss = factor.loss.mean()
+        loss = factor
         return DecoderLoss(
             loss=loss,
-            items={"anchor_factor": factor},
+            losses={"anchor_factor": factor},
             primary="anchor_factor",
-            scalars={"total_loss": loss.detach()},
         )
 
     def _factor_output(self, logits: Tensor) -> tuple[Tensor, ...]:

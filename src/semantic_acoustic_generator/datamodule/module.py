@@ -180,7 +180,7 @@ class _PreparedDataset(MapStyleABC):
 
     def __init__(
         self,
-        source: Dataset[GeneratorSample],
+        source: Dataset[Any],
         *,
         indexes: Sequence[int],
         costs: Sequence[int],
@@ -199,7 +199,7 @@ class _PreparedDataset(MapStyleABC):
     def __len__(self) -> int:
         return len(self.indexes)
 
-    def __getitem__(self, index: int) -> GeneratorSample:
+    def __getitem__(self, index: int) -> Any:
         return self.source[self.indexes[index]]
 
     def _shuffle(

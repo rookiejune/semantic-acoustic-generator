@@ -6,7 +6,7 @@ from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
 import semantic_acoustic_generator.types as codec_types
 from semantic_acoustic_generator.datamodule import collate_structured_codes
-from semantic_acoustic_generator.pl_module.semantic import GeneratorModule
+from semantic_acoustic_generator.pl_module import GeneratorModule
 from semantic_acoustic_generator.types import GeneratorBatch, PairMetadata
 
 

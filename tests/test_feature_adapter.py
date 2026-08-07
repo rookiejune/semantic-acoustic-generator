@@ -18,6 +18,7 @@ from semantic_acoustic_generator.backend import (
 )
 from semantic_acoustic_generator.config import (
     AnchorTarget,
+    BackboneConfig,
     DecoderConfig,
     FactorPredictor,
     FeatureAdapter,
@@ -28,10 +29,11 @@ from semantic_acoustic_generator.evaluation import evaluate_first_codebook_oracl
 from semantic_acoustic_generator.model import FMFeatureGenerator
 from semantic_acoustic_generator.model import rvq as rvq_module
 from semantic_acoustic_generator.pl_module import build_module
+from semantic_acoustic_generator.pl_module.objective import factor_targets
 from semantic_acoustic_generator.runtime import GeneratorConfig, GeneratorRuntime, build_support
 from semantic_acoustic_generator.runtime.artifact import (
     load_artifact,
-    load_generator_artifact,
+    load_model_artifact,
     save_artifact,
 )
 from semantic_acoustic_generator.types import GeneratorBatch
@@ -374,9 +376,9 @@ def test_longcat_factor_targets_ignore_padded_code_ids() -> None:
     )
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
         feature_adapter=FeatureAdapter.LONGCAT_FIRST_CODEBOOK,
-        decoder=DecoderConfig(
+        head=DecoderConfig(
             hidden_dim=4,
             layers=1,
             heads=1,
@@ -389,8 +391,8 @@ def test_longcat_factor_targets_ignore_padded_code_ids() -> None:
     )
     module = build_module(adapted, config, batch, normalize_features=True)
 
-    targets = module._factor_targets(batch)
-    generator = module.support.generator
+    targets = factor_targets(module.backend, batch)
+    generator = module.support.head
     assert isinstance(generator, FMFeatureGenerator)
     assert generator.anchor is not None
     with torch.no_grad():
@@ -448,9 +450,9 @@ def test_artifact_restores_longcat_feature_adapter_for_raw_backend(tmp_path) -> 
     adapted = adapt_backend(backend, FeatureAdapter.LONGCAT_FIRST_CODEBOOK)
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
         feature_adapter=FeatureAdapter.LONGCAT_FIRST_CODEBOOK,
-        decoder=DecoderConfig(
+        head=DecoderConfig(
             hidden_dim=4,
             layers=1,
             heads=1,
@@ -469,14 +471,14 @@ def test_artifact_restores_longcat_feature_adapter_for_raw_backend(tmp_path) -> 
 
     loaded = load_artifact(tmp_path)
     runtime = GeneratorRuntime(loaded, backend)
-    generator = load_generator_artifact(tmp_path)
+    generator = load_model_artifact(tmp_path)
 
     assert loaded.acoustic_feature_dim == 16
     assert loaded.config is not None
     assert loaded.config.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
     assert isinstance(runtime.backend, LongCatFirstCodebookAdapter)
     assert generator.spec.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
-    assert generator.spec.decoder.fm_mode is FMMode.ANCHOR
+    assert generator.spec.head.fm_mode is FMMode.ANCHOR
     generator.spec.validate_backend(backend)
 
 
@@ -485,9 +487,9 @@ def test_factor_artifact_restores_codebook_buffers_without_codec_weights(tmp_pat
     adapted = LongCatFirstCodebookAdapter(backend)
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
         feature_adapter=FeatureAdapter.LONGCAT_FIRST_CODEBOOK,
-        decoder=DecoderConfig(
+        head=DecoderConfig(
             hidden_dim=4,
             layers=1,
             heads=1,
@@ -507,11 +509,11 @@ def test_factor_artifact_restores_codebook_buffers_without_codec_weights(tmp_pat
     save_artifact(tmp_path, support, backend=adapted)
 
     loaded = load_artifact(tmp_path)
-    acoustic = load_generator_artifact(tmp_path)
+    acoustic = load_model_artifact(tmp_path)
 
     assert loaded.config is not None
-    assert loaded.config.decoder.anchor_target is AnchorTarget.FACTOR
-    for restored in (loaded.generator, acoustic.generator):
+    assert loaded.config.head.anchor_target is AnchorTarget.FACTOR
+    for restored in (loaded.head, acoustic.head):
         assert isinstance(restored, FMFeatureGenerator)
         assert restored.factor_codebook_a is not None
         assert restored.factor_codebook_b is not None
@@ -524,10 +526,10 @@ def test_multi_codebook_factor_artifact_roundtrip(tmp_path) -> None:
     adapted = LongCatCodebookAdapter(backend, codebooks=3)
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
         feature_adapter=FeatureAdapter.LONGCAT_CODEBOOKS,
         feature_codebooks=3,
-        decoder=DecoderConfig(
+        head=DecoderConfig(
             hidden_dim=4,
             layers=1,
             heads=1,
@@ -548,21 +550,21 @@ def test_multi_codebook_factor_artifact_roundtrip(tmp_path) -> None:
 
     loaded = load_artifact(tmp_path)
     runtime = GeneratorRuntime(loaded, backend)
-    acoustic = load_generator_artifact(tmp_path)
+    acoustic = load_model_artifact(tmp_path)
 
     assert loaded.config is not None
     assert loaded.config.feature_codebooks == 3
     assert isinstance(runtime.backend, LongCatCodebookAdapter)
     assert runtime.backend.feature_codebooks == 3
     assert acoustic.spec.feature_codebooks == 3
-    assert "factor_codebook_2_b" in loaded.generator.state_dict()
+    assert "factor_codebook_2_b" in loaded.head.state_dict()
     for index, codebook in enumerate(adapted.factor_codebooks):
         key = (
             ("factor_codebook_a", "factor_codebook_b")[index]
             if index < 2
             else f"factor_codebook_{index // 2}_{'a' if index % 2 == 0 else 'b'}"
         )
-        torch.testing.assert_close(loaded.generator.state_dict()[key], codebook)
+        torch.testing.assert_close(loaded.head.state_dict()[key], codebook)
 
 
 def test_depth_factor_artifact_roundtrip(
@@ -578,10 +580,10 @@ def test_depth_factor_artifact_roundtrip(
     adapted = LongCatCodebookAdapter(backend, codebooks=2)
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
         feature_adapter=FeatureAdapter.LONGCAT_CODEBOOKS,
         feature_codebooks=2,
-        decoder=DecoderConfig(
+        head=DecoderConfig(
             hidden_dim=4,
             layers=1,
             heads=1,
@@ -601,17 +603,17 @@ def test_depth_factor_artifact_roundtrip(
     )
     condition = torch.randn(1, 3, 4)
     mask = torch.ones(1, 3, dtype=torch.bool)
-    expected = support.generator.sample_factor_codes(condition, mask)
+    expected = support.head.sample_factor_codes(condition, mask)
     save_artifact(tmp_path, support, backend=backend)
 
     loaded = load_artifact(tmp_path)
     assert loaded.config is not None
-    assert loaded.config.decoder.factor_predictor is FactorPredictor.DEPTH_AR
-    assert isinstance(loaded.generator, FMFeatureGenerator)
-    assert loaded.generator.factor_depth is not None
-    assert "factor_depth.factor_codebook_1_b" in loaded.generator.state_dict()
+    assert loaded.config.head.factor_predictor is FactorPredictor.DEPTH_AR
+    assert isinstance(loaded.head, FMFeatureGenerator)
+    assert loaded.head.factor_depth is not None
+    assert "factor_depth.factor_codebook_1_b" in loaded.head.state_dict()
     torch.testing.assert_close(
-        loaded.generator.sample_factor_codes(condition, mask),
+        loaded.head.sample_factor_codes(condition, mask),
         expected,
     )
 
@@ -621,10 +623,10 @@ def test_recurrent_factor_artifact_roundtrip(tmp_path) -> None:
     adapted = LongCatCodebookAdapter(backend, codebooks=2)
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
         feature_adapter=FeatureAdapter.LONGCAT_CODEBOOKS,
         feature_codebooks=2,
-        decoder=DecoderConfig(
+        head=DecoderConfig(
             hidden_dim=4,
             layers=2,
             heads=1,
@@ -644,14 +646,14 @@ def test_recurrent_factor_artifact_roundtrip(tmp_path) -> None:
     )
     condition = torch.randn(1, 3, 4)
     mask = torch.ones(1, 3, dtype=torch.bool)
-    expected = support.generator.sample_factor_codes(condition, mask)
+    expected = support.head.sample_factor_codes(condition, mask)
     save_artifact(tmp_path, support, backend=backend)
 
     loaded = load_artifact(tmp_path)
 
     assert loaded.config is not None
-    assert loaded.config.decoder.factor_predictor is FactorPredictor.DEPTH_RECURRENT
-    assert isinstance(loaded.generator, FMFeatureGenerator)
-    assert loaded.generator.factor_depth is not None
-    assert loaded.generator.factor_depth.recurrent is True
-    torch.testing.assert_close(loaded.generator.sample_factor_codes(condition, mask), expected)
+    assert loaded.config.head.factor_predictor is FactorPredictor.DEPTH_RECURRENT
+    assert isinstance(loaded.head, FMFeatureGenerator)
+    assert loaded.head.factor_depth is not None
+    assert loaded.head.factor_depth.recurrent is True
+    torch.testing.assert_close(loaded.head.sample_factor_codes(condition, mask), expected)

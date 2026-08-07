@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from lightning import LightningModule, Trainer
     from torch import Tensor
 
-    from semantic_acoustic_generator.pl_module.semantic import GeneratorModule
+    from semantic_acoustic_generator.pl_module.module import GeneratorModule
 
 
 @dataclass(frozen=True)
@@ -321,7 +321,7 @@ def _public_metadata(batch: GeneratorBatch) -> dict[str, Any]:
 
 
 def _module(module: LightningModule) -> GeneratorModule:
-    from semantic_acoustic_generator.pl_module.semantic import GeneratorModule
+    from semantic_acoustic_generator.pl_module.module import GeneratorModule
 
     if not isinstance(module, GeneratorModule):
         raise TypeError("SampleLogger requires a GeneratorModule.")

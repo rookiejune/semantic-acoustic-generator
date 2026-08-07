@@ -100,7 +100,6 @@ def test_factor_depth_packs_valid_frames_and_preserves_factor_order(
         packed.labels,
         torch.tensor([[0, 1, 2, 3], [2, 3, 4, 5], [1, 2, 3, 4]]),
     )
-    assert torch.equal(packed.row_indices, torch.tensor([0, 0, 1]))
     assert [tuple(value.shape) for value in packed.logits] == [
         (3, 3),
         (3, 4),
@@ -330,8 +329,8 @@ def test_factor_depth_integrates_with_aligned_factor_generator(
 
     assert generator.factor_depth is not None
     assert output.primary == "anchor_factor"
-    assert output.items["anchor_factor"].details is not None
-    assert "codebook_3_top1" in output.items["anchor_factor"].details
+    assert output.losses["anchor_factor"].ndim == 0
+    assert torch.isfinite(output.losses["anchor_factor"])
     assert factors.shape == (2, 3, 4)
     assert features.shape == (2, 3, 32)
     assert torch.equal(factors[~mask], torch.zeros_like(factors[~mask]))
@@ -384,8 +383,8 @@ def test_factor_depth_loss_keeps_valid_frames_packed(
         mask,
         target_features=None,
         factor_targets=targets,
-        include_details=False,
     )
 
     assert output.loss.isfinite()
-    assert output.items["anchor_factor"].details is None
+    assert output.losses["anchor_factor"].ndim == 0
+    torch.testing.assert_close(output.losses["anchor_factor"], output.loss)

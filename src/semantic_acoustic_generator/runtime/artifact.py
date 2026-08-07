@@ -19,17 +19,19 @@ from semantic_acoustic_generator.backend import adapt_backend
 from semantic_acoustic_generator.config import (
     AnchorContext,
     AnchorTarget,
-    DecoderConfig,
+    BackboneConfig,
     FactorPredictor,
     FeatureAdapter,
     FMMode,
+    HeadConfig,
     Initialization,
     Route,
-    RVQPredictor,
 )
 from semantic_acoustic_generator.model.code import RVQCodeGenerator
 from semantic_acoustic_generator.model.feature import FMFeatureGenerator, factor_codebook_names
-from semantic_acoustic_generator.model.generator import AcousticUnitGenerator
+from semantic_acoustic_generator.model.generator import AcousticHead
+from semantic_acoustic_generator.model.backbone import QwenBackbone
+from semantic_acoustic_generator.model.model import AcousticGeneratorModel
 from semantic_acoustic_generator.runtime.metadata import (
     support_metadata,
     validate_backend_metadata,
@@ -42,7 +44,7 @@ if TYPE_CHECKING:
         SamplingConfig,
     )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 CONFIG_NAME = "generator.json"
 LEGACY_SCHEMA_VERSION = 7
 LEGACY_CONFIG_NAME = "codec.json"
@@ -52,8 +54,10 @@ __all__ = [
     "AcousticGeneratorArtifact",
     "AcousticGeneratorBackend",
     "AcousticGeneratorSpec",
+    "AcousticModelArtifact",
     "load_artifact",
     "load_generator_artifact",
+    "load_model_artifact",
     "save_artifact",
 ]
 
@@ -80,10 +84,10 @@ class AcousticGeneratorSpec:
     """Portable decoder contract consumed by external condition producers."""
 
     route: Route
-    condition_dim: int
+    backbone: BackboneConfig
     feature_adapter: FeatureAdapter
     feature_codebooks: int
-    decoder: DecoderConfig
+    head: HeadConfig
     backend_name: str
     sample_rate: int
     frame_rate: float
@@ -97,6 +101,14 @@ class AcousticGeneratorSpec:
     feature_mean: tuple[float, ...]
     feature_std: tuple[float, ...]
     sampling: SamplingConfig
+
+    @property
+    def condition_dim(self) -> int:
+        return self.backbone.hidden_dim
+
+    @property
+    def decoder(self) -> HeadConfig:
+        return self.head
 
     def __post_init__(self) -> None:
         if self.feature_codebooks <= 0:
@@ -148,8 +160,24 @@ class AcousticGeneratorSpec:
 class AcousticGeneratorArtifact:
     """Loaded generator plus the condition and backend contract of its weights."""
 
-    generator: AcousticUnitGenerator
+    generator: AcousticHead
     spec: AcousticGeneratorSpec
+
+
+@dataclass(frozen=True)
+class AcousticModelArtifact:
+    """Loaded semantic backbone and acoustic head with their codec contract."""
+
+    model: AcousticGeneratorModel
+    spec: AcousticGeneratorSpec
+
+    @property
+    def backbone(self) -> QwenBackbone:
+        return self.model.backbone
+
+    @property
+    def head(self) -> AcousticHead:
+        return self.model.head
 
 
 def save_artifact(
@@ -209,28 +237,45 @@ def load_generator_artifact(
         generator.to(device=device)
     generator.eval()
     codec_spec = _codec_spec(metadata)
-    acoustic_feature_dim = codec_spec.acoustic_feature_dim
-    spec = AcousticGeneratorSpec(
-        route=config.route,
-        condition_dim=config.condition_dim,
-        feature_adapter=config.feature_adapter,
-        feature_codebooks=config.feature_codebooks,
-        decoder=config.decoder,
-        backend_name=_metadata_string(metadata, "name"),
-        sample_rate=codec_spec.sample_rate,
-        frame_rate=codec_spec.frame_rate,
-        semantic_frame_rate=codec_spec.semantic_frame_rate,
-        semantic_vocab_size=codec_spec.semantic_codebook_sizes[0],
-        semantic_embedding_dim=codec_spec.semantic_embedding_dim,
-        acoustic_feature_dim=acoustic_feature_dim,
-        acoustic_codebook_sizes=codec_spec.acoustic_codebook_sizes,
-        acoustic_layout=codec_spec.acoustic_layout,
-        acoustic_unit_length=codec_spec.acoustic_unit_length,
-        feature_mean=_feature_values(config.feature_mean, acoustic_feature_dim, fill=0.0),
-        feature_std=_feature_values(config.feature_std, acoustic_feature_dim, fill=1.0),
-        sampling=config.sampling,
+    return AcousticGeneratorArtifact(
+        generator=generator,
+        spec=_spec(config, metadata, codec_spec),
     )
-    return AcousticGeneratorArtifact(generator=generator, spec=spec)
+
+
+def load_model_artifact(
+    path: str | Path,
+    *,
+    device: str | torch.device | None = None,
+) -> AcousticModelArtifact:
+    """Load the schema-9 ``backbone + head`` model without a codec instance."""
+    checkpoint, metadata, config = _artifact(path)
+    state = _load_state(checkpoint)
+    model_state = _model_state(state)
+    codec_spec = _codec_spec(metadata)
+    factor_codebooks = _factor_codebooks(model_state, config, prefix="head.")
+    model = AcousticGeneratorModel(
+        QwenBackbone(
+            torch.zeros(
+                codec_spec.semantic_codebook_sizes[0],
+                codec_spec.semantic_embedding_dim,
+            ),
+            config.backbone,
+        ),
+        _generator(
+            config,
+            metadata,
+            factor_codebooks=factor_codebooks,
+        ),
+    )
+    model.load_state_dict(model_state)
+    if device is not None:
+        model.to(device=device)
+    model.eval()
+    return AcousticModelArtifact(
+        model=model,
+        spec=_spec(config, metadata, codec_spec),
+    )
 
 
 def _backend_metadata(
@@ -295,7 +340,15 @@ def _load_artifact(
         ),
         codec_spec=codec_spec,
         artifact_backend_metadata=backend_data,
-        factor_codebooks=_factor_codebooks(state, config, prefix="generator."),
+        factor_codebooks=_factor_codebooks(
+            state,
+            config,
+            prefix=(
+                "model.head."
+                if any(key.startswith("model.head.") for key in state)
+                else "generator."
+            ),
+        ),
     )
     support.load_state_dict(state)
     if device is not None:
@@ -350,22 +403,51 @@ def _generator(
     metadata: Mapping[str, object],
     *,
     factor_codebooks: tuple[Tensor, ...] | None = None,
-) -> AcousticUnitGenerator:
+) -> AcousticHead:
     codec_spec = _codec_spec(metadata)
     if config.route is Route.FM:
         return FMFeatureGenerator(
-            config.condition_dim,
+            config.backbone.hidden_dim,
             codec_spec.acoustic_feature_dim,
-            config.decoder,
+            config.head,
             factor_codebooks=factor_codebooks,
         )
     if config.route is Route.RVQ:
         return RVQCodeGenerator(
-            config.condition_dim,
+            config.backbone.hidden_dim,
             codec_spec.acoustic_codebook_sizes,
-            config.decoder,
+            config.head,
+            factor_codebooks=factor_codebooks,
         )
     raise AssertionError(f"unsupported route: {config.route}")
+
+
+def _spec(
+    config: GeneratorConfig,
+    metadata: Mapping[str, object],
+    codec_spec: SemanticAcousticCodecSpec,
+) -> AcousticGeneratorSpec:
+    acoustic_feature_dim = codec_spec.acoustic_feature_dim
+    return AcousticGeneratorSpec(
+        route=config.route,
+        backbone=config.backbone,
+        feature_adapter=config.feature_adapter,
+        feature_codebooks=config.feature_codebooks,
+        head=config.head,
+        backend_name=_metadata_string(metadata, "name"),
+        sample_rate=codec_spec.sample_rate,
+        frame_rate=codec_spec.frame_rate,
+        semantic_frame_rate=codec_spec.semantic_frame_rate,
+        semantic_vocab_size=codec_spec.semantic_codebook_sizes[0],
+        semantic_embedding_dim=codec_spec.semantic_embedding_dim,
+        acoustic_feature_dim=acoustic_feature_dim,
+        acoustic_codebook_sizes=codec_spec.acoustic_codebook_sizes,
+        acoustic_layout=codec_spec.acoustic_layout,
+        acoustic_unit_length=codec_spec.acoustic_unit_length,
+        feature_mean=_feature_values(config.feature_mean, acoustic_feature_dim, fill=0.0),
+        feature_std=_feature_values(config.feature_std, acoustic_feature_dim, fill=1.0),
+        sampling=config.sampling,
+    )
 
 
 def _codec_spec(metadata: Mapping[str, object]) -> SemanticAcousticCodecSpec:
@@ -392,10 +474,29 @@ def _codec_spec(metadata: Mapping[str, object]) -> SemanticAcousticCodecSpec:
 
 
 def _generator_state(state: Mapping[str, Tensor]) -> dict[str, Tensor]:
-    prefix = "generator."
-    result = {key[len(prefix) :]: value for key, value in state.items() if key.startswith(prefix)}
+    prefixes = ("model.head.", "generator.")
+    result: dict[str, Tensor] = {}
+    for prefix in prefixes:
+        result = {
+            key[len(prefix) :]: value for key, value in state.items() if key.startswith(prefix)
+        }
+        if result:
+            break
     if not result:
         raise RuntimeError("generator checkpoint is missing generator state.")
+    return result
+
+
+def _model_state(state: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    prefix = "model."
+    result = {
+        key[len(prefix) :]: value for key, value in state.items() if key.startswith(prefix)
+    }
+    if not result:
+        raise RuntimeError(
+            "generator checkpoint is missing schema-9 model state; "
+            "legacy artifacts expose only the acoustic head."
+        )
     return result
 
 
@@ -405,7 +506,16 @@ def _factor_codebooks(
     *,
     prefix: str,
 ) -> tuple[Tensor, ...] | None:
-    if config.decoder.anchor_target is AnchorTarget.FEATURE:
+    if config.route is Route.RVQ:
+        values: list[Tensor] = []
+        index = 0
+        while (key := f"{prefix}core.classifiers.{index}.codebook") in state:
+            values.append(state[key])
+            index += 1
+        if values and len(values) % 2 != 0:
+            raise RuntimeError("AGRVQ artifact contains an incomplete factor-codebook pair.")
+        return tuple(values) if values else None
+    if config.head.anchor_target is AnchorTarget.FEATURE:
         return None
     keys = tuple(
         f"{prefix}{name}" for name in factor_codebook_names(config.feature_codebooks)
@@ -426,24 +536,67 @@ def _config_dict(config: GeneratorConfig) -> dict[str, object]:
     data = asdict(config)
     data["route"] = config.route.value
     data["feature_adapter"] = config.feature_adapter.value
-    data["initialization"] = config.initialization.value
-    decoder = cast(dict[str, object], data["decoder"])
-    decoder["rvq_predictor"] = config.decoder.rvq_predictor.value
-    decoder["fm_mode"] = config.decoder.fm_mode.value
-    decoder["anchor_context"] = config.decoder.anchor_context.value
-    decoder["anchor_target"] = config.decoder.anchor_target.value
-    decoder["factor_predictor"] = config.decoder.factor_predictor.value
+    backbone = cast(dict[str, object], data["backbone"])
+    backbone["embedding_initialization"] = config.backbone.embedding_initialization.value
+    head = cast(dict[str, object], data["head"])
+    head["codebook_initialization"] = config.head.codebook_initialization.value
+    head["fm_mode"] = config.head.fm_mode.value
+    head["anchor_context"] = config.head.anchor_context.value
+    head["anchor_target"] = config.head.anchor_target.value
+    head["factor_predictor"] = config.head.factor_predictor.value
     return cast(dict[str, object], data)
 
 
 def _config(data: Mapping[str, object]) -> GeneratorConfig:
     from semantic_acoustic_generator.runtime.semantic import GeneratorConfig, SamplingConfig
 
-    decoder = _schema_mapping(data, "decoder", owner="config")
+    backbone = (
+        _schema_mapping(data, "backbone", owner="config")
+        if "backbone" in data
+        else None
+    )
+    head = _schema_mapping(data, "head", owner="config") if "head" in data else None
+    head_data = _schema_mapping(data, "decoder", owner="config") if head is None else head
+    head_owner = "decoder" if head is None else "head"
     sampling = _schema_mapping(data, "sampling", owner="config")
     return GeneratorConfig(
         route=Route(_schema_string(data, "route", owner="config")),
-        condition_dim=_schema_int(data, "condition_dim", owner="config"),
+        backbone=BackboneConfig(
+            hidden_dim=(
+                _schema_int(data, "condition_dim", owner="config")
+                if backbone is None
+                else _schema_int(backbone, "hidden_dim", owner="backbone")
+            ),
+            layers=(
+                4
+                if backbone is None
+                else _schema_int(backbone, "layers", owner="backbone")
+            ),
+            heads=(
+                8
+                if backbone is None
+                else _schema_int(backbone, "heads", owner="backbone")
+            ),
+            ffn_ratio=(
+                4
+                if backbone is None
+                else _schema_int(backbone, "ffn_ratio", owner="backbone")
+            ),
+            embedding_initialization=Initialization(
+                _schema_string(data, "initialization", owner="config")
+                if backbone is None
+                else _schema_string(
+                    backbone,
+                    "embedding_initialization",
+                    owner="backbone",
+                )
+            ),
+            seed=(
+                _schema_int(data, "seed", owner="config")
+                if backbone is None
+                else _schema_int(backbone, "seed", owner="backbone")
+            ),
+        ),
         feature_adapter=FeatureAdapter(
             _schema_optional_string(
                 data,
@@ -458,100 +611,113 @@ def _config(data: Mapping[str, object]) -> GeneratorConfig:
             owner="config",
             default=1,
         ),
-        decoder=DecoderConfig(
-            hidden_dim=_schema_optional_int(decoder, "hidden_dim", owner="decoder"),
-            layers=_schema_int(decoder, "layers", owner="decoder"),
-            heads=_schema_int(decoder, "heads", owner="decoder"),
-            ffn_ratio=_schema_int(decoder, "ffn_ratio", owner="decoder"),
-            rvq_predictor=RVQPredictor(_schema_string(decoder, "rvq_predictor", owner="decoder")),
-            mtp_layers=_schema_int(decoder, "mtp_layers", owner="decoder"),
-            mtp_heads=_schema_int(decoder, "mtp_heads", owner="decoder"),
+        head=HeadConfig(
+            codebook_initialization=Initialization(
+                _schema_optional_string(
+                    head_data,
+                    (
+                        "codebook_initialization"
+                        if "codebook_initialization" in head_data
+                        else "initialization"
+                    ),
+                    owner=head_owner,
+                    default=Initialization.CODEC.value,
+                )
+            ),
+            seed=_schema_optional_int_default(
+                head_data,
+                "seed",
+                owner=head_owner,
+                default=0,
+            ),
+            hidden_dim=_schema_optional_int(head_data, "hidden_dim", owner=head_owner),
+            layers=_schema_int(head_data, "layers", owner=head_owner),
+            heads=_schema_int(head_data, "heads", owner=head_owner),
+            ffn_ratio=_schema_int(head_data, "ffn_ratio", owner=head_owner),
             repa_feature_dim=_schema_optional_int(
-                decoder,
+                head_data,
                 "repa_feature_dim",
-                owner="decoder",
+                owner=head_owner,
             ),
             repa_student_layer=_schema_optional_int(
-                decoder,
+                head_data,
                 "repa_student_layer",
-                owner="decoder",
+                owner=head_owner,
             ),
             repa_loss_weight=_schema_float(
-                decoder,
+                head_data,
                 "repa_loss_weight",
-                owner="decoder",
+                owner=head_owner,
             ),
             fm_mode=FMMode(
                 _schema_optional_string(
-                    decoder,
+                    head_data,
                     "fm_mode",
-                    owner="decoder",
+                    owner=head_owner,
                     default=FMMode.FLOW.value,
                 )
             ),
             anchor_context=AnchorContext(
                 _schema_optional_string(
-                    decoder,
+                    head_data,
                     "anchor_context",
-                    owner="decoder",
+                    owner=head_owner,
                     default=AnchorContext.LOCAL.value,
                 )
             ),
             anchor_target=AnchorTarget(
                 _schema_optional_string(
-                    decoder,
+                    head_data,
                     "anchor_target",
-                    owner="decoder",
+                    owner=head_owner,
                     default=AnchorTarget.FEATURE.value,
                 )
             ),
             factor_predictor=FactorPredictor(
                 _schema_optional_string(
-                    decoder,
+                    head_data,
                     "factor_predictor",
-                    owner="decoder",
+                    owner=head_owner,
                     default=FactorPredictor.PARALLEL.value,
                 )
             ),
             anchor_hidden_dim=_schema_optional_int_default(
-                decoder,
+                head_data,
                 "anchor_hidden_dim",
-                owner="decoder",
+                owner=head_owner,
                 default=512,
             ),
             anchor_layers=_schema_optional_int_default(
-                decoder,
+                head_data,
                 "anchor_layers",
-                owner="decoder",
+                owner=head_owner,
                 default=4,
             ),
             anchor_kernel_size=_schema_optional_int_default(
-                decoder,
+                head_data,
                 "anchor_kernel_size",
-                owner="decoder",
+                owner=head_owner,
                 default=3,
             ),
             anchor_cosine_weight=_schema_optional_float(
-                decoder,
+                head_data,
                 "anchor_cosine_weight",
-                owner="decoder",
+                owner=head_owner,
                 default=0.1,
             ),
             anchor_factor_weight=_schema_optional_float(
-                decoder,
+                head_data,
                 "anchor_factor_weight",
-                owner="decoder",
+                owner=head_owner,
                 default=0.1,
             ),
             anchor_factor_temperature=_schema_optional_float(
-                decoder,
+                head_data,
                 "anchor_factor_temperature",
-                owner="decoder",
+                owner=head_owner,
                 default=0.1,
             ),
         ),
-        initialization=Initialization(_schema_string(data, "initialization", owner="config")),
-        seed=_schema_int(data, "seed", owner="config"),
         sampling=SamplingConfig(
             flow_steps=_schema_int(sampling, "flow_steps", owner="sampling"),
             temperature=_schema_float(sampling, "temperature", owner="sampling"),

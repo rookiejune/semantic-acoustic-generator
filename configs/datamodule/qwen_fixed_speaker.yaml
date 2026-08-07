@@ -1,4 +1,5 @@
-source: qwen_fixed_speaker
+dataset: qwen
+pairing: none
 root: null
 split: train
 validation_split: null

@@ -10,13 +10,12 @@ from semantic_acoustic_generator.backend import BackendConfig
 from semantic_acoustic_generator.config import (
     AnchorContext,
     AnchorTarget,
-    DecoderConfig,
     FactorPredictor,
     FeatureAdapter,
     FMMode,
+    HeadConfig,
     Route,
-    RVQPredictor,
-    decoder_options,
+    head_options,
 )
 from semantic_acoustic_generator.training import (
     TrainConfig,
@@ -34,57 +33,42 @@ CONFIG_DIR = Path(__file__).parents[1] / "configs"
         "layers",
         "heads",
         "ffn_ratio",
-        "mtp_layers",
-        "mtp_heads",
         "repa_feature_dim",
         "repa_student_layer",
     ],
 )
 @pytest.mark.parametrize("value", [True, "4"])
-def test_decoder_config_rejects_non_integer_fields(field: str, value: object) -> None:
+def test_head_config_rejects_non_integer_fields(field: str, value: object) -> None:
     with pytest.raises(TypeError, match=field):
-        DecoderConfig(**{field: value})  # type: ignore[arg-type]
+        HeadConfig(**{field: value})  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("value", [True, "0.1"])
-def test_decoder_config_rejects_non_numeric_repa_weight(value: object) -> None:
+def test_head_config_rejects_non_numeric_repa_weight(value: object) -> None:
     with pytest.raises(TypeError, match="repa_loss_weight"):
-        DecoderConfig(repa_loss_weight=value)  # type: ignore[arg-type]
+        HeadConfig(repa_loss_weight=value)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_decoder_config_rejects_non_finite_repa_weight(value: float) -> None:
+def test_head_config_rejects_non_finite_repa_weight(value: float) -> None:
     with pytest.raises(ValueError, match="repa_loss_weight must be finite"):
-        DecoderConfig(repa_loss_weight=value)
+        HeadConfig(repa_loss_weight=value)
 
 
-def test_decoder_config_requires_declared_predictor() -> None:
-    with pytest.raises(TypeError, match="rvq_predictor must be an RVQPredictor"):
-        DecoderConfig(rvq_predictor="mtp")  # type: ignore[arg-type]
-
-
-def test_decoder_config_requires_declared_factor_predictor() -> None:
+def test_head_config_requires_declared_factor_predictor() -> None:
     with pytest.raises(TypeError, match="factor_predictor must be a FactorPredictor"):
-        DecoderConfig(factor_predictor="depth_ar")  # type: ignore[arg-type]
+        HeadConfig(factor_predictor="depth_ar")  # type: ignore[arg-type]
 
 
-def test_depth_ar_factor_predictor_requires_factor_target() -> None:
-    assert DecoderConfig().factor_predictor is FactorPredictor.PARALLEL
-    with pytest.raises(
-        ValueError,
-        match="depth factor predictors require anchor_target=factor",
-    ):
-        DecoderConfig(factor_predictor=FactorPredictor.DEPTH_AR)
-
-    with pytest.raises(
-        ValueError,
-        match="depth factor predictors require anchor_target=factor",
-    ):
-        DecoderConfig(factor_predictor=FactorPredictor.DEPTH_RECURRENT)
+def test_head_config_allows_rvq_stage_dependency_without_fm_target_settings() -> None:
+    assert HeadConfig().factor_predictor is FactorPredictor.PARALLEL
+    assert HeadConfig(
+        factor_predictor=FactorPredictor.DEPTH_AR
+    ).factor_predictor is FactorPredictor.DEPTH_AR
 
 
-def test_decoder_options_parses_depth_ar_factor_predictor() -> None:
-    config = decoder_options(
+def test_head_options_parses_depth_ar_factor_predictor() -> None:
+    config = head_options(
         {
             "layers": 8,
             "heads": 8,
@@ -98,8 +82,8 @@ def test_decoder_options_parses_depth_ar_factor_predictor() -> None:
     assert config.factor_predictor is FactorPredictor.DEPTH_AR
 
 
-def test_decoder_options_parses_recurrent_factor_predictor() -> None:
-    config = decoder_options(
+def test_head_options_parses_recurrent_factor_predictor() -> None:
+    config = head_options(
         {
             "layers": 2,
             "heads": 8,
@@ -113,8 +97,8 @@ def test_decoder_options_parses_recurrent_factor_predictor() -> None:
     assert config.factor_predictor is FactorPredictor.DEPTH_RECURRENT
 
 
-def test_decoder_options_parses_qwen_film_anchor() -> None:
-    config = decoder_options(
+def test_head_options_parses_qwen_film_anchor() -> None:
+    config = head_options(
         {
             "layers": 2,
             "heads": 8,
@@ -127,9 +111,9 @@ def test_decoder_options_parses_qwen_film_anchor() -> None:
     assert config.anchor_context is AnchorContext.QWEN_FILM
 
 
-def test_decoder_options_rejects_non_finite_repa_weight() -> None:
+def test_head_options_rejects_non_finite_repa_weight() -> None:
     with pytest.raises(ValueError, match="repa_loss_weight must be finite"):
-        decoder_options(
+        head_options(
             {
                 "layers": 8,
                 "heads": 8,
@@ -141,14 +125,14 @@ def test_decoder_options_rejects_non_finite_repa_weight() -> None:
 
 def test_transformer_anchor_requires_heads_to_divide_hidden_dim() -> None:
     with pytest.raises(ValueError, match="divisible by heads"):
-        DecoderConfig(
+        HeadConfig(
             heads=3,
             anchor_context=AnchorContext.TRANSFORMER,
             anchor_hidden_dim=8,
         )
 
     with pytest.raises(ValueError, match="divisible by heads"):
-        DecoderConfig(
+        HeadConfig(
             heads=3,
             anchor_context=AnchorContext.QWEN_FILM,
             anchor_hidden_dim=8,
@@ -156,9 +140,9 @@ def test_transformer_anchor_requires_heads_to_divide_hidden_dim() -> None:
 
 
 def test_factor_target_requires_anchor_mode() -> None:
-    assert DecoderConfig().anchor_target is AnchorTarget.FEATURE
+    assert HeadConfig().anchor_target is AnchorTarget.FEATURE
     with pytest.raises(ValueError, match="anchor_target=factor requires fm_mode=anchor"):
-        DecoderConfig(anchor_target=AnchorTarget.FACTOR)
+        HeadConfig(anchor_target=AnchorTarget.FACTOR)
 
 
 def _compose(*overrides: str) -> DictConfig:
@@ -186,7 +170,8 @@ def test_experiment_composes_src_aligned_groups(
     config = _compose(f"experiment={experiment}")
 
     assert config.backend.name == backend
-    assert config.datamodule.source == "qwen_cross_text"
+    assert config.datamodule.dataset == "qwen"
+    assert config.datamodule.pairing == "cross_text"
     assert config.model.route == route
     assert config.trainer.max_steps == max_steps
 
@@ -199,11 +184,15 @@ def test_root_has_no_legacy_flat_training_groups() -> None:
     assert config.seed == 0
     assert config.datamodule.fixed_batch is False
     assert config.pl_module.reference_dropout == 0.5
-    assert config.pl_module.finite_loss_check_interval == 100
     assert config.runtime.sampling.cfg_scale == 1.0
+    assert config.callback.debug.enabled is False
     assert config.callback.checkpoint.enabled is True
     assert config.callback.performance.profile_flops is False
     assert config.callback.data_throughput.enabled is True
+    assert config.callback.data_throughput.log_every_n_units is None
+    assert config.callback.data_throughput.measure_window_batches == 100
+    assert config.callback.data_throughput.sync_cuda is True
+    assert config.callback.data_throughput.sync_distributed is True
 
 
 def test_longcat_fm_uses_24gb_single_gpu_batching_defaults() -> None:
@@ -220,26 +209,31 @@ def test_train_config_parses_to_typed_entry_schema() -> None:
     assert isinstance(config.backend, BackendConfig)
     assert config.model.route is Route.FM
     assert config.model.feature_adapter is FeatureAdapter.NONE
-    assert config.model.decoder.rvq_predictor is RVQPredictor.MTP
-    assert config.model.decoder.factor_predictor is FactorPredictor.PARALLEL
+    assert config.model.head.factor_predictor is FactorPredictor.PARALLEL
     assert config.datamodule.fixed_batch is False
     assert config.callback.performance.enabled is False
     assert config.runtime.sampling.cfg_scale == 1.0
-    assert config.output_subdir == "longcat/fm-8l/codec"
+    assert config.output_subdir == "longcat/fm-4l/codec"
 
 
-@pytest.mark.parametrize("experiment", ["smoke", "smoke32", "overfit"])
-def test_debug_experiments_check_finite_loss_every_step(experiment: str) -> None:
+@pytest.mark.parametrize(
+    "experiment",
+    [
+        "smoke",
+        "smoke32",
+        "overfit",
+        "010_longcat_anchor_overfit",
+        "011_longcat_anchor_scale",
+        "011_longcat_transformer_anchor",
+        "012_longcat_factor_classifier",
+        "013_longcat_factor_scale",
+        "014_longcat_factor_depth",
+    ],
+)
+def test_debug_experiments_enable_debug_callback(experiment: str) -> None:
     config = _compose(f"experiment={experiment}")
 
-    assert config.pl_module.finite_loss_check_interval == 1
-
-
-def test_train_config_rejects_non_positive_finite_loss_interval() -> None:
-    raw = _compose("pl_module.finite_loss_check_interval=0")
-
-    with pytest.raises(ValueError, match="finite_loss_check_interval"):
-        parse_train_config(raw)
+    assert config.callback.debug.enabled is True
 
 
 def test_train_config_preserves_false_backend_boolean() -> None:
@@ -288,8 +282,8 @@ def test_train_config_parses_longcat_multi_codebook_adapter() -> None:
         _compose(
             "model.feature_adapter=longcat_codebooks",
             "model.feature_codebooks=3",
-            "model.decoder.fm_mode=anchor",
-            "model.decoder.anchor_target=factor",
+            "model.head.fm_mode=anchor",
+            "model.head.anchor_target=factor",
         )
     )
 
@@ -311,31 +305,31 @@ def test_train_config_parses_first_codebook_anchor_mode() -> None:
     config = parse_train_config(
         _compose(
             "model.feature_adapter=longcat_first_codebook",
-            "model.decoder.fm_mode=anchor",
-            "model.decoder.anchor_hidden_dim=256",
-            "model.decoder.anchor_layers=2",
-            "model.decoder.anchor_context=transformer",
+            "model.head.fm_mode=anchor",
+            "model.head.anchor_hidden_dim=256",
+            "model.head.anchor_layers=2",
+            "model.head.anchor_context=transformer",
         )
     )
 
-    assert config.model.decoder.fm_mode is FMMode.ANCHOR
-    assert config.model.decoder.anchor_hidden_dim == 256
-    assert config.model.decoder.anchor_layers == 2
-    assert config.model.decoder.anchor_context is AnchorContext.TRANSFORMER
+    assert config.model.head.fm_mode is FMMode.ANCHOR
+    assert config.model.head.anchor_hidden_dim == 256
+    assert config.model.head.anchor_layers == 2
+    assert config.model.head.anchor_context is AnchorContext.TRANSFORMER
 
 
 def test_train_config_parses_factor_anchor_target() -> None:
     config = parse_train_config(
         _compose(
             "model.feature_adapter=longcat_first_codebook",
-            "model.decoder.fm_mode=anchor",
-            "model.decoder.anchor_target=factor",
-            "model.decoder.factor_predictor=depth_ar",
+            "model.head.fm_mode=anchor",
+            "model.head.anchor_target=factor",
+            "model.head.factor_predictor=depth_ar",
         )
     )
 
-    assert config.model.decoder.anchor_target is AnchorTarget.FACTOR
-    assert config.model.decoder.factor_predictor is FactorPredictor.DEPTH_AR
+    assert config.model.head.anchor_target is AnchorTarget.FACTOR
+    assert config.model.head.factor_predictor is FactorPredictor.DEPTH_AR
     support = build_support_config(config, seed=0, repa_teacher=None)
     assert support.decoder.factor_predictor is FactorPredictor.DEPTH_AR
 
@@ -344,9 +338,9 @@ def test_longcat_factor_classifier_experiment_is_frame_aligned() -> None:
     config = parse_train_config(_compose("experiment=012_longcat_factor_classifier"))
 
     assert config.model.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
-    assert config.model.decoder.fm_mode is FMMode.ANCHOR
-    assert config.model.decoder.anchor_context is AnchorContext.LOCAL
-    assert config.model.decoder.anchor_target is AnchorTarget.FACTOR
+    assert config.model.head.fm_mode is FMMode.ANCHOR
+    assert config.model.head.anchor_context is AnchorContext.LOCAL
+    assert config.model.head.anchor_target is AnchorTarget.FACTOR
     assert config.datamodule.sample_limit == 128
     assert config.datamodule.batch_size == 16
     assert config.pl_module.normalize_features is False
@@ -358,9 +352,9 @@ def test_longcat_factor_scale_experiment_is_frame_aligned() -> None:
 
     assert config.model.feature_adapter is FeatureAdapter.LONGCAT_CODEBOOKS
     assert config.model.feature_codebooks == 2
-    assert config.model.decoder.fm_mode is FMMode.ANCHOR
-    assert config.model.decoder.anchor_context is AnchorContext.LOCAL
-    assert config.model.decoder.anchor_target is AnchorTarget.FACTOR
+    assert config.model.head.fm_mode is FMMode.ANCHOR
+    assert config.model.head.anchor_context is AnchorContext.LOCAL
+    assert config.model.head.anchor_target is AnchorTarget.FACTOR
     assert config.datamodule.sample_limit == 128
     assert config.datamodule.batch_size == 16
     assert config.pl_module.normalize_features is False
@@ -372,14 +366,14 @@ def test_longcat_factor_recurrent_experiment_is_formal_and_frame_aligned() -> No
 
     assert config.model.feature_adapter is FeatureAdapter.LONGCAT_CODEBOOKS
     assert config.model.feature_codebooks == 2
-    assert config.model.decoder.factor_predictor is FactorPredictor.DEPTH_RECURRENT
-    assert config.model.decoder.ffn_ratio == 2
+    assert config.model.head.factor_predictor is FactorPredictor.DEPTH_RECURRENT
+    assert config.model.head.ffn_ratio == 2
     assert config.datamodule.sample_limit == 9984
     assert config.datamodule.batch_size == 96
     assert config.datamodule.batching.enabled is True
     assert config.datamodule.batching.max_batch_seconds == 1152.0
-    assert config.pl_module.finite_loss_check_interval == 100
     assert config.pl_module.residual_retarget is False
+    assert config.callback.debug.enabled is False
     assert config.callback.performance.enabled is False
     assert config.trainer.max_steps == 20000
 
@@ -389,9 +383,9 @@ def test_longcat_qwen_film_experiment_is_frame_aligned() -> None:
 
     assert config.model.feature_adapter is FeatureAdapter.LONGCAT_CODEBOOKS
     assert config.model.feature_codebooks == 2
-    assert config.model.decoder.anchor_context is AnchorContext.QWEN_FILM
-    assert config.model.decoder.anchor_layers == 1
-    assert config.model.decoder.factor_predictor is FactorPredictor.DEPTH_RECURRENT
+    assert config.model.head.anchor_context is AnchorContext.QWEN_FILM
+    assert config.model.head.anchor_layers == 1
+    assert config.model.head.factor_predictor is FactorPredictor.DEPTH_RECURRENT
     assert config.datamodule.sample_limit == 9984
     assert config.datamodule.batch_size == 96
     assert config.datamodule.batching.max_batch_seconds == 1152.0
@@ -402,8 +396,8 @@ def test_longcat_qwen_film_experiment_is_frame_aligned() -> None:
 def test_residual_retarget_requires_recurrent_factor_predictor() -> None:
     raw = _compose(
         "model.feature_adapter=longcat_first_codebook",
-        "model.decoder.fm_mode=anchor",
-        "model.decoder.anchor_target=factor",
+        "model.head.fm_mode=anchor",
+        "model.head.anchor_target=factor",
         "pl_module.residual_retarget=true",
     )
 
@@ -418,15 +412,15 @@ def test_longcat_transformer_anchor_experiment_is_frame_aligned() -> None:
     config = parse_train_config(_compose("experiment=011_longcat_transformer_anchor"))
 
     assert config.model.feature_adapter is FeatureAdapter.LONGCAT_FIRST_CODEBOOK
-    assert config.model.decoder.fm_mode is FMMode.ANCHOR
-    assert config.model.decoder.anchor_context is AnchorContext.TRANSFORMER
+    assert config.model.head.fm_mode is FMMode.ANCHOR
+    assert config.model.head.anchor_context is AnchorContext.TRANSFORMER
     assert config.datamodule.sample_limit == 10000
     assert config.trainer.max_steps == 2000
 
 
 def test_train_config_rejects_anchor_without_first_codebook_adapter() -> None:
     with pytest.raises(ValueError, match="requires model.feature_adapter"):
-        parse_train_config(_compose("model.decoder.fm_mode=anchor"))
+        parse_train_config(_compose("model.head.fm_mode=anchor"))
 
 
 def test_train_config_rejects_feature_adapter_on_rvq_route() -> None:

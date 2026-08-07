@@ -275,7 +275,7 @@ def test_eval_artifact_main_loads_cross_text_pair(
     args = argparse.Namespace(
         artifact=tmp_path / "artifact",
         codec="longcat",
-        data_source="qwen_cross_text",
+        data_pairing="cross_text",
         data_root=None,
         split="train",
         sample_index=2,
@@ -316,13 +316,16 @@ def test_eval_artifact_main_loads_cross_text_pair(
     assert loaded["backend_config"].local_files_only is True
     assert loaded["backend_config"].allow_unpinned_revision is False
     assert loaded["backend_kwargs"]["device"] == torch.device("cpu")
-    assert loaded["data"].source == "qwen_cross_text"
+    assert loaded["data"].dataset == "qwen"
+    assert loaded["data"].pairing == "cross_text"
     assert loaded["data"].sample_index == 2
     assert loaded["kwargs"]["codec"] == "longcat"
     assert loaded["kwargs"]["acoustic_layout"] is AcousticLayout.FRAME_ALIGNED
     result = json.loads(capsys.readouterr().out)
     assert result["artifact"] == "artifact"
     assert result["data_root"] is None
+    assert result["dataset"] == "qwen"
+    assert result["pairing"] == "cross_text"
     assert result["cfg_scale"] == 3.0
     assert result["pair"]["target_index"] == 0
     assert "target_utterance_id" not in result["pair"]
@@ -350,7 +353,7 @@ def test_eval_artifact_can_include_private_metadata(
     args = argparse.Namespace(
         artifact=tmp_path / "artifact",
         codec="longcat",
-        data_source="qwen_cross_text",
+        data_pairing="cross_text",
         data_root=tmp_path / "data",
         split="train",
         sample_index=2,
@@ -451,7 +454,7 @@ def test_smoke_real_data_defaults_to_cross_text_and_loads_pair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(sys, "argv", ["smoke.py"])
-    assert smoke._args().data_source == "qwen_cross_text"
+    assert smoke._args().data_pairing == "cross_text"
 
     backend = EvalBackend(AcousticLayout.FRAME_ALIGNED)
     batch = _pair(AcousticLayout.FRAME_ALIGNED)
@@ -467,13 +470,14 @@ def test_smoke_real_data_defaults_to_cross_text_and_loads_pair(
     smoke._data_smoke(
         None,
         codec="longcat",
-        source="qwen_cross_text",
+        pairing="cross_text",
         split="train",
         index=0,
         device="cpu",
     )
 
-    assert loaded["data"].source == "qwen_cross_text"
+    assert loaded["data"].dataset == "qwen"
+    assert loaded["data"].pairing == "cross_text"
     assert loaded["kwargs"]["acoustic_layout"] is AcousticLayout.FRAME_ALIGNED
     assert len(backend.feature_inputs) == 2
     reference_acoustic = batch.reference_acoustic_codes

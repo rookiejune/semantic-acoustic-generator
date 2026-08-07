@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from anytrain.lightning import find_ema_callback
 from lightning.pytorch.callbacks import Callback
 
-from semantic_acoustic_generator.pl_module.semantic import GeneratorModule
+from semantic_acoustic_generator.pl_module.module import GeneratorModule
 
 if TYPE_CHECKING:
     from lightning import LightningModule, Trainer

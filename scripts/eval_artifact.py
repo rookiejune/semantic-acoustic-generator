@@ -35,7 +35,7 @@ def main() -> None:
     backend = load_backend(BackendConfig(name=str(args.codec)), device=device)
     support = load_artifact(args.artifact, device=device)
     data = DataConfig(
-        source=args.data_source,
+        pairing=args.data_pairing,
         root=None if args.data_root is None else str(args.data_root),
         split=args.split,
         sample_index=args.sample_index,
@@ -81,7 +81,7 @@ def _args() -> argparse.Namespace:
     )
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--codec", default="longcat")
-    parser.add_argument("--data-source", choices=("qwen_cross_text",), default="qwen_cross_text")
+    parser.add_argument("--data-pairing", choices=("cross_text",), default="cross_text")
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--split", default="train")
     parser.add_argument("--sample-index", type=int, default=0)
@@ -201,7 +201,8 @@ def _summary(
             if args.data_root is None
             else _path_value(args.data_root, include_private=_include_private(args))
         ),
-        "data_source": str(args.data_source),
+        "dataset": "qwen",
+        "pairing": str(args.data_pairing),
         "sample_index": int(args.sample_index),
         "sample_rate": sample_rate,
         "cfg_scale": float(args.cfg_scale),

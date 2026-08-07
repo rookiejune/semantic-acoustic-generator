@@ -12,7 +12,7 @@ defaults:
   - _self_
 
 # Fixed-sample contract check for the generator, not a production preset.
-output_subdir: overfit/${backend.name}/${model.route}-${model.decoder.layers}l
+output_subdir: overfit/${backend.name}/${model.route}-${model.backbone.layers}l
 
 datamodule:
   sample_index: 0
@@ -28,7 +28,6 @@ datamodule:
 pl_module:
   learning_rate: 1e-3
   weight_decay: 0.0
-  finite_loss_check_interval: 1
 
 trainer:
   accelerator: gpu
@@ -41,6 +40,8 @@ trainer:
   gradient_clip_val: 1.0
 
 callback:
+  debug:
+    enabled: true
   performance:
     enabled: true
     profile_flops: true

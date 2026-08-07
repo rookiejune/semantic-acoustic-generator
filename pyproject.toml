@@ -7,10 +7,10 @@ name = "semantic-acoustic-generator"
 version = "0.1.0"
 description = "Reference-optional semantic-to-acoustic generation for external codec backends."
 requires-python = ">=3.9"
-dependencies = ["torch>=2.0", "anytrain"]
+dependencies = ["torch>=2.0", "anytrain", "transformers>=4.51"]
 
 [project.optional-dependencies]
-rvq = ["transformers>=4.50"]
+rvq = []
 train = ["lightning>=2.0", "hydra-core>=1.3", "anytrain[flow]", "anydataset"]
 test = ["pytest>=8.0", "anydataset"]
 

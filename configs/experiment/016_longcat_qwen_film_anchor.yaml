@@ -29,10 +29,11 @@ datamodule:
     seed: 0
 
 model:
-  condition_dim: 512
+  backbone:
+    hidden_dim: 512
   feature_adapter: longcat_codebooks
   feature_codebooks: 2
-  decoder:
+  head:
     hidden_dim: 512
     layers: 2
     heads: 8
@@ -50,7 +51,6 @@ pl_module:
   learning_rate: 1e-3
   weight_decay: 0.0
   reference_dropout: 1.0
-  finite_loss_check_interval: 100
   residual_retarget: false
 
 trainer:
@@ -71,10 +71,9 @@ callback:
     enabled: false
   data_throughput:
     enabled: true
-    log_every_n_steps: 100
-    warmup_steps: 20
-    measure_window_steps: 100
-  loss_time_bucket:
+    log_every_n_units: null
+    measure_window_batches: 100
+  observation:
     enabled: false
   checkpoint:
     enabled: true

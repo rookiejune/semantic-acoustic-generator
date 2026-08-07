@@ -16,7 +16,7 @@ from anytrain.codec import (
 )
 from anytrain.framework.flow_matching import ContinuousFlowRuntime
 
-from semantic_acoustic_generator.config import DecoderConfig, Route
+from semantic_acoustic_generator.config import BackboneConfig, DecoderConfig, Route
 from semantic_acoustic_generator.datamodule import BatchingConfig, DataConfig, load_batch
 from semantic_acoustic_generator.model import FMFeatureGenerator, RVQCodeGenerator, build_route
 from semantic_acoustic_generator.runtime import (
@@ -90,7 +90,7 @@ def main() -> None:
         _data_smoke(
             args.data_root,
             codec=args.codec,
-            source=args.data_source,
+            pairing=args.data_pairing,
             split=args.split,
             index=args.index,
             device=args.device,
@@ -114,7 +114,11 @@ def _args() -> argparse.Namespace:
         default=None,
         help="Prepared codec grid root; workspace resolves the standard root when omitted.",
     )
-    parser.add_argument("--data-source", default="qwen_cross_text")
+    parser.add_argument(
+        "--data-pairing",
+        choices=("none", "cross_text"),
+        default="cross_text",
+    )
     parser.add_argument("--codec", default="longcat", choices=("longcat",))
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--split", default="train")
@@ -197,13 +201,18 @@ def _route_smoke(
             backend.semantic_codebook,
             backend.acoustic_feature_dim,
             backend.acoustic_codebook_sizes,
-            condition_dim=12,
-            decoder=decoder,
+            backbone=BackboneConfig(hidden_dim=12, layers=1, heads=2, ffn_ratio=2),
+            head=decoder,
+            factor_codebooks=(
+                _factor_codebooks(backend.acoustic_codebook_sizes)
+                if route is Route.RVQ
+                else None
+            ),
         )
         optimizer = torch.optim.AdamW(
-            list(modules.conditioner.parameters())
+            list(modules.backbone.parameters())
             + list(modules.reference_conditioner.parameters())
-            + list(modules.generator.parameters()),
+            + list(modules.head.parameters()),
             lr=1e-3,
         )
         reference = modules.reference_conditioner(
@@ -211,11 +220,15 @@ def _route_smoke(
             mask=reference_mask,
             batch_size=semantic.size(0),
         )
-        condition = (modules.conditioner(semantic) + reference).masked_fill(~mask[..., None], 0)
+        semantic_condition = modules.model.condition(
+            input_ids=semantic,
+            attention_mask=mask,
+        )
+        condition = (semantic_condition + reference).masked_fill(~mask[..., None], 0)
         if route is Route.FM:
-            if not isinstance(modules.generator, FMFeatureGenerator):
+            if not isinstance(modules.head, FMFeatureGenerator):
                 raise TypeError("FM route must build an FMFeatureGenerator.")
-            output = modules.generator.feature_loss_from_condition(
+            output = modules.head.feature_loss_from_condition(
                 condition,
                 mask,
                 target_features=target,
@@ -224,9 +237,9 @@ def _route_smoke(
                 flow_runtime=ContinuousFlowRuntime(),
             )
         elif route is Route.RVQ:
-            if not isinstance(modules.generator, RVQCodeGenerator):
+            if not isinstance(modules.head, RVQCodeGenerator):
                 raise TypeError("RVQ route must build an RVQCodeGenerator.")
-            output = modules.generator.code_loss_from_condition(
+            output = modules.head.code_loss_from_condition(
                 condition,
                 mask,
                 target_codes=acoustic,
@@ -241,11 +254,23 @@ def _route_smoke(
         print(f"{route.value} train smoke ok: loss={float(loss.detach()):.6f}")
 
 
+def _factor_codebooks(codebook_sizes: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+    values: list[torch.Tensor] = []
+    for index, size in enumerate(codebook_sizes):
+        dim = index + 2
+        values.extend((torch.randn(1, dim), torch.randn(size, dim)))
+    return tuple(values)
+
+
 def _artifact_smoke(backend: FakeCodec, decoder: DecoderConfig) -> None:
     semantic, _, mask = _batch()
     _, reference_acoustic, reference_mask = _reference_batch()
     reference_features = masked_acoustic_features(backend, reference_acoustic, reference_mask)
-    config = GeneratorConfig(route=Route.FM, condition_dim=12, decoder=decoder)
+    config = GeneratorConfig(
+        route=Route.FM,
+        backbone=BackboneConfig(hidden_dim=12, layers=1, heads=2, ffn_ratio=2),
+        head=decoder,
+    )
     support = build_support(
         config,
         semantic_codebook=backend.semantic_codebook,
@@ -321,14 +346,14 @@ def _data_smoke(
     root: Path | None,
     *,
     codec: str,
-    source: str,
+    pairing: str,
     split: str,
     index: int,
     device: str,
 ) -> None:
     backend = load_semantic_acoustic(codec, device=device)
     data = DataConfig(
-        source=source,
+        pairing=pairing,
         root=None if root is None else str(root),
         split=split,
         sample_index=index,
@@ -342,8 +367,8 @@ def _data_smoke(
         semantic_pad_id=int(backend.semantic_codebook.size(0)),
         acoustic_pad_ids=backend.acoustic_codebook_sizes,
     )
-    if source == "qwen_cross_text" and not batch.has_reference:
-        raise RuntimeError("qwen_cross_text data smoke requires a target/reference pair.")
+    if pairing == "cross_text" and not batch.has_reference:
+        raise RuntimeError("cross_text data smoke requires a target/reference pair.")
     _validate_batch(batch)
     target = masked_acoustic_features(
         backend,
@@ -363,7 +388,7 @@ def _data_smoke(
         reference_shape = tuple(reference_features.shape)
     print(
         "data smoke ok: "
-        f"source={source} codec={codec} split={split} index={index} "
+        f"dataset=qwen pairing={pairing} codec={codec} split={split} index={index} "
         f"semantic_shape={tuple(batch.semantic_codes.shape)} "
         f"acoustic_shape={tuple(batch.acoustic_codes.shape)} "
         f"reference_feature_shape={reference_shape} frames={int(batch.mask.sum())}"

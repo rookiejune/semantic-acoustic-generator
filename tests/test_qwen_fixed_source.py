@@ -23,14 +23,16 @@ from semantic_acoustic_generator.datamodule import BatchingConfig, DataConfig, D
 from semantic_acoustic_generator.datamodule import longcat as longcat_data
 from semantic_acoustic_generator.datamodule import module as module_data
 from semantic_acoustic_generator.datamodule import qwen as qwen_data
-from semantic_acoustic_generator.datamodule.source import DataSource, Overlong
+from semantic_acoustic_generator.datamodule.dataset import DatasetName, Overlong, Pairing
 
 
 def test_data_config_defaults_to_cross_text_grid_column() -> None:
     data = DataConfig()
 
-    assert data.source == "qwen_cross_text"
-    assert data.source_type is DataSource.QWEN_CROSS_TEXT
+    assert data.dataset == "qwen"
+    assert data.dataset_type is DatasetName.QWEN
+    assert data.pairing == "cross_text"
+    assert data.pairing_type is Pairing.CROSS_TEXT
     assert data.overlong_policy is Overlong.ERROR
     assert data.role == "target"
     assert data.speaker_id == "vivian"
@@ -61,7 +63,7 @@ def test_qwen_fixed_speaker_source_batches_frame_aligned_units(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     data = DataConfig(
-        source="qwen_fixed_speaker",
+        pairing="none",
         root=str(tmp_path / "prepared"),
         batch_size=1,
         num_workers=0,
@@ -107,7 +109,7 @@ def test_qwen_cross_text_source_batches_explicit_pair_and_metadata(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     data = DataConfig(
-        source="qwen_cross_text",
+        pairing="cross_text",
         root=str(tmp_path / "prepared"),
         batch_size=2,
         num_workers=0,
@@ -153,7 +155,7 @@ def test_qwen_cross_text_uses_anydataset_cost_batching(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     data = DataConfig(
-        source="qwen_cross_text",
+        pairing="cross_text",
         root=str(tmp_path / "prepared"),
         batch_size=4,
         num_workers=0,
@@ -202,7 +204,7 @@ def test_dynamic_batch_planning_does_not_load_qwen_codec_samples(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     data = DataConfig(
-        source="qwen_cross_text",
+        pairing="cross_text",
         root=str(tmp_path / "prepared"),
         batch_size=2,
         num_workers=0,
@@ -334,7 +336,7 @@ def test_dynamic_batch_cost_cache_is_bounded_by_planning_window(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     data = DataConfig(
-        source="qwen_fixed_speaker",
+        pairing="none",
         root=str(tmp_path / "prepared"),
         batch_size=2,
         num_workers=0,
@@ -372,7 +374,7 @@ def test_dynamic_batch_duration_proxy_counts_at_least_one_frame(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     data = DataConfig(
-        source="qwen_fixed_speaker",
+        pairing="none",
         root=str(tmp_path / "prepared"),
         batch_size=1,
         num_workers=0,
@@ -408,7 +410,7 @@ def test_dynamic_batch_budget_does_not_create_hard_duration_limit(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     data = DataConfig(
-        source="qwen_fixed_speaker",
+        pairing="none",
         root=str(tmp_path / "prepared"),
         max_seconds=None,
         overlong="truncate",
@@ -724,7 +726,7 @@ def test_datamodule_exposes_deterministic_held_out_split(
         lambda **kwargs: SimpleNamespace(load=lambda: grids[kwargs["split"]]),
     )
     data = DataConfig(
-        source="qwen_cross_text",
+        pairing="cross_text",
         root=str(tmp_path / "prepared"),
         validation_split="heldout",
         validation_sample_limit=2,
@@ -770,7 +772,7 @@ def test_validate_setup_does_not_load_training_split(
 
     monkeypatch.setattr(qwen_data.qwen_tts, "speaker_grid", speaker_grid)
     data = DataConfig(
-        source="qwen_cross_text",
+        pairing="cross_text",
         root=str(tmp_path / "prepared"),
         validation_split="heldout",
         batch_size=2,
@@ -806,7 +808,7 @@ def test_qwen_cross_text_filter_checks_target_and_reference_raw_lengths(
         lambda **_: SimpleNamespace(load=lambda: grid),
     )
     data = DataConfig(
-        source="qwen_cross_text",
+        pairing="cross_text",
         root=str(tmp_path / "prepared"),
         max_seconds=1.0,
         overlong="filter",

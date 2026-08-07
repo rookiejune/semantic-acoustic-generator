@@ -4,7 +4,7 @@ import pytest
 import torch
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
 
-from semantic_acoustic_generator.config import DecoderConfig, Route
+from semantic_acoustic_generator.config import BackboneConfig, DecoderConfig, Route
 from semantic_acoustic_generator.datamodule import collate_structured_codes
 from semantic_acoustic_generator.pl_module import build_module
 from semantic_acoustic_generator.runtime import GeneratorConfig
@@ -141,8 +141,8 @@ def test_fixed_layout_backend_is_rejected_before_training() -> None:
     backend = FixedBackend()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
 
     with pytest.raises(ValueError, match="frame-aligned"):

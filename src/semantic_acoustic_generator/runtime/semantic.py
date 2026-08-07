@@ -17,12 +17,18 @@ from semantic_acoustic_generator._tensor import is_signed_integer_dtype
 from semantic_acoustic_generator.backend import adapt_backend
 from semantic_acoustic_generator.config import (
     AnchorTarget,
-    DecoderConfig,
+    BackboneConfig,
     FeatureAdapter,
-    Initialization,
+    HeadConfig,
     Route,
 )
-from semantic_acoustic_generator.model.generator import AcousticCodeSampler, FeatureSampler
+from semantic_acoustic_generator.model.backbone import QwenBackbone
+from semantic_acoustic_generator.model.generator import (
+    AcousticCodeSampler,
+    AcousticHead,
+    FeatureSampler,
+)
+from semantic_acoustic_generator.model.model import AcousticGeneratorModel
 from semantic_acoustic_generator.model.routes import RouteModules, build_route
 from semantic_acoustic_generator.runtime.metadata import (
     support_metadata,
@@ -62,10 +68,8 @@ class SamplingConfig:
 @dataclass(frozen=True)
 class GeneratorConfig:
     route: Route
-    condition_dim: int
-    decoder: DecoderConfig = field(default_factory=DecoderConfig)
-    initialization: Initialization = Initialization.CODEC
-    seed: int = 0
+    backbone: BackboneConfig = field(default_factory=BackboneConfig)
+    head: HeadConfig = field(default_factory=HeadConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     feature_adapter: FeatureAdapter = FeatureAdapter.NONE
     feature_codebooks: int = 1
@@ -75,19 +79,15 @@ class GeneratorConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.route, Route):
             raise TypeError("route must be a Route.")
-        _integer(self.condition_dim, name="condition_dim")
-        if not isinstance(self.decoder, DecoderConfig):
-            raise TypeError("decoder must be a DecoderConfig.")
-        if not isinstance(self.initialization, Initialization):
-            raise TypeError("initialization must be an Initialization.")
-        _integer(self.seed, name="seed")
+        if not isinstance(self.backbone, BackboneConfig):
+            raise TypeError("backbone must be a BackboneConfig.")
+        if not isinstance(self.head, HeadConfig):
+            raise TypeError("head must be a HeadConfig.")
         if not isinstance(self.sampling, SamplingConfig):
             raise TypeError("sampling must be a SamplingConfig.")
         if not isinstance(self.feature_adapter, FeatureAdapter):
             raise TypeError("feature_adapter must be a FeatureAdapter.")
         _integer(self.feature_codebooks, name="feature_codebooks")
-        if self.condition_dim <= 0:
-            raise ValueError("condition_dim must be positive.")
         if self.feature_codebooks <= 0:
             raise ValueError("feature_codebooks must be positive.")
         if self.feature_adapter is not FeatureAdapter.NONE and self.route is not Route.FM:
@@ -106,7 +106,7 @@ class GeneratorConfig:
         if self.feature_adapter is FeatureAdapter.NONE and self.feature_codebooks != 1:
             raise ValueError("feature_codebooks requires a LongCat feature adapter.")
         if (
-            self.decoder.anchor_target is AnchorTarget.FACTOR
+            self.head.anchor_target is AnchorTarget.FACTOR
             and not longcat_adapter
         ):
             raise ValueError(
@@ -125,6 +125,22 @@ class GeneratorConfig:
             raise ValueError("feature normalization must not be empty.")
         if any(value <= 0 for value in self.feature_std):
             raise ValueError("feature_std values must be positive.")
+
+    @property
+    def condition_dim(self) -> int:
+        return self.backbone.hidden_dim
+
+    @property
+    def decoder(self) -> HeadConfig:
+        return self.head
+
+    @property
+    def initialization(self):
+        return self.backbone.embedding_initialization
+
+    @property
+    def seed(self) -> int:
+        return self.backbone.seed
 
 
 class GeneratorSupport(nn.Module):
@@ -147,9 +163,8 @@ class GeneratorSupport(nn.Module):
         _validate_frame_aligned_spec(codec_spec)
         if modules.acoustic_codebook_sizes != codec_spec.acoustic_codebook_sizes:
             raise ValueError("route acoustic codebooks must match codec_spec.")
-        self.conditioner = modules.conditioner
+        self.model = modules.model
         self.reference_conditioner = modules.reference_conditioner
-        self.generator = modules.generator
         self.route = modules.route
         self.codec_spec = codec_spec
         self.acoustic_feature_dim = codec_spec.acoustic_feature_dim
@@ -169,16 +184,32 @@ class GeneratorSupport(nn.Module):
         )
 
     @property
+    def backbone(self) -> QwenBackbone:
+        return self.model.backbone
+
+    @property
+    def head(self) -> AcousticHead:
+        return self.model.head
+
+    @property
+    def conditioner(self):
+        return self.backbone.embedding
+
+    @property
+    def generator(self) -> AcousticHead:
+        return self.head
+
+    @property
     def feature_sampler(self) -> FeatureSampler:
-        if not isinstance(self.generator, FeatureSampler):
+        if not isinstance(self.head, FeatureSampler):
             raise RuntimeError("feature generation requires the FM route.")
-        return self.generator
+        return self.head
 
     @property
     def code_sampler(self) -> AcousticCodeSampler:
-        if not isinstance(self.generator, AcousticCodeSampler):
+        if not isinstance(self.head, AcousticCodeSampler):
             raise RuntimeError("acoustic-code generation requires the RVQ route.")
-        return self.generator
+        return self.head
 
     @torch.no_grad()
     def sample_features(
@@ -211,7 +242,11 @@ class GeneratorSupport(nn.Module):
         cfg_scale: float | None,
         generator: torch.Generator | None,
     ) -> Tensor:
-        semantic = self.conditioner(prepared, validate=False)
+        semantic = self.model.condition(
+            input_ids=prepared,
+            attention_mask=frame_mask,
+            validate=False,
+        )
         condition = self._condition(
             semantic,
             frame_mask,
@@ -275,7 +310,11 @@ class GeneratorSupport(nn.Module):
         reference_mask: Tensor | None,
         generator: torch.Generator | None,
     ) -> Tensor:
-        semantic = self.conditioner(prepared, validate=False)
+        semantic = self.model.condition(
+            input_ids=prepared,
+            attention_mask=frame_mask,
+            validate=False,
+        )
         condition = self._condition(
             semantic,
             frame_mask,
@@ -305,7 +344,11 @@ class GeneratorSupport(nn.Module):
         validate: bool = True,
     ) -> Tensor:
         prepared, frame_mask = self._semantic_input(semantic_codes, mask, validate=validate)
-        semantic = self.conditioner(prepared, validate=False)
+        semantic = self.model.condition(
+            input_ids=prepared,
+            attention_mask=frame_mask,
+            validate=False,
+        )
         return self._condition(
             semantic,
             frame_mask,
@@ -388,7 +431,7 @@ class GeneratorSupport(nn.Module):
         if validate and not is_signed_integer_dtype(semantic.dtype):
             raise TypeError("semantic_codes must use a signed integer dtype.")
 
-        reference = self.conditioner.embedding.weight
+        reference = self.backbone.embedding.embedding.weight
         prepared = semantic.to(device=reference.device, dtype=torch.long).contiguous()
         if mask is None:
             frame_mask = torch.ones(prepared.shape[:2], device=prepared.device, dtype=torch.bool)
@@ -405,10 +448,10 @@ class GeneratorSupport(nn.Module):
             valid = prepared[..., 0][frame_mask]
             if bool((valid < 0).any()):
                 raise ValueError("valid semantic_codes must not contain negative IDs.")
-            if bool((valid >= self.conditioner.semantic_codebook_size).any()):
+            if bool((valid >= self.backbone.semantic_codebook_size).any()):
                 raise ValueError("semantic_codes contain an ID outside the semantic codebook.")
         return prepared.masked_fill(
-            ~frame_mask[..., None], self.conditioner.semantic_pad_id
+            ~frame_mask[..., None], self.backbone.semantic_pad_id
         ), frame_mask
 
 
@@ -560,22 +603,24 @@ def build_support(
 ) -> GeneratorSupport:
     _validate_frame_aligned_spec(codec_spec)
     _validate_semantic_codebook(semantic_codebook, codec_spec)
-    if config.decoder.anchor_target is AnchorTarget.FACTOR and (
+    if config.head.anchor_target is AnchorTarget.FACTOR and (
         factor_codebooks is None
         or len(factor_codebooks) != config.feature_codebooks * 2
     ):
         raise ValueError(
             "factor target requires two stored factor codebooks per selected acoustic codebook."
         )
+    if config.route is Route.RVQ and factor_codebooks is not None and (
+        len(factor_codebooks) != len(codec_spec.acoustic_codebook_sizes) * 2
+    ):
+        raise ValueError("AGRVQ requires two factor codebooks per acoustic residual stage.")
     modules = build_route(
         config.route,
         semantic_codebook,
         codec_spec.acoustic_feature_dim,
         codec_spec.acoustic_codebook_sizes,
-        condition_dim=config.condition_dim,
-        decoder=config.decoder,
-        initialization=config.initialization,
-        seed=config.seed,
+        backbone=config.backbone,
+        head=config.head,
         factor_codebooks=factor_codebooks,
     )
     mean = (

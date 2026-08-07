@@ -14,13 +14,13 @@ from semantic_acoustic_generator.backend import BackendConfig
 from semantic_acoustic_generator.config import (
     AnchorContext,
     AnchorTarget,
-    DecoderConfig,
+    BackboneConfig,
     FactorPredictor,
     FeatureAdapter,
     FMMode,
+    HeadConfig,
     Initialization,
     Route,
-    RVQPredictor,
 )
 from semantic_acoustic_generator.datamodule import DataConfig
 from semantic_acoustic_generator.runtime import SamplingConfig
@@ -41,19 +41,27 @@ class DataModuleConfig(DataConfig):
 @dataclass(frozen=True)
 class ModelConfig:
     route: Route = Route.FM
-    condition_dim: int = 1024
-    decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    backbone: BackboneConfig = field(default_factory=BackboneConfig)
+    head: HeadConfig = field(default_factory=HeadConfig)
     feature_adapter: FeatureAdapter = FeatureAdapter.NONE
     feature_codebooks: int = 1
 
     def __post_init__(self) -> None:
-        if isinstance(self.condition_dim, bool) or not isinstance(self.condition_dim, int):
-            raise TypeError("model.condition_dim must be an integer.")
-        if self.condition_dim <= 0:
-            raise ValueError("model.condition_dim must be positive.")
+        if not isinstance(self.backbone, BackboneConfig):
+            raise TypeError("model.backbone must be a BackboneConfig.")
+        if not isinstance(self.head, HeadConfig):
+            raise TypeError("model.head must be a HeadConfig.")
         if not isinstance(self.feature_adapter, FeatureAdapter):
             raise TypeError("model.feature_adapter must be a FeatureAdapter.")
         _positive_integer(self.feature_codebooks, "model.feature_codebooks")
+
+    @property
+    def condition_dim(self) -> int:
+        return self.backbone.hidden_dim
+
+    @property
+    def decoder(self) -> HeadConfig:
+        return self.head
 
 
 @dataclass(frozen=True)
@@ -90,7 +98,6 @@ class PLModuleConfig:
     weight_decay: float = 0.01
     reference_dropout: float = 0.5
     validation_seed: int = 0
-    finite_loss_check_interval: int = 100
     residual_retarget: bool = False
     ema_decay: float | None = None
     ema_update_after_step: int = 0
@@ -102,10 +109,6 @@ class PLModuleConfig:
         _non_negative_number(self.weight_decay, "pl_module.weight_decay")
         _ratio(self.reference_dropout, "pl_module.reference_dropout")
         _non_negative_integer(self.validation_seed, "pl_module.validation_seed")
-        _positive_integer(
-            self.finite_loss_check_interval,
-            "pl_module.finite_loss_check_interval",
-        )
         _boolean(self.residual_retarget, "pl_module.residual_retarget")
         _optional_positive_number(self.ema_decay, "pl_module.ema_decay")
         _non_negative_integer(self.ema_update_after_step, "pl_module.ema_update_after_step")
@@ -114,8 +117,15 @@ class PLModuleConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     device: str | None = None
-    initialization: Initialization = Initialization.CODEC
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
+
+
+@dataclass(frozen=True)
+class DebugCallbackConfig:
+    enabled: bool = False
+
+    def __post_init__(self) -> None:
+        _boolean(self.enabled, "callback.debug.enabled")
 
 
 @dataclass(frozen=True)
@@ -159,18 +169,23 @@ class PerformanceCallbackConfig:
 @dataclass(frozen=True)
 class DataThroughputCallbackConfig:
     enabled: bool = True
-    log_every_n_steps: int = 100
-    warmup_steps: int = 20
-    measure_window_steps: int = 100
+    log_every_n_units: float | None = None
+    measure_window_batches: int = 100
+    sync_cuda: bool = True
+    sync_distributed: bool = True
 
     def __post_init__(self) -> None:
         _boolean(self.enabled, "callback.data_throughput.enabled")
-        _positive_integer(self.log_every_n_steps, "callback.data_throughput.log_every_n_steps")
-        _non_negative_integer(self.warmup_steps, "callback.data_throughput.warmup_steps")
-        _positive_integer(
-            self.measure_window_steps,
-            "callback.data_throughput.measure_window_steps",
+        _optional_positive_number(
+            self.log_every_n_units,
+            "callback.data_throughput.log_every_n_units",
         )
+        _positive_integer(
+            self.measure_window_batches,
+            "callback.data_throughput.measure_window_batches",
+        )
+        _boolean(self.sync_cuda, "callback.data_throughput.sync_cuda")
+        _boolean(self.sync_distributed, "callback.data_throughput.sync_distributed")
 
 
 @dataclass(frozen=True)
@@ -194,24 +209,17 @@ class LossSummaryCallbackConfig:
 
 
 @dataclass(frozen=True)
-class LossTimeBucketCallbackConfig:
+class ObservationCallbackConfig:
     enabled: bool = True
-    item_name: str = "flow"
-    detail_key: str = "t"
-    histogram_tag: str | None = "train/flow_loss/t_hist"
-    scalar_template: str = "train/flow_loss/t/{lower:.1f}_{upper:.1f}"
     every_n_steps: int | None = 100
-    bucket_count: int = 10
+    half_life_steps: float | None = 1_000.0
+    sync_distributed: bool = False
 
     def __post_init__(self) -> None:
-        _boolean(self.enabled, "callback.loss_time_bucket.enabled")
-        _non_empty_string(self.item_name, "callback.loss_time_bucket.item_name")
-        _non_empty_string(self.detail_key, "callback.loss_time_bucket.detail_key")
-        if self.histogram_tag is not None:
-            _non_empty_string(self.histogram_tag, "callback.loss_time_bucket.histogram_tag")
-        _non_empty_string(self.scalar_template, "callback.loss_time_bucket.scalar_template")
-        _optional_positive_integer(self.every_n_steps, "callback.loss_time_bucket.every_n_steps")
-        _positive_integer(self.bucket_count, "callback.loss_time_bucket.bucket_count")
+        _boolean(self.enabled, "callback.observation.enabled")
+        _optional_positive_integer(self.every_n_steps, "callback.observation.every_n_steps")
+        _optional_positive_number(self.half_life_steps, "callback.observation.half_life_steps")
+        _boolean(self.sync_distributed, "callback.observation.sync_distributed")
 
 
 @dataclass(frozen=True)
@@ -243,6 +251,7 @@ class EMACallbackConfig:
 
 @dataclass(frozen=True)
 class CallbackConfig:
+    debug: DebugCallbackConfig = field(default_factory=DebugCallbackConfig)
     sample: SampleCallbackConfig = field(default_factory=SampleCallbackConfig)
     performance: PerformanceCallbackConfig = field(default_factory=PerformanceCallbackConfig)
     data_throughput: DataThroughputCallbackConfig = field(
@@ -250,8 +259,8 @@ class CallbackConfig:
     )
     codebook_usage: CodebookUsageCallbackConfig = field(default_factory=CodebookUsageCallbackConfig)
     loss_summary: LossSummaryCallbackConfig = field(default_factory=LossSummaryCallbackConfig)
-    loss_time_bucket: LossTimeBucketCallbackConfig = field(
-        default_factory=LossTimeBucketCallbackConfig
+    observation: ObservationCallbackConfig = field(
+        default_factory=ObservationCallbackConfig
     )
     checkpoint: CheckpointCallbackConfig = field(default_factory=CheckpointCallbackConfig)
     ema: EMACallbackConfig = field(default_factory=EMACallbackConfig)
@@ -302,7 +311,8 @@ class TrainConfig:
     seed: int = 0
     output_dir: str | None = None
     output_subdir: str = (
-        "${backend.name}/${model.route}-${model.decoder.layers}l/${runtime.initialization}"
+        "${backend.name}/${model.route}-${model.backbone.layers}l/"
+        "${model.backbone.embedding_initialization}"
     )
     backend: BackendConfig = field(default_factory=BackendConfig)
     datamodule: DataModuleConfig = field(default_factory=DataModuleConfig)
@@ -341,17 +351,25 @@ class TrainConfig:
         if self.model.feature_adapter is FeatureAdapter.NONE and self.model.feature_codebooks != 1:
             raise ValueError("model.feature_codebooks requires a LongCat feature adapter.")
         if (
-            self.model.decoder.fm_mode is not FMMode.FLOW
+            self.model.head.fm_mode is not FMMode.FLOW
             and not longcat_adapter
         ):
             raise ValueError(
-                "model.decoder.fm_mode=anchor|residual requires "
+                "model.head.fm_mode=anchor|residual requires "
                 "model.feature_adapter=longcat_first_codebook or longcat_codebooks."
             )
-        if self.model.route is not Route.FM and self.model.decoder.fm_mode is not FMMode.FLOW:
-            raise ValueError("model.decoder.fm_mode is only supported by model.route=fm.")
+        if self.model.route is not Route.FM and self.model.head.fm_mode is not FMMode.FLOW:
+            raise ValueError("model.head.fm_mode is only supported by model.route=fm.")
+        if (
+            self.model.route is Route.FM
+            and self.model.head.factor_predictor is not FactorPredictor.PARALLEL
+            and self.model.head.anchor_target is not AnchorTarget.FACTOR
+        ):
+            raise ValueError(
+                "FM depth factor predictors require model.head.anchor_target=factor."
+            )
         if self.pl_module.residual_retarget and (
-            self.model.decoder.factor_predictor is not FactorPredictor.DEPTH_RECURRENT
+            self.model.head.factor_predictor is not FactorPredictor.DEPTH_RECURRENT
         ):
             raise ValueError(
                 "pl_module.residual_retarget requires factor_predictor=depth_recurrent."
@@ -394,28 +412,28 @@ def _prepare(config: DictConfig) -> DictConfig:
         feature_adapter = model.get("feature_adapter")
         if feature_adapter is not None:
             model.feature_adapter = _enum_name(FeatureAdapter, feature_adapter)
-        decoder = model.get("decoder")
-        if isinstance(decoder, DictConfig):
-            predictor = decoder.get("rvq_predictor")
-            if predictor is not None:
-                decoder.rvq_predictor = _enum_name(RVQPredictor, predictor)
-            fm_mode = decoder.get("fm_mode")
+        backbone = model.get("backbone")
+        if isinstance(backbone, DictConfig):
+            initialization = backbone.get("embedding_initialization")
+            if initialization is not None:
+                backbone.embedding_initialization = _enum_name(Initialization, initialization)
+        head = model.get("head")
+        if isinstance(head, DictConfig):
+            initialization = head.get("codebook_initialization")
+            if initialization is not None:
+                head.codebook_initialization = _enum_name(Initialization, initialization)
+            fm_mode = head.get("fm_mode")
             if fm_mode is not None:
-                decoder.fm_mode = _enum_name(FMMode, fm_mode)
-            anchor_context = decoder.get("anchor_context")
+                head.fm_mode = _enum_name(FMMode, fm_mode)
+            anchor_context = head.get("anchor_context")
             if anchor_context is not None:
-                decoder.anchor_context = _enum_name(AnchorContext, anchor_context)
-            anchor_target = decoder.get("anchor_target")
+                head.anchor_context = _enum_name(AnchorContext, anchor_context)
+            anchor_target = head.get("anchor_target")
             if anchor_target is not None:
-                decoder.anchor_target = _enum_name(AnchorTarget, anchor_target)
-            factor_predictor = decoder.get("factor_predictor")
+                head.anchor_target = _enum_name(AnchorTarget, anchor_target)
+            factor_predictor = head.get("factor_predictor")
             if factor_predictor is not None:
-                decoder.factor_predictor = _enum_name(FactorPredictor, factor_predictor)
-    runtime = result.get("runtime")
-    if isinstance(runtime, DictConfig):
-        initialization = runtime.get("initialization")
-        if initialization is not None:
-            runtime.initialization = _enum_name(Initialization, initialization)
+                head.factor_predictor = _enum_name(FactorPredictor, factor_predictor)
     return result
 
 
@@ -517,11 +535,12 @@ __all__ = [
     "CodebookUsageCallbackConfig",
     "DataModuleConfig",
     "DataThroughputCallbackConfig",
+    "DebugCallbackConfig",
     "EMACallbackConfig",
     "LossConfig",
     "LossSummaryCallbackConfig",
-    "LossTimeBucketCallbackConfig",
     "ModelConfig",
+    "ObservationCallbackConfig",
     "PerformanceCallbackConfig",
     "PLModuleConfig",
     "RepaTeacherConfig",

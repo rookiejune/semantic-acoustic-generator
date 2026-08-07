@@ -10,11 +10,19 @@ from typing import TYPE_CHECKING, Any, Union, cast
 import torch
 from anytrain.codec import AcousticLayout
 from anytrain.lightning import (
+    DebugCallback,
     EMACallback,
     LossSummaryCallback,
-    LossTimeBucketLoggerCallback,
     ModelCheckpoint,
+    ObservationCallback,
     PerformanceCallback,
+)
+from anytrain.lightning.schedule import (
+    Constant,
+    LRSchedule,
+    Phase,
+    UnitClock,
+    UnitScheduleCallback,
 )
 from lightning import pytorch as pl
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor
@@ -26,11 +34,11 @@ from semantic_acoustic_generator.callback import (
     SampleLogConfig,
     SampleLogger,
     SemanticFrameUnits,
-    UnitThroughputCallback,
 )
 from semantic_acoustic_generator.config import (
     AnchorTarget,
-    DecoderConfig,
+    BackboneConfig,
+    HeadConfig,
     Route,
 )
 from semantic_acoustic_generator.datamodule import (
@@ -46,6 +54,7 @@ from semantic_acoustic_generator.training.config import (
     CheckpointCallbackConfig,
     CodebookUsageCallbackConfig,
     DataThroughputCallbackConfig,
+    DebugCallbackConfig,
     EMACallbackConfig,
     PerformanceCallbackConfig,
     PLModuleConfig,
@@ -145,7 +154,7 @@ def build_session(config: DictConfig | TrainConfig) -> TrainingSession:
     ckpt_path = config.trainer.ckpt_path
     normalize_features = (
         config.pl_module.normalize_features
-        and support_config.decoder.anchor_target is AnchorTarget.FEATURE
+        and support_config.head.anchor_target is AnchorTarget.FEATURE
     )
     feature_mean: tuple[float, ...] | None = None
     feature_std: tuple[float, ...] | None = None
@@ -174,7 +183,6 @@ def build_session(config: DictConfig | TrainConfig) -> TrainingSession:
         weight_decay=config.pl_module.weight_decay,
         reference_dropout=config.pl_module.reference_dropout,
         validation_seed=config.pl_module.validation_seed,
-        finite_loss_check_interval=config.pl_module.finite_loss_check_interval,
         residual_retarget=config.pl_module.residual_retarget,
         repa_teacher=repa_teacher,
     )
@@ -224,7 +232,8 @@ def build_support_config(
     seed: int,
     repa_teacher: Teacher | None,
 ) -> GeneratorConfig:
-    decoder = config.model.decoder
+    backbone = config.model.backbone
+    head = config.model.head
     loss = config.loss
     sampling = config.runtime.sampling
     repa_feature_dim = loss.repa_feature_dim
@@ -238,33 +247,37 @@ def build_support_config(
             )
     return GeneratorConfig(
         route=config.model.route,
-        condition_dim=config.model.condition_dim,
+        backbone=BackboneConfig(
+            hidden_dim=backbone.hidden_dim,
+            layers=backbone.layers,
+            heads=backbone.heads,
+            ffn_ratio=backbone.ffn_ratio,
+            embedding_initialization=backbone.embedding_initialization,
+            seed=seed,
+        ),
         feature_adapter=config.model.feature_adapter,
         feature_codebooks=config.model.feature_codebooks,
-        decoder=DecoderConfig(
-            hidden_dim=decoder.hidden_dim,
-            layers=decoder.layers,
-            heads=decoder.heads,
-            ffn_ratio=decoder.ffn_ratio,
-            rvq_predictor=decoder.rvq_predictor,
-            mtp_layers=decoder.mtp_layers,
-            mtp_heads=decoder.mtp_heads,
+        head=HeadConfig(
+            codebook_initialization=head.codebook_initialization,
+            seed=seed,
+            hidden_dim=head.hidden_dim,
+            layers=head.layers,
+            heads=head.heads,
+            ffn_ratio=head.ffn_ratio,
             repa_feature_dim=repa_feature_dim,
             repa_student_layer=loss.repa_student_layer,
             repa_loss_weight=loss.repa_loss_weight,
-            fm_mode=decoder.fm_mode,
-            anchor_context=decoder.anchor_context,
-            anchor_target=decoder.anchor_target,
-            factor_predictor=decoder.factor_predictor,
-            anchor_hidden_dim=decoder.anchor_hidden_dim,
-            anchor_layers=decoder.anchor_layers,
-            anchor_kernel_size=decoder.anchor_kernel_size,
-            anchor_cosine_weight=decoder.anchor_cosine_weight,
-            anchor_factor_weight=decoder.anchor_factor_weight,
-            anchor_factor_temperature=decoder.anchor_factor_temperature,
+            fm_mode=head.fm_mode,
+            anchor_context=head.anchor_context,
+            anchor_target=head.anchor_target,
+            factor_predictor=head.factor_predictor,
+            anchor_hidden_dim=head.anchor_hidden_dim,
+            anchor_layers=head.anchor_layers,
+            anchor_kernel_size=head.anchor_kernel_size,
+            anchor_cosine_weight=head.anchor_cosine_weight,
+            anchor_factor_weight=head.anchor_factor_weight,
+            anchor_factor_temperature=head.anchor_factor_temperature,
         ),
-        initialization=config.runtime.initialization,
-        seed=seed,
         sampling=SamplingConfig(
             flow_steps=sampling.flow_steps,
             temperature=sampling.temperature,
@@ -314,6 +327,9 @@ def build_callbacks(
         ArtifactExport(output_dir),
         LearningRateMonitor(logging_interval="step"),
     ]
+    debug_callback = _debug_callback(callback_config.debug)
+    if debug_callback is not None:
+        callbacks.append(debug_callback)
     callbacks.extend(_loss_callbacks(callback_config))
 
     codebook_usage_callback = _codebook_usage_callback(callback_config.codebook_usage)
@@ -344,6 +360,12 @@ def build_callbacks(
     return callbacks
 
 
+def _debug_callback(config: DebugCallbackConfig) -> Callback | None:
+    if not config.enabled:
+        return None
+    return DebugCallback()
+
+
 def _codebook_usage_callback(
     config: CodebookUsageCallbackConfig,
 ) -> Callback | None:
@@ -358,16 +380,13 @@ def _loss_callbacks(config: CallbackConfig) -> list[Callback]:
     if loss_summary.enabled:
         callbacks.append(LossSummaryCallback(window_capacity=loss_summary.window_capacity))
 
-    loss_time_bucket = config.loss_time_bucket
-    if loss_time_bucket.enabled:
+    observation = config.observation
+    if observation.enabled:
         callbacks.append(
-            LossTimeBucketLoggerCallback(
-                item_name=loss_time_bucket.item_name,
-                detail_key=loss_time_bucket.detail_key,
-                histogram_tag=loss_time_bucket.histogram_tag,
-                scalar_template=loss_time_bucket.scalar_template,
-                every_n_steps=loss_time_bucket.every_n_steps,
-                bucket_count=loss_time_bucket.bucket_count,
+            ObservationCallback(
+                every_n_steps=observation.every_n_steps,
+                half_life_steps=observation.half_life_steps,
+                sync_distributed=observation.sync_distributed,
             )
         )
     return callbacks
@@ -393,11 +412,18 @@ def _data_throughput_callback(
 ) -> Callback | None:
     if not config.enabled:
         return None
-    return UnitThroughputCallback(
-        unit_provider=SemanticFrameUnits(),
-        log_every_n_steps=config.log_every_n_steps,
-        warmup_steps=config.warmup_steps,
-        measure_window_steps=config.measure_window_steps,
+    return UnitScheduleCallback(
+        LRSchedule(
+            clock=UnitClock(
+                unit="frames",
+                provider=SemanticFrameUnits(),
+                log_every_n_units=config.log_every_n_units,
+                measure_window_batches=config.measure_window_batches,
+                sync_cuda=config.sync_cuda,
+                sync_distributed=config.sync_distributed,
+            ),
+            phases=(Phase(name="constant", duration=1.0, lr=Constant(1.0)),),
+        )
     )
 
 

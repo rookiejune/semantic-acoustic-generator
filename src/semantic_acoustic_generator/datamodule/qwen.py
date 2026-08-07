@@ -26,6 +26,8 @@ from torch.utils.data import Dataset
 from zhuyin.datasets.wmt19 import qwen_tts
 
 from semantic_acoustic_generator.backend.longcat import split_codes as split_longcat_codes
+from semantic_acoustic_generator.datamodule.dataset import GeneratorSample, Pairing
+from semantic_acoustic_generator.types import PairMetadata
 
 
 @dataclass(frozen=True)
@@ -408,6 +410,71 @@ class QwenCodecPairDataset(Dataset[QwenCodecPairSample]):
             self._reference_indices.popitem(last=False)
 
 
+class QwenGeneratorDataset(Dataset[GeneratorSample]):
+    """Project-level generator samples over one prepared Qwen codec column."""
+
+    def __init__(
+        self,
+        source: QwenCodecColumnDataset | QwenCodecPairDataset,
+        *,
+        sample_limit: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.source = source
+        self.size = len(source) if sample_limit is None else _sample_count(sample_limit, source=source)
+        self._index_order: MapStyleABC = IndexSelection(source.index_order, range(self.size))
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index: int) -> GeneratorSample:
+        sample = self.source[_index(index, size=len(self), source="Qwen generator sample")]
+        if isinstance(sample, QwenCodecSample):
+            return GeneratorSample(target=sample.codes)
+        if isinstance(sample, QwenCodecPairSample):
+            return GeneratorSample(
+                target=sample.target.codes,
+                reference=sample.reference.codes,
+                metadata=_metadata(sample),
+            )
+        raise TypeError(f"unsupported Qwen generator sample: {type(sample)!r}.")
+
+    @property
+    def index_order(self) -> MapStyleABC:
+        return self._index_order
+
+    def raw_length(self, index: int) -> int:
+        return self.source.raw_length(_index(index, size=len(self), source="Qwen generator sample"))
+
+    def duration(self, index: int) -> float:
+        return self.source.duration(_index(index, size=len(self), source="Qwen generator sample"))
+
+
+def qwen_dataset(
+    *,
+    codec: qwen_tts.Codec | str,
+    root: str | PathLike[str] | None,
+    split: str,
+    role: Role,
+    speaker_id: str,
+    pairing: Pairing,
+    sample_limit: int | None,
+) -> QwenGeneratorDataset:
+    column = QwenCodecColumnDataset(
+        codec=codec,
+        root=root,
+        split=split,
+        role=role,
+        speaker_id=speaker_id,
+    )
+    if pairing is Pairing.NONE:
+        return QwenGeneratorDataset(column, sample_limit=sample_limit)
+    if pairing is Pairing.CROSS_TEXT:
+        pairs = QwenCodecPairDataset(column, sample_count=sample_limit)
+        return QwenGeneratorDataset(pairs)
+    raise ValueError(f"unsupported Qwen generator pairing: {pairing!r}.")
+
+
 def _codes(
     value: object,
     codec: qwen_tts.Codec,
@@ -474,7 +541,11 @@ def _index(value: int, *, size: int, source: str) -> int:
     return index
 
 
-def _sample_count(value: int, *, source: QwenCodecColumnDataset) -> int:
+def _sample_count(
+    value: int,
+    *,
+    source: QwenCodecColumnDataset | QwenCodecPairDataset,
+) -> int:
     if isinstance(value, bool):
         raise TypeError("sample_count must be an integer or None.")
     size = operator.index(value)
@@ -483,9 +554,30 @@ def _sample_count(value: int, *, source: QwenCodecColumnDataset) -> int:
     return min(size, len(source))
 
 
+def _metadata(pair: QwenCodecPairSample) -> PairMetadata:
+    return PairMetadata(
+        target_index=pair.target_index,
+        reference_index=pair.reference_index,
+        target_text_index=pair.target.text_index,
+        reference_text_index=pair.reference.text_index,
+        target_source_index=pair.target.source_index,
+        reference_source_index=pair.reference.source_index,
+        target_role=pair.target.role.value,
+        reference_role=pair.reference.role.value,
+        target_utterance_id=pair.target.utterance_id,
+        reference_utterance_id=pair.reference.utterance_id,
+        target_speaker_id=pair.target.speaker_id,
+        reference_speaker_id=pair.reference.speaker_id,
+        target_text=pair.target.text,
+        reference_text=pair.reference.text,
+    )
+
+
 __all__ = [
     "QwenCodecColumnDataset",
     "QwenCodecPairDataset",
     "QwenCodecPairSample",
     "QwenCodecSample",
+    "QwenGeneratorDataset",
+    "qwen_dataset",
 ]

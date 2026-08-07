@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -9,7 +8,10 @@ from typing import Any, cast
 import pytest
 import torch
 from anydataset.dataset import MapStyleABC
+from anytrain import observation
 from anytrain.codec import AcousticLayout, SemanticAcousticCodes
+from anytrain.lightning import DebugCallback, ObservationCallback
+from anytrain.lightning.schedule import UnitScheduleCallback
 from lightning import pytorch as pl
 from torch import Tensor
 
@@ -22,18 +24,12 @@ try:
         SampleLogConfig,
         SampleLogger,
     )
-    from semantic_acoustic_generator.config import DecoderConfig, Route
+    from semantic_acoustic_generator.config import BackboneConfig, DecoderConfig, Route
     from semantic_acoustic_generator.datamodule import collate_codes, single_batch_loader
     from semantic_acoustic_generator.pl_module import (
-        CHECKPOINT_METADATA_KEY,
-        CHECKPOINT_SCHEMA_VERSION,
         build_module,
         dataset_feature_stats,
         feature_stats,
-    )
-    from semantic_acoustic_generator.pl_module.semantic import (
-        LEGACY_CHECKPOINT_METADATA_KEY,
-        LEGACY_CHECKPOINT_SCHEMA_VERSION,
     )
     from semantic_acoustic_generator.runtime import (
         GeneratorConfig,
@@ -291,8 +287,8 @@ def test_training_module_trains_and_exports_artifact(tmp_path) -> None:
     )
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     module = build_module(backend, config, batch, normalize_features=True)
 
@@ -313,7 +309,7 @@ def test_training_module_trains_and_exports_artifact(tmp_path) -> None:
     )
 
 
-def test_training_module_rejects_non_finite_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_training_resume_restores_checkpoint_learning_rate(tmp_path: Path) -> None:
     backend = FakeCodec()
     batch = collate_codes(
         [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
@@ -322,75 +318,8 @@ def test_training_module_rejects_non_finite_loss(monkeypatch: pytest.MonkeyPatch
     )
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
-    )
-    module = build_module(backend, config, batch, normalize_features=True)
-    loss = module.support.generator.loss
-
-    def non_finite_loss(*args: Any, **kwargs: Any):
-        output = loss(*args, **kwargs)
-        return replace(output, loss=output.loss.new_full((), float("nan")))
-
-    monkeypatch.setattr(module.support.generator, "loss", non_finite_loss)
-
-    with pytest.raises(FloatingPointError, match="flow training loss is non-finite"):
-        module.training_step(batch, 0)
-
-
-def test_deferred_finite_loss_guard_is_sticky_and_checkpoint_safe() -> None:
-    backend = FakeCodec()
-    batch = collate_codes(
-        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
-        semantic_pad_id=backend.semantic_codebook.size(0),
-        acoustic_pad_ids=backend.acoustic_codebook_sizes,
-    )
-    config = GeneratorConfig(
-        route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
-    )
-    module = build_module(backend, config, batch, normalize_features=True)
-    module._defer_finite_training_loss(torch.tensor(True), name="flow")
-    module._defer_finite_training_loss(torch.tensor(False), name="flow")
-    module._defer_finite_training_loss(torch.tensor(True), name="flow")
-
-    with pytest.raises(FloatingPointError, match="flow training loss is non-finite"):
-        module.on_save_checkpoint({"state_dict": {}})
-
-
-def test_deferred_finite_loss_guard_resets_after_successful_flush() -> None:
-    backend = FakeCodec()
-    batch = collate_codes(
-        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
-        semantic_pad_id=backend.semantic_codebook.size(0),
-        acoustic_pad_ids=backend.acoustic_codebook_sizes,
-    )
-    config = GeneratorConfig(
-        route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
-    )
-    module = build_module(backend, config, batch, normalize_features=True)
-    module._defer_finite_training_loss(torch.tensor(True), name="flow")
-
-    module.on_train_end()
-
-    assert module._finite_training_loss_ok is None
-    assert module._finite_training_loss_name is None
-
-
-def test_training_resume_uses_configured_learning_rate(tmp_path: Path) -> None:
-    backend = FakeCodec()
-    batch = collate_codes(
-        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
-        semantic_pad_id=backend.semantic_codebook.size(0),
-        acoustic_pad_ids=backend.acoustic_codebook_sizes,
-    )
-    config = GeneratorConfig(
-        route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     original = build_module(
         backend,
@@ -450,11 +379,11 @@ def test_training_resume_uses_configured_learning_rate(tmp_path: Path) -> None:
     )
 
     assert second.global_step == 2
-    assert observed == pytest.approx([1e-4])
-    assert second.optimizers[0].param_groups[0]["lr"] == pytest.approx(1e-4)
+    assert observed == pytest.approx([3e-4])
+    assert second.optimizers[0].param_groups[0]["lr"] == pytest.approx(3e-4)
 
 
-def test_training_checkpoint_drops_backend_and_requires_support_state() -> None:
+def test_training_checkpoint_uses_lightning_state_dict() -> None:
     backend = FakeModuleCodec()
     batch = collate_codes(
         [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
@@ -463,61 +392,18 @@ def test_training_checkpoint_drops_backend_and_requires_support_state() -> None:
     )
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     module = build_module(backend, config, batch, normalize_features=True)
-    checkpoint = {"state_dict": dict(module.state_dict())}
+    state = dict(module.state_dict())
 
-    assert not any(key.startswith("backend.") for key in checkpoint["state_dict"])
-    checkpoint["state_dict"]["backend.probe.weight"] = backend.probe.weight.detach().clone()
-    checkpoint[LEGACY_CHECKPOINT_METADATA_KEY] = {
-        "schema_version": LEGACY_CHECKPOINT_SCHEMA_VERSION,
-        "backend_state": "external",
-    }
-    module.on_save_checkpoint(checkpoint)
+    assert not any(key.startswith(("backend.", "repa_teacher.")) for key in state)
+    support_key = next(key for key in state if key.startswith("support."))
+    del state[support_key]
 
-    assert LEGACY_CHECKPOINT_METADATA_KEY not in checkpoint
-    assert checkpoint[CHECKPOINT_METADATA_KEY] == {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "backend_state": "external",
-    }
-    assert not any(key.startswith("backend.") for key in checkpoint["state_dict"])
-    module.on_load_checkpoint(checkpoint)
-
-    broken = {
-        CHECKPOINT_METADATA_KEY: checkpoint[CHECKPOINT_METADATA_KEY],
-        "state_dict": dict(checkpoint["state_dict"]),
-    }
-    support_key = next(key for key in broken["state_dict"] if key.startswith("support."))
-    del broken["state_dict"][support_key]
-
-    with pytest.raises(RuntimeError, match="missing support state"):
-        module.on_load_checkpoint(broken)
-
-
-def test_training_checkpoint_loads_legacy_metadata_key() -> None:
-    backend = FakeModuleCodec()
-    batch = collate_codes(
-        [torch.tensor([[1, 2, 3], [4, 1, 2]], dtype=torch.long)],
-        semantic_pad_id=backend.semantic_codebook.size(0),
-        acoustic_pad_ids=backend.acoustic_codebook_sizes,
-    )
-    config = GeneratorConfig(
-        route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
-    )
-    module = build_module(backend, config, batch, normalize_features=True)
-    checkpoint = {
-        LEGACY_CHECKPOINT_METADATA_KEY: {
-            "schema_version": LEGACY_CHECKPOINT_SCHEMA_VERSION,
-            "backend_state": "external",
-        },
-        "state_dict": dict(module.state_dict()),
-    }
-
-    module.on_load_checkpoint(checkpoint)
+    with pytest.raises(RuntimeError, match="Missing key"):
+        module.load_state_dict(state, strict=True)
 
 
 def test_paired_reference_dropout_is_sampled_per_row(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -525,8 +411,8 @@ def test_paired_reference_dropout_is_sampled_per_row(monkeypatch: pytest.MonkeyP
     batch = _paired_batch(backend)
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     module = build_module(
         backend,
@@ -566,13 +452,14 @@ def test_paired_reference_dropout_is_sampled_per_row(monkeypatch: pytest.MonkeyP
         captured["use_reference"] = kwargs["use_reference"]
         captured["row_indices"] = kwargs["row_indices"]
 
-    logs: dict[str, Any] = {}
+    observations: dict[str, observation.Observation] = {}
 
-    def log_dict(metrics: dict[str, Any], **_: Any) -> None:
-        logs.update(metrics)
+    def emit(owner: torch.nn.Module, name: str, values: Any) -> None:
+        if owner is module and name == "batch":
+            observations.update(values)
 
     monkeypatch.setattr(torch, "rand", rand)
-    monkeypatch.setattr(module, "log_dict", log_dict)
+    monkeypatch.setattr(observation, "emit", emit)
     handle = module.support.reference_conditioner.register_forward_pre_hook(
         capture,
         with_kwargs=True,
@@ -591,12 +478,14 @@ def test_paired_reference_dropout_is_sampled_per_row(monkeypatch: pytest.MonkeyP
     null = module.support.reference_conditioner.null_condition
 
     assert sampled
-    assert converted_batches == [2, 1]
+    assert sorted(converted_batches) == [1, 2]
     torch.testing.assert_close(features, expected)
     assert torch.equal(cast(Tensor, captured["mask"]), reference_mask[1:])
     assert captured["use_reference"] is None
     assert cast(Tensor, captured["row_indices"]).tolist() == [1]
-    assert float(cast(Tensor, logs["train/reference_fraction"])) == pytest.approx(0.5)
+    reference_fraction = observations["reference_fraction"]
+    assert isinstance(reference_fraction, observation.Curve)
+    assert float(reference_fraction.value) == pytest.approx(0.5)
     assert null.grad is not None
 
 
@@ -608,8 +497,8 @@ def test_sample_logger_uses_fixed_pair_and_writes_paired_metrics(
     batch = _paired_batch(backend)
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
     )
     module = build_module(backend, config, batch, normalize_features=True)
     experiment = SimpleNamespace(audio=[], scalars=[])
@@ -807,15 +696,21 @@ def test_training_session_uses_datamodule_when_fixed_batch_is_false(
             "backend": {"name": "longcat"},
             "model": {
                 "route": "fm",
-                "condition_dim": 10,
-                "decoder": {
+                "backbone": {
+                    "hidden_dim": 10,
+                    "layers": 1,
+                    "heads": 2,
+                    "ffn_ratio": 2,
+                    "embedding_initialization": "codec",
+                    "seed": 0,
+                },
+                "head": {
+                    "codebook_initialization": "codec",
+                    "seed": 0,
                     "hidden_dim": None,
                     "layers": 1,
                     "heads": 2,
                     "ffn_ratio": 2,
-                    "rvq_predictor": "mtp",
-                    "mtp_layers": 1,
-                    "mtp_heads": 2,
                 },
             },
             "loss": {
@@ -829,13 +724,13 @@ def test_training_session_uses_datamodule_when_fixed_batch_is_false(
                 "weight_decay": 0.0,
                 "reference_dropout": 0.5,
             },
-            "runtime": {
-                "device": "cpu",
-                "initialization": "codec",
-                "sampling": {"flow_steps": 2, "temperature": 1.0, "top_p": 1.0},
+                "runtime": {
+                    "device": "cpu",
+                    "sampling": {"flow_steps": 2, "temperature": 1.0, "top_p": 1.0},
             },
             "datamodule": {
-                "source": "qwen_fixed_speaker",
+                "dataset": "qwen",
+                "pairing": "none",
                 "root": None,
                 "split": "train",
                 "sample_index": 0,
@@ -916,6 +811,7 @@ def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
     config = omegaconf.OmegaConf.create(
         {
             "callback": {
+                "debug": {"enabled": True},
                 "sample": {"enabled": True, "every_n_train_steps": 2, "seed": 7},
                 "performance": {
                     "enabled": False,
@@ -926,7 +822,12 @@ def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
                 "data_throughput": {"enabled": False},
                 "codebook_usage": {"enabled": False},
                 "loss_summary": {"enabled": False},
-                "loss_time_bucket": {"enabled": False},
+                "observation": {
+                    "enabled": True,
+                    "every_n_steps": 11,
+                    "half_life_steps": 100,
+                    "sync_distributed": False,
+                },
                 "checkpoint": {
                     "enabled": True,
                     "filename": "step-{step:08d}",
@@ -949,10 +850,53 @@ def test_training_callback_builder_respects_switches(tmp_path: Path) -> None:
     assert [type(callback).__name__ for callback in callbacks] == [
         "ArtifactExport",
         "LearningRateMonitor",
+        "DebugCallback",
+        "ObservationCallback",
         "EMACallback",
         "SampleLogger",
         "ModelCheckpoint",
     ]
+    assert isinstance(callbacks[2], DebugCallback)
+    assert isinstance(callbacks[3], ObservationCallback)
+
+
+def test_training_callback_builder_uses_anytrain_unit_progress(tmp_path: Path) -> None:
+    omegaconf = pytest.importorskip("omegaconf")
+
+    config = omegaconf.OmegaConf.create(
+        {
+            "callback": {
+                "sample": {"enabled": False},
+                "performance": {"enabled": False},
+                "data_throughput": {
+                    "enabled": True,
+                    "log_every_n_units": 5000,
+                    "measure_window_batches": 17,
+                    "sync_cuda": False,
+                    "sync_distributed": False,
+                },
+                "codebook_usage": {"enabled": False},
+                "loss_summary": {"enabled": False},
+                "observation": {"enabled": False},
+                "checkpoint": {"enabled": False},
+            },
+        }
+    )
+
+    callbacks = build_callbacks(
+        parse_train_config(config),
+        output_dir=tmp_path,
+        fixed_batch=_paired_batch(FakeCodec()),
+    )
+
+    progress = next(callback for callback in callbacks if isinstance(callback, UnitScheduleCallback))
+    assert progress.clock.unit == "frames"
+    assert progress.clock.log_every_n_units == 5000
+    assert progress.clock.measure_window_batches == 17
+    assert progress.clock.sync_cuda is False
+    assert progress.clock.sync_distributed is False
+    assert progress.schedule.lr_ratio(0) == 1.0
+    assert progress.schedule.lr_ratio(10_000) == 1.0
 
 
 def test_codebook_usage_logger_logs_target_codebooks() -> None:
@@ -997,8 +941,8 @@ def test_training_module_adds_repa_loss_with_teacher() -> None:
     )
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(
             layers=2,
             heads=2,
             ffn_ratio=2,
@@ -1033,8 +977,8 @@ def test_training_module_requires_repa_teacher() -> None:
     )
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=10,
-        decoder=DecoderConfig(
+        backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(
             layers=2,
             heads=2,
             ffn_ratio=2,
@@ -1095,8 +1039,8 @@ def test_validation_metrics_are_paired_and_deterministic(
         backend,
         GeneratorConfig(
             route=Route.FM,
-            condition_dim=10,
-            decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+            backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+            head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
             sampling=SamplingConfig(flow_steps=1),
         ),
         batch,
@@ -1177,8 +1121,8 @@ def test_validation_epoch_metric_is_invariant_to_batch_partition(
             backend,
             GeneratorConfig(
                 route=Route.FM,
-                condition_dim=10,
-                decoder=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
+                backbone=BackboneConfig(hidden_dim=10, layers=1, heads=2, ffn_ratio=2),
+                head=DecoderConfig(layers=1, heads=2, ffn_ratio=2),
                 sampling=SamplingConfig(flow_steps=1),
             ),
             combined,

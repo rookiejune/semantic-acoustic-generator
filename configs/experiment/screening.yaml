@@ -12,7 +12,7 @@ defaults:
   - _self_
 
 # One-epoch cross-text screening over source indices 0..983.
-output_subdir: screening/${backend.name}/${model.route}-${model.decoder.layers}l
+output_subdir: screening/${backend.name}/${model.route}-${model.backbone.layers}l
 
 datamodule:
   sample_limit: 984

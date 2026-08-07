@@ -36,7 +36,7 @@ def main() -> None:
         sample_index = args.sample_start + offset
         batch = load_batch(
             DataConfig(
-                source="qwen_cross_text",
+                pairing="cross_text",
                 root=str(args.data_root),
                 split=args.split,
                 sample_index=sample_index,

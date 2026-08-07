@@ -12,15 +12,15 @@ import semantic_acoustic_generator.runtime.semantic as runtime_semantic
 from semantic_acoustic_generator.config import (
     AnchorContext,
     AnchorTarget,
+    BackboneConfig,
     DecoderConfig,
     FactorPredictor,
     FeatureAdapter,
     FMMode,
     Route,
-    RVQPredictor,
 )
-from semantic_acoustic_generator.model.condition import ReferenceConditioner, SemanticConditioner
-from semantic_acoustic_generator.model.decoder import AcousticUnitGenerator
+from semantic_acoustic_generator.model import AcousticGeneratorModel, AcousticHead, QwenBackbone
+from semantic_acoustic_generator.model.condition import ReferenceConditioner
 from semantic_acoustic_generator.model.routes import RouteModules
 from semantic_acoustic_generator.runtime import (
     GeneratorConfig,
@@ -56,12 +56,8 @@ def test_sampling_config_rejects_non_finite_fields(field: str, value: float) -> 
     ("field", "value", "message"),
     [
         ("route", "fm", "route must be a Route"),
-        ("condition_dim", True, "condition_dim must be an integer"),
-        ("condition_dim", "4", "condition_dim must be an integer"),
-        ("decoder", object(), "decoder must be a DecoderConfig"),
-        ("initialization", "codec", "initialization must be an Initialization"),
-        ("seed", True, "seed must be an integer"),
-        ("seed", "0", "seed must be an integer"),
+        ("backbone", object(), "backbone must be a BackboneConfig"),
+        ("head", object(), "head must be a HeadConfig"),
         ("sampling", object(), "sampling must be a SamplingConfig"),
         ("feature_adapter", "none", "feature_adapter must be a FeatureAdapter"),
     ],
@@ -71,7 +67,10 @@ def test_semantic_support_config_rejects_invalid_field_types(
     value: object,
     message: str,
 ) -> None:
-    options: dict[str, object] = {"route": Route.FM, "condition_dim": 4}
+    options: dict[str, object] = {
+        "route": Route.FM,
+        "backbone": BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+    }
     options[field] = value
 
     with pytest.raises(TypeError, match=message):
@@ -82,8 +81,8 @@ def test_factor_target_requires_longcat_first_codebook_adapter() -> None:
     with pytest.raises(ValueError, match="requires feature_adapter=longcat_first_codebook"):
         GeneratorConfig(
             route=Route.FM,
-            condition_dim=4,
-            decoder=DecoderConfig(
+            backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+            head=DecoderConfig(
                 fm_mode=FMMode.ANCHOR,
                 anchor_target=AnchorTarget.FACTOR,
             ),
@@ -93,10 +92,10 @@ def test_factor_target_requires_longcat_first_codebook_adapter() -> None:
 def test_factor_target_accepts_longcat_multi_codebook_adapter() -> None:
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
         feature_adapter=FeatureAdapter.LONGCAT_CODEBOOKS,
         feature_codebooks=3,
-        decoder=DecoderConfig(
+        head=DecoderConfig(
             fm_mode=FMMode.ANCHOR,
             anchor_target=AnchorTarget.FACTOR,
         ),
@@ -121,7 +120,7 @@ def test_semantic_support_config_requires_finite_numeric_feature_stats(
 ) -> None:
     options: dict[str, object] = {
         "route": Route.FM,
-        "condition_dim": 4,
+        "backbone": BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
         "feature_mean": (0.0,),
         "feature_std": (1.0,),
     }
@@ -164,7 +163,7 @@ class FakeBackend:
         return acoustic_features.flatten(1).unsqueeze(1)
 
 
-class SeededGenerator(nn.Module):
+class SeededGenerator(AcousticHead):
     def __init__(self, feature_dim: int, codebook_size: int) -> None:
         super().__init__()
         self.feature_dim = feature_dim
@@ -420,15 +419,15 @@ def test_sampling_prepares_semantic_input_once_per_public_call(monkeypatch) -> N
     assert calls == [Route.RVQ]
 
 
-def test_schema_eight_artifact_roundtrip_preserves_decoder_fields(
+def test_schema_nine_artifact_roundtrip_preserves_model_fields(
     tmp_path,
     monkeypatch,
 ) -> None:
     backend = FakeBackend()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
-        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
         sampling=SamplingConfig(flow_steps=1),
     )
     support = build_support(
@@ -440,14 +439,15 @@ def test_schema_eight_artifact_roundtrip_preserves_decoder_fields(
 
     config_path = tmp_path / "generator.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    assert data["schema_version"] == 8
+    assert data["schema_version"] == 9
     assert not (tmp_path / "codec.json").exists()
     assert data["backend"]["name"] == backend.name
     assert data["backend"]["sample_rate"] == backend.sample_rate
     assert data["backend"]["frame_rate"] == backend.frame_rate
     assert data["backend"]["semantic_frame_rate"] == backend.semantic_frame_rate
-    assert data["config"]["decoder"]["rvq_predictor"] == RVQPredictor.MTP.value
-    assert data["config"]["decoder"]["factor_predictor"] == FactorPredictor.PARALLEL.value
+    assert data["config"]["backbone"]["hidden_dim"] == 4
+    assert data["config"]["head"]["codebook_initialization"] == "codec"
+    assert data["config"]["head"]["factor_predictor"] == FactorPredictor.PARALLEL.value
     assert data["config"]["feature_adapter"] == FeatureAdapter.NONE.value
     assert data["config"]["feature_codebooks"] == 1
     assert data["config"]["sampling"]["cfg_scale"] == 1.0
@@ -463,8 +463,8 @@ def test_schema_eight_artifact_roundtrip_preserves_decoder_fields(
     loaded = load_artifact(tmp_path)
 
     assert len(captured) == 1
-    assert captured[0].decoder.rvq_predictor is RVQPredictor.MTP
-    assert captured[0].decoder.factor_predictor is FactorPredictor.PARALLEL
+    assert captured[0].head.codebook_initialization.value == "codec"
+    assert captured[0].head.factor_predictor is FactorPredictor.PARALLEL
     assert captured[0].feature_adapter is FeatureAdapter.NONE
     assert captured[0].sampling.cfg_scale == 1.0
     assert loaded.acoustic_layout is AcousticLayout.FRAME_ALIGNED
@@ -478,8 +478,8 @@ def test_schema_seven_artifact_remains_readable(tmp_path) -> None:
     backend = FakeBackend()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
-        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
         sampling=SamplingConfig(flow_steps=1),
     )
     support = build_support(
@@ -500,12 +500,12 @@ def test_schema_seven_artifact_remains_readable(tmp_path) -> None:
         assert torch.equal(loaded.state_dict()[key], value)
 
 
-def test_early_schema_eight_artifact_defaults_new_fm_fields(tmp_path) -> None:
+def test_early_schema_nine_artifact_defaults_optional_fm_fields(tmp_path) -> None:
     backend = FakeBackend()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
-        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
         sampling=SamplingConfig(flow_steps=1),
     )
     support = build_support(
@@ -530,7 +530,7 @@ def test_early_schema_eight_artifact_defaults_new_fm_fields(tmp_path) -> None:
         "anchor_factor_weight",
         "anchor_factor_temperature",
     ):
-        del data["config"]["decoder"][key]
+        del data["config"]["head"][key]
     path.write_text(json.dumps(data), encoding="utf-8")
 
     loaded = load_artifact(tmp_path)
@@ -538,18 +538,18 @@ def test_early_schema_eight_artifact_defaults_new_fm_fields(tmp_path) -> None:
     assert loaded.config is not None
     assert loaded.config.feature_adapter is FeatureAdapter.NONE
     assert loaded.config.feature_codebooks == 1
-    assert loaded.config.decoder.fm_mode is FMMode.FLOW
-    assert loaded.config.decoder.anchor_context is AnchorContext.LOCAL
-    assert loaded.config.decoder.anchor_target is AnchorTarget.FEATURE
-    assert loaded.config.decoder.factor_predictor is FactorPredictor.PARALLEL
+    assert loaded.config.head.fm_mode is FMMode.FLOW
+    assert loaded.config.head.anchor_context is AnchorContext.LOCAL
+    assert loaded.config.head.anchor_target is AnchorTarget.FEATURE
+    assert loaded.config.head.factor_predictor is FactorPredictor.PARALLEL
 
 
-def test_schema_eight_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
+def test_schema_nine_artifact_rejects_missing_head_fields(tmp_path) -> None:
     backend = FakeBackend()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
-        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
         sampling=SamplingConfig(flow_steps=1),
     )
     support = build_support(
@@ -561,10 +561,10 @@ def test_schema_eight_artifact_rejects_missing_decoder_fields(tmp_path) -> None:
 
     config_path = tmp_path / "generator.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    del data["config"]["decoder"]["rvq_predictor"]
+    del data["config"]["head"]["layers"]
     config_path.write_text(json.dumps(data), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="missing 'rvq_predictor'"):
+    with pytest.raises(ValueError, match="missing 'layers'"):
         load_artifact(tmp_path)
 
 
@@ -572,8 +572,8 @@ def test_schema_eight_artifact_rejects_missing_cfg_scale(tmp_path) -> None:
     backend = FakeBackend()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
-        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
         sampling=SamplingConfig(flow_steps=1),
     )
     support = build_support(
@@ -595,8 +595,8 @@ def test_schema_eight_artifact_rejects_missing_cfg_scale(tmp_path) -> None:
 @pytest.mark.parametrize(
     ("section", "field", "value", "message"),
     [
-        ("config", "condition_dim", True, "config.condition_dim"),
-        ("decoder", "layers", "1", "decoder.layers"),
+        ("backbone", "hidden_dim", True, "backbone.hidden_dim"),
+        ("head", "layers", "1", "head.layers"),
         ("sampling", "temperature", "1.0", "sampling.temperature"),
     ],
 )
@@ -610,8 +610,8 @@ def test_schema_eight_artifact_rejects_lossy_numeric_coercion(
     backend = FakeBackend()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
-        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
         sampling=SamplingConfig(flow_steps=1),
     )
     support = build_support(
@@ -636,8 +636,8 @@ def test_schema_eight_artifact_rejects_invalid_feature_metadata(tmp_path, value:
     backend = FakeBackend()
     config = GeneratorConfig(
         route=Route.FM,
-        condition_dim=4,
-        decoder=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
+        backbone=BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+        head=DecoderConfig(hidden_dim=4, layers=1, heads=1, ffn_ratio=2),
         sampling=SamplingConfig(flow_steps=1),
         feature_mean=(0.0, 0.0, 0.0, 0.0),
         feature_std=(1.0, 1.0, 1.0, 1.0),
@@ -672,9 +672,14 @@ def _support(
         reference.projection.bias.zero_()
         reference.gate.fill_(2.0)
     modules = RouteModules(
-        conditioner=SemanticConditioner(backend.semantic_codebook, condition_dim=4),
+        model=AcousticGeneratorModel(
+            QwenBackbone(
+                backend.semantic_codebook,
+                BackboneConfig(hidden_dim=4, layers=1, heads=2, ffn_ratio=2),
+            ),
+            generator,
+        ),
         reference_conditioner=reference,
-        generator=cast(AcousticUnitGenerator, cast(object, generator)),
         route=route,
         acoustic_codebook_sizes=backend.acoustic_codebook_sizes,
     )

@@ -5,8 +5,8 @@ codes 和可选 reference acoustic features，生成外部 codec backend 解码�
 codec 的编码、解码、码本结构和 backend 实现不属于本仓库；主力实现由 AnyCodec 持有，当前代码通过
 `anytrain.codec.SemanticAcousticCodec` 契约接入 frame-aligned LongCat backend。
 
-训练主线消费 workspace 离线生成的 Qwen speaker grid codec units；`qwen_cross_text` 为每个 target 选择同
-speaker、不同 utterance 和不同文本的 reference。推理可以只使用 semantic codes 和 learned null
+训练主线消费 workspace 离线生成的 Qwen speaker grid codec units；`dataset=qwen` 配合
+`pairing=cross_text` 为每个 target 选择同 speaker、不同 utterance 和不同文本的 reference。推理可以只使用 semantic codes 和 learned null
 condition，也可以额外提供 reference acoustic features。
 
 仓库边界：
@@ -47,7 +47,7 @@ python scripts/smoke.py
 ```bash
 python scripts/smoke.py \
   --codec longcat \
-  --data-source qwen_cross_text \
+  --data-pairing cross_text \
   --data-root /path/to/prepared/codec-grid \
   --require-data
 ```
@@ -88,8 +88,8 @@ python scripts/train.py experiment=ablation_fm_ema
 
 `pl_module.ema_decay` 非空时启用 `anytrain.lightning.EMACallback`；sample / artifact 导出使用 EMA
 权重。`loss.repa_loss_weight>0` 时训练服务构造 `WavLMTeacher`（当前仅 LongCat frame-aligned FM）。
-CUDA 训练通过 `pl_module.finite_loss_check_interval` 有界延迟检查非有限 loss，并在 epoch 结束和
-checkpoint 保存前强制检查；smoke / overfit 将该值设为 `1` 以获得逐步诊断。
+`callback.debug.enabled=true` 时启用 `anytrain.lightning.DebugCallback`，逐步检查 loss、参数和梯度
+中的 NaN / Inf；正式训练默认关闭，smoke / overfit 等诊断实验显式开启。
 
 LongCat-FM 可以显式启用第一 acoustic codebook 的低维 feature adapter：
 

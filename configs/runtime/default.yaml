@@ -1,5 +1,4 @@
 device: null
-initialization: codec
 sampling:
   flow_steps: 16
   temperature: 1.0

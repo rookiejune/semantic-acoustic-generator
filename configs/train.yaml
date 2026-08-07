@@ -13,4 +13,4 @@ defaults:
 
 seed: 0
 output_dir: null
-output_subdir: ${backend.name}/${model.route}-${model.decoder.layers}l/${runtime.initialization}
+output_subdir: ${backend.name}/${model.route}-${model.backbone.layers}l/${model.backbone.embedding_initialization}

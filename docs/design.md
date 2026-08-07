@@ -5,7 +5,7 @@
 本项目实现 reference-optional 的 semantic-to-acoustic generator：输入 semantic codes 和可选 reference
 acoustic features，生成外部 codec backend 解码所需的 acoustic features 或 codes。本工程只支持
 frame-aligned 的 semantic/acoustic codec；当前训练主线使用 Qwen speaker grid 离线生成的 LongCat units，
-并由 `qwen_cross_text` 构造显式 target/reference pair。
+并由 `dataset=qwen, pairing=cross_text` 构造显式 target/reference pair。
 每个 reference 必须和 target 属于同一 speaker，同时 sample index、utterance id 和文本均不同；无法配对时
 在 dataset 构造阶段直接报错。
 
@@ -205,7 +205,7 @@ acoustic features，RVQ 只接收 acoustic code IDs；两者不再通过 nullabl
 - `acoustic_layout: AcousticLayout.FRAME_ALIGNED`：这是唯一接受的 layout；`FIXED_LENGTH` 在 batch
   构造时明确拒绝。
 - `reference_semantic_codes`、`reference_acoustic_codes`、`reference_mask` 和
-  `reference_acoustic_mask`：`qwen_cross_text` batch 中完整保留 cross-text reference side。
+  `reference_acoustic_mask`：`pairing=cross_text` batch 中完整保留 reference side。
 - `metadata: tuple[PairMetadata, ...]`：逐行记录 target/reference store index、grid
   `text_index`、原始 `source_index`、role、utterance id、speaker id 和文本，并在构造时维护
   same-speaker / cross-text 不变量。
@@ -289,7 +289,14 @@ generation 语义、condition、head、loss 和 runtime 组合。
 
 ## 数据路线
 
-正式训练默认使用 `qwen_cross_text`：
+正式训练默认使用 Qwen dataset 的 `cross_text` pairing：
+
+- workspace 只负责返回已经准备好的 Qwen logical speaker grid；默认路径解析、store 和 manifest 契约仍由
+  workspace 持有，项目只允许用显式 `root` 覆盖标准 store。
+- `datamodule.dataset` 定义 source-neutral `GeneratorSample`，`datamodule.qwen` 把 grid column 和
+  cross-text pairing 投影成该契约。
+- `DataModule` 只处理有效 subset、长度策略、collate 和 train/validation loader；动态 batch 规划继续委托
+  `anydataset`，不在项目内复制 planner。
 
 1. workspace 从 Qwen speaker grid 离线生成 waveform，并物化 LongCat frame-aligned structured units。
 2. dataset 在 `__getitem__` 中按 source order 为每个 target 懒加载并确定性选择同 speaker、不同 utterance
@@ -299,10 +306,10 @@ generation 语义、condition、head、loss 和 runtime 组合。
    reference condition，不能把 target features 回流到 condition。
 5. 训练逐样本以 `reference_dropout=0.5` 在显式 reference 与 learned null condition 之间切换。
 
-单侧 `qwen_fixed_speaker` 仍作为显式 smoke source 保留：它通过
+单侧 `pairing=none` 仍由 `qwen_fixed_speaker` datamodule preset 作为显式 smoke 配置保留：它通过
 `zhuyin.datasets.wmt19.qwen_tts` 从统一 Qwen codec grid 选择一个 role/speaker 列，codec view
 与网格的行、列、整网格访问契约保持一致，不再依赖 `zhuyin.datasets.wmt19_tts` 或独立的固定 speaker
-prepared dataset。默认训练数据契约仍是 `qwen_cross_text`。
+prepared dataset。默认训练数据契约仍是 `dataset=qwen, pairing=cross_text`。
 
 ## 两条 generator 路线
 
@@ -413,7 +420,7 @@ reference gain。
 
 验收证据见 [experiments/results/](experiments/results/)。当前仍待验证的是：
 
-1. 用当前 `qwen_cross_text` pair contract 重跑 LongCat × FM / RVQ single-pair overfit，分别记录
+1. 用当前 `dataset=qwen, pairing=cross_text` contract 重跑 LongCat × FM / RVQ single-pair overfit，分别记录
    with-reference 与 without-reference 的 loss、feature MSE、音频和 `reference_gain`。
 2. 在 `speech-to-speech` 真实 generation 中同时跑通省略 reference 和提供 reference 的两条路径，并保留
    可核对的 pair metadata 与同 seed A/B 指标。
@@ -421,7 +428,7 @@ reference gain。
    feature MSE、waveform finite、RTF、显存、MFU 和失败样本。
 4. 检查 reference 是否泄漏文本内容；验证完成前不把 reference gain 或音色保持写入 conclusion。
 
-其中 fixed-speaker 结果不等同于当前默认的 `qwen_cross_text` 训练契约；cross-text 重跑、held-out fixed
+其中 fixed-speaker 结果不等同于当前默认的 `pairing=cross_text` 训练契约；cross-text 重跑、held-out fixed
 eval 和 reference leakage 检查以
 [experiments/todo.md](experiments/todo.md) 为准。
 
